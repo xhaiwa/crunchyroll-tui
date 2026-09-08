@@ -1,0 +1,11 @@
+/target
+.idea
+.DS_Store
+
+# Widevine device files
+*.wvd
+client_id.bin
+private_key.pem
+
+# Downloads
+*.mkv
