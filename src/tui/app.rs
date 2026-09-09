@@ -5,6 +5,7 @@ use ratatui::widgets::ListState;
 
 use crate::download::DownloadOptions;
 use crate::model::{CatalogItem, Season, SeasonEpisode};
+use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
 use super::worker::{Listing, Request, Response, Worker};
@@ -41,6 +42,10 @@ pub struct Pane<T> {
     /// The id these items belong to. A slow answer for a series the user has already
     /// moved away from arrives with the wrong owner and is dropped.
     pub owner: String,
+    /// Where to put the cursor when the next answer arrives. A reload, or a list asked
+    /// for again in another language, is still the same list to the user, so the cursor
+    /// has no business going back to the top.
+    pub pending_cursor: Option<usize>,
 }
 
 impl<T> Default for Pane<T> {
@@ -51,6 +56,7 @@ impl<T> Default for Pane<T> {
             loading: false,
             error: None,
             owner: String::new(),
+            pending_cursor: None,
         }
     }
 }
@@ -63,7 +69,12 @@ impl<T> Pane<T> {
     }
 
     pub fn set(&mut self, items: Vec<T>) {
-        self.state.select((!items.is_empty()).then_some(0));
+        let restored = self
+            .pending_cursor
+            .take()
+            .filter(|index| *index < items.len());
+        self.state
+            .select(restored.or_else(|| (!items.is_empty()).then_some(0)));
         self.items = items;
         self.loading = false;
     }
@@ -74,6 +85,7 @@ impl<T> Pane<T> {
         self.loading = false;
         self.error = None;
         self.owner.clear();
+        self.pending_cursor = None;
     }
 
     pub fn move_by(&mut self, delta: isize) {
@@ -95,6 +107,23 @@ impl<T> Pane<T> {
     }
 }
 
+/// The language list while it is open: which of the two settings it is choosing for,
+/// and the locales it is offering.
+pub struct Picker {
+    pub audio: bool,
+    pub pane: Pane<String>,
+}
+
+impl Picker {
+    pub fn title(&self) -> &'static str {
+        if self.audio {
+            " Audio language "
+        } else {
+            " Subtitle language "
+        }
+    }
+}
+
 pub struct App {
     worker: Worker,
     pub options: DownloadOptions,
@@ -105,6 +134,8 @@ pub struct App {
     pub listing: Listing,
     /// The search box while it is being typed into.
     pub editing: Option<String>,
+    /// The language list while it is open.
+    pub picker: Option<Picker>,
     pub notice: Option<Notice>,
     /// What the API client would have printed had the interface not owned the screen.
     notices: Arc<Mutex<Vec<String>>>,
@@ -125,6 +156,7 @@ impl App {
             episodes: Pane::default(),
             listing: Listing::Browse(0),
             editing: None,
+            picker: None,
             notice: None,
             notices,
             show_help: false,
@@ -352,7 +384,9 @@ impl App {
 
     /// The locales worth offering for the current selection, most specific first: what
     /// the season lists, else what the series lists, else what was asked for on the
-    /// command line.
+    /// command line, else every locale Crunchyroll publishes. Whatever is in use is
+    /// always among them, so the list can open on it even when the selection does not
+    /// admit to having it.
     fn locales(&self, audio: bool) -> Vec<String> {
         let from_season = self.seasons.selected().map(|season| {
             if audio {
@@ -373,39 +407,82 @@ impl App {
         } else {
             &self.options.subtitles_langs
         };
-        for candidate in [from_season, from_series] {
-            if let Some(locales) = candidate.filter(|locales| !locales.is_empty()) {
-                let mut locales = locales.clone();
-                locales.sort();
-                return locales;
-            }
-        }
-        configured.clone()
+        let mut locales = [from_season, from_series]
+            .into_iter()
+            .flatten()
+            .find(|locales| !locales.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                if configured.is_empty() {
+                    LANGUAGES
+                        .iter()
+                        .map(|(locale, _)| (*locale).to_owned())
+                        .collect()
+                } else {
+                    configured.clone()
+                }
+            });
+        locales.push(if audio { self.audio() } else { self.subs() });
+        locales.sort();
+        locales.dedup();
+        locales
+    }
+
+    /// Opens the language list on the locale in use.
+    fn open_picker(&mut self, audio: bool) {
+        let locales = self.locales(audio);
+        let current = if audio { self.audio() } else { self.subs() };
+        let mut pane = Pane {
+            pending_cursor: locales.iter().position(|locale| *locale == current),
+            ..Pane::default()
+        };
+        pane.set(locales);
+        self.picker = Some(Picker { audio, pane });
     }
 
     fn cycle_locale(&mut self, audio: bool) {
         let locales = self.locales(audio);
-        if locales.is_empty() {
-            self.complain(if audio {
-                "No audio locale is listed for this selection."
-            } else {
-                "No subtitle locale is listed for this selection."
-            });
-            return;
-        }
         let current = if audio { self.audio() } else { self.subs() };
         let next = locales
             .iter()
             .position(|locale| *locale == current)
             .map_or(0, |index| (index + 1) % locales.len());
-        let chosen = locales[next].clone();
-        if audio {
-            self.options.audio_langs = vec![chosen.clone()];
-            self.say(format!("Audio: {chosen}"));
-        } else {
-            self.options.subtitles_langs = vec![chosen.clone()];
-            self.say(format!("Subtitles: {chosen}"));
+        if let Some(chosen) = locales.get(next).cloned() {
+            self.choose_locale(audio, chosen);
         }
+    }
+
+    fn choose_locale(&mut self, audio: bool, locale: String) {
+        let changed = locale != if audio { self.audio() } else { self.subs() };
+        let name = language_name(&locale).to_owned();
+        if audio {
+            self.options.audio_langs = vec![locale];
+            self.say(format!("Audio: {name}"));
+        } else {
+            self.options.subtitles_langs = vec![locale];
+            self.say(format!("Subtitles: {name}"));
+        }
+        if changed {
+            self.refresh_localised();
+        }
+    }
+
+    /// Crunchyroll is asked for both lists in the chosen languages: titles come back
+    /// localised, and an episode carries the dub that was asked for. So a language
+    /// change only shows once the deepest list open has been asked for again - with the
+    /// cursor put back, since it is still the same season being looked at.
+    fn refresh_localised(&mut self) {
+        let focus = self.focus;
+        if !self.episodes.owner.is_empty() {
+            let cursor = self.episodes.state.selected();
+            self.request_episodes();
+            self.episodes.pending_cursor = cursor;
+        } else if !self.seasons.owner.is_empty() {
+            let cursor = self.seasons.state.selected();
+            self.request_seasons();
+            self.seasons.pending_cursor = cursor;
+        }
+        self.focus = focus;
     }
 
     fn cycle_quality(&mut self) {
@@ -426,9 +503,21 @@ impl App {
 
     fn reload(&mut self) {
         match self.focus {
-            Focus::Series => self.request_catalog(),
-            Focus::Seasons => self.request_seasons(),
-            Focus::Episodes => self.request_episodes(),
+            Focus::Series => {
+                let cursor = self.series.state.selected();
+                self.request_catalog();
+                self.series.pending_cursor = cursor;
+            }
+            Focus::Seasons => {
+                let cursor = self.seasons.state.selected();
+                self.request_seasons();
+                self.seasons.pending_cursor = cursor;
+            }
+            Focus::Episodes => {
+                let cursor = self.episodes.state.selected();
+                self.request_episodes();
+                self.episodes.pending_cursor = cursor;
+            }
         }
     }
 
@@ -458,12 +547,49 @@ impl App {
         }
     }
 
+    /// The language list has the keys of a column, plus tab to look at the other list
+    /// without going back out first.
+    fn edit_picker(&mut self, key: KeyEvent) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
+            KeyCode::Up | KeyCode::Char('k') => picker.pane.move_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => picker.pane.move_by(1),
+            KeyCode::PageUp => picker.pane.move_by(-10),
+            KeyCode::PageDown => picker.pane.move_by(10),
+            KeyCode::Home | KeyCode::Char('g') => picker.pane.select_edge(false),
+            KeyCode::End | KeyCode::Char('G') => picker.pane.select_edge(true),
+            KeyCode::Tab => {
+                let other = !picker.audio;
+                self.open_picker(other);
+            }
+            KeyCode::Char('a') => self.open_picker(true),
+            KeyCode::Char('s') => self.open_picker(false),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let audio = picker.audio;
+                let chosen = picker.pane.selected().cloned();
+                self.picker = None;
+                if let Some(chosen) = chosen {
+                    self.choose_locale(audio, chosen);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
         if self.editing.is_some() {
             self.edit_search(key);
+            return Action::None;
+        }
+        if self.picker.is_some() {
+            self.notice = None;
+            self.edit_picker(key);
             return Action::None;
         }
         if self.show_help {
@@ -494,8 +620,10 @@ impl App {
             KeyCode::Char('P') => return self.play(true),
             KeyCode::Char('d') => return self.download(false),
             KeyCode::Char('D') => return self.download(true),
-            KeyCode::Char('a') => self.cycle_locale(true),
-            KeyCode::Char('s') => self.cycle_locale(false),
+            KeyCode::Char('a') => self.open_picker(true),
+            KeyCode::Char('s') => self.open_picker(false),
+            KeyCode::Char('A') => self.cycle_locale(true),
+            KeyCode::Char('S') => self.cycle_locale(false),
             KeyCode::Char('v') => self.cycle_quality(),
             KeyCode::Char('o') => self.cycle_sort(),
             KeyCode::Char('r') => self.reload(),
