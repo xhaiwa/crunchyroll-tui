@@ -105,17 +105,36 @@ pub struct DownloadOptions {
     pub mpv_args: Vec<String>,
 }
 
-fn temp_path(prefix: &str, suffix: &str) -> Result<PathBuf> {
+/// Makes an empty file in `dir` for the run to work in.
+///
+/// The names start with a dot so a half-finished track stays hidden from the library
+/// the finished MKV is written to.
+fn temp_path(dir: &Path, prefix: &str, suffix: &str) -> Result<PathBuf> {
     let (file, path) = tempfile::Builder::new()
         .prefix(prefix)
         .suffix(suffix)
-        .tempfile()
-        .context("create temporary media file")?
+        .tempfile_in(dir)
+        .with_context(|| format!("create temporary media file in {}", dir.display()))?
         .keep()
         .map_err(|error| error.error)
         .context("keep temporary media file")?;
     drop(file);
     Ok(path)
+}
+
+/// Where a download does its buffering: beside the file it is headed for.
+///
+/// The encrypted buffer and the decrypted track are each as big as the episode, and
+/// `/tmp` is RAM on most Linux systems, so three concurrent versions of a 1080p episode
+/// would ask for a dozen gigabytes of it. Beside the output file the space wanted is
+/// the space the finished MKV needs anyway, on the disk the user chose to fill.
+/// Playback writes no media at all, so it keeps its subtitles in the system directory,
+/// which is `TMPDIR` when the environment names one.
+fn scratch_dir(output: Option<&Path>) -> PathBuf {
+    output
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(std::env::temp_dir, Path::to_path_buf)
 }
 
 fn encrypted_path(output: &Path) -> PathBuf {
@@ -614,8 +633,9 @@ impl<'a> TrackSource<'a> {
 
 /// Where a media track ends up once it has been pulled off the CDN.
 enum Destination<'a> {
-    /// Buffer it on disk, decrypt it into a temporary MP4 and mux later.
-    Files,
+    /// Buffer it on disk in the given directory, decrypt it into a temporary MP4
+    /// there and mux later.
+    Files(&'a Path),
     /// Feed it into a named pipe and let ffmpeg decrypt it on the fly for mpv.
     Pipes(&'a LivePipes),
 }
@@ -623,6 +643,7 @@ enum Destination<'a> {
 /// Buffers the encrypted track on disk, then decrypts it into a temporary MP4.
 fn fetch_to_file(
     client: &CrunchyrollClient,
+    scratch: &Path,
     title: &str,
     source: &TrackSource<'_>,
     is_video: bool,
@@ -630,10 +651,11 @@ fn fetch_to_file(
 ) -> Result<PathBuf> {
     let init_data = source.initialization(client)?;
     let output = temp_path(
+        scratch,
         if is_video {
-            "crdl-video-"
+            ".crdl-video-"
         } else {
-            "crdl-audio-"
+            ".crdl-audio-"
         },
         ".mp4",
     )?;
@@ -721,13 +743,20 @@ fn fetch_track(
     let locale = request.locale.unwrap_or_default().to_owned();
 
     match destination {
-        Destination::Files => {
+        Destination::Files(scratch) => {
             let title = if request.is_video {
                 "Downloading video".to_owned()
             } else {
                 format!("Downloading {} audio", language_name(&locale))
             };
-            let file = fetch_to_file(client, &title, &source, request.is_video, request.keys)?;
+            let file = fetch_to_file(
+                client,
+                scratch,
+                &title,
+                &source,
+                request.is_video,
+                request.keys,
+            )?;
             Ok(Some(MediaTrack::media(file, locale, None)))
         }
         Destination::Pipes(pipes) => {
@@ -843,7 +872,11 @@ fn remove_track(track: Option<&MediaTrack>) {
     }
 }
 
-fn download_subtitle(client: &CrunchyrollClient, subtitle: &Subtitle) -> Result<PathBuf> {
+fn download_subtitle(
+    client: &CrunchyrollClient,
+    scratch: &Path,
+    subtitle: &Subtitle,
+) -> Result<PathBuf> {
     let body =
         read_body(media_request(client, &subtitle.url, None)?).context("read subtitle response")?;
     let suffix = format!(
@@ -854,7 +887,7 @@ fn download_subtitle(client: &CrunchyrollClient, subtitle: &Subtitle) -> Result<
             &subtitle.format
         }
     );
-    let path = temp_path("crdl-subs-", &suffix)?;
+    let path = temp_path(scratch, ".crdl-subs-", &suffix)?;
     if let Err(error) = fs::write(&path, &body).context("write subtitle file") {
         let _ = fs::remove_file(&path);
         return Err(error);
@@ -866,6 +899,7 @@ fn download_subtitle(client: &CrunchyrollClient, subtitle: &Subtitle) -> Result<
 /// before any media starts moving.
 fn fetch_subtitles(
     client: &CrunchyrollClient,
+    scratch: &Path,
     jobs: &[(String, bool, Subtitle)],
 ) -> Result<Vec<MediaTrack>> {
     let mut tracks: Vec<Option<MediaTrack>> = vec![None; jobs.len()];
@@ -876,7 +910,7 @@ fn fetch_subtitles(
             .enumerate()
             .map(|(index, (locale, is_cc, subtitle))| {
                 scope.spawn(move || -> Result<(usize, MediaTrack)> {
-                    let file = download_subtitle(client, subtitle).with_context(|| {
+                    let file = download_subtitle(client, scratch, subtitle).with_context(|| {
                         format!("download subtitles for {}", language_name(locale))
                     })?;
                     Ok((
@@ -930,6 +964,7 @@ struct MediaResults {
 fn download_media(
     client: &CrunchyrollClient,
     options: &DownloadOptions,
+    scratch: &Path,
     versions: &[(String, String)],
     first_episode: &Episode,
     active_streams: &Mutex<HashMap<String, String>>,
@@ -956,7 +991,7 @@ fn download_media(
                             content_id,
                             first_episode,
                             active_streams,
-                            &Destination::Files,
+                            &Destination::Files(scratch),
                         );
                         let mut results = results.lock().expect("download results poisoned");
                         match outcome {
@@ -1159,6 +1194,7 @@ pub fn download_episode(
         return Ok(());
     }
 
+    let scratch = scratch_dir(output_file.as_deref());
     let guid_by_locale = build_guid_by_locale(info, base_content_id);
     let audio_langs = if options.audio_langs == ["all"] {
         let mut result = Vec::new();
@@ -1245,24 +1281,28 @@ pub fn download_episode(
             let caption = first_episode.captions[&locale].clone();
             sub_jobs.push((locale, true, caption));
         }
-        let subtitle_tracks = fetch_subtitles(client, &sub_jobs)?;
+        let subtitle_tracks = fetch_subtitles(client, &scratch, &sub_jobs)?;
         if !subtitle_tracks.is_empty() {
             println!("Downloaded subtitles!");
         }
 
         let outcome = match &output_file {
-            Some(output_file) => {
-                download_media(client, options, &versions, &first_episode, &active_streams)
-                    .and_then(|(video, audio)| {
-                        let merged =
-                            merge_everything(&video, &audio, &subtitle_tracks, output_file, info);
-                        remove_track(Some(&video));
-                        for track in &audio {
-                            let _ = fs::remove_file(&track.file);
-                        }
-                        merged
-                    })
-            }
+            Some(output_file) => download_media(
+                client,
+                options,
+                &scratch,
+                &versions,
+                &first_episode,
+                &active_streams,
+            )
+            .and_then(|(video, audio)| {
+                let merged = merge_everything(&video, &audio, &subtitle_tracks, output_file, info);
+                remove_track(Some(&video));
+                for track in &audio {
+                    let _ = fs::remove_file(&track.file);
+                }
+                merged
+            }),
             None => play_media(
                 client,
                 options,
@@ -1338,6 +1378,22 @@ pub fn download_season(
 mod tests {
     use super::*;
     use crate::model::DubVersion;
+
+    /// A 1080p episode buffers twice its own size, three versions at a time, so the
+    /// temporaries belong on the disk the MKV is going to rather than in RAM-backed
+    /// `/tmp`. Playback has no output file and falls back to the system directory.
+    #[test]
+    fn a_download_buffers_beside_its_output() {
+        let output = PathBuf::from("Some Series/Some Series S01E01 - Title [1080p].mkv");
+        assert_eq!(scratch_dir(Some(&output)), Path::new("Some Series"));
+        assert_eq!(scratch_dir(None), std::env::temp_dir());
+        // A bare file name has a parent, but it is the empty path, which no file can be
+        // created in.
+        assert_eq!(
+            scratch_dir(Some(Path::new("episode.mkv"))),
+            std::env::temp_dir()
+        );
+    }
 
     fn status_error(status: u16) -> anyhow::Error {
         UnexpectedStatus {
