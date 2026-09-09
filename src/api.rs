@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
@@ -9,12 +10,38 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::model::{
-    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, Season,
-    SeasonEpisode, SeasonEpisodesResponse, SearchResponse, SeasonsResponse,
+    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, SearchResponse,
+    Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse,
 };
 
 const USER_AGENT_VALUE: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0";
+
+/// How long a TCP connection and TLS handshake may take before the host counts as
+/// unreachable. `reqwest` leaves this unset, so the connect phase is otherwise bounded
+/// only by whatever the operating system does about a SYN nobody answers.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The whole budget for an API call, headers and body together. Every one of them
+/// carries a small JSON document or a manifest, so anything this side of it is a
+/// connection that has stopped moving rather than a slow one.
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one read of a media body may go without a byte arriving.
+///
+/// `reqwest` applies a client's timeout to each read of a body rather than to the
+/// response as a whole, which is the shape media downloads need. One on-demand track is
+/// a single response covering twenty minutes of video, drained at the speed the consumer
+/// wants it, so a deadline for the whole thing would cut a healthy stream off
+/// mid-episode; a segment on a slow line has the same problem in miniature. Per read it
+/// says the one thing worth saying instead - nothing is arriving any more - and a CDN
+/// connection that has gone quiet is noticed in half a minute rather than parking a
+/// worker on it until the process is killed.
+///
+/// This only holds for a body read by hand. The convenience readers (`bytes`, `json`)
+/// take it as a deadline for the entire body, so media bodies wanted in one piece are
+/// read through `download::read_body` rather than through those.
+const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -35,14 +62,35 @@ pub struct CrunchyrollClient {
     pub debug: bool,
 }
 
+/// The client that talks to the API: one budget for the whole call, because every
+/// response it reads is small enough to arrive well inside it.
+fn build_api_client() -> Result<Client> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(API_TIMEOUT)
+        .build()
+        .context("build HTTP client")
+}
+
+/// The client that talks to the CDN, pinned to HTTP/1.1 and given `stall` as the time
+/// one read of a body may go without a byte.
+///
+/// Taken as a parameter so a test can watch a trickle of bytes against a timeout it
+/// does not have to wait half a minute for.
+fn build_media_client(stall: Duration) -> Result<Client> {
+    Client::builder()
+        .http1_only()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(stall)
+        .build()
+        .context("build media HTTP client")
+}
+
 impl CrunchyrollClient {
     pub fn new(etp_rt: String, debug: bool) -> Result<Self> {
         let client = Self {
-            http: Client::builder().build().context("build HTTP client")?,
-            media: Client::builder()
-                .http1_only()
-                .build()
-                .context("build media HTTP client")?,
+            http: build_api_client()?,
+            media: build_media_client(MEDIA_STALL_TIMEOUT)?,
             device_id: Uuid::new_v4().to_string(),
             etp_rt,
             access_token: Arc::new(RwLock::new(String::new())),
@@ -315,5 +363,87 @@ impl CrunchyrollClient {
     /// connection each costs a few sockets and takes that away.
     pub fn media_client(&self) -> &Client {
         &self.media
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Instant;
+
+    use super::{Duration, build_media_client};
+
+    /// Serves one request: the headers for a `promised`-byte body, then `sent` of those
+    /// bytes handed over one at a time `gap` apart, and silence afterwards.
+    fn dribbling_server(promised: usize, sent: usize, gap: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a test server");
+        let address = format!(
+            "http://{}/media",
+            listener.local_addr().expect("test server address")
+        );
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // The request itself is of no interest, but it has to come off the socket.
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            let headers = format!("HTTP/1.1 200 OK\r\nContent-Length: {promised}\r\n\r\n");
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            for _ in 0..sent {
+                thread::sleep(gap);
+                if stream.write_all(b"x").is_err() {
+                    return;
+                }
+            }
+            // Held open, so a client still waiting for the rest of the body is waiting
+            // on a silent socket rather than on a closed one.
+            thread::sleep(Duration::from_secs(5));
+        });
+        address
+    }
+
+    /// The media client's timeout has to apply to each read rather than to the response
+    /// as a whole: one on-demand track arrives as a single body drained at the speed the
+    /// consumer wants it, so a total deadline would cut a perfectly healthy stream off
+    /// partway through the episode.
+    #[test]
+    fn a_media_body_may_outlast_the_stall_timeout() {
+        // Six bytes 150ms apart: 900ms in all, comfortably past the timeout, with no
+        // single wait anywhere near it.
+        let url = dribbling_server(6, 6, Duration::from_millis(150));
+        let client = build_media_client(Duration::from_millis(500)).expect("media client");
+        let mut response = client.get(&url).send().expect("send the request");
+        let mut body = Vec::new();
+        response
+            .read_to_end(&mut body)
+            .expect("read the whole body");
+        assert_eq!(body, b"xxxxxx");
+    }
+
+    /// And it does have to fire. A CDN connection that goes quiet mid-body is what the
+    /// timeout is there to notice, rather than parking a worker on it until the process
+    /// is killed.
+    #[test]
+    fn a_silent_media_body_gives_up() {
+        // Promises ten bytes and sends one, leaving the client on an open, silent socket.
+        let url = dribbling_server(10, 1, Duration::from_millis(10));
+        let client = build_media_client(Duration::from_millis(300)).expect("media client");
+        let mut response = client.get(&url).send().expect("send the request");
+        let started = Instant::now();
+        let outcome = response.read_to_end(&mut Vec::new());
+        assert!(
+            outcome.is_err(),
+            "a body that stopped arriving must not read as a finished one"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "gave up only after {:?}",
+            started.elapsed()
+        );
     }
 }

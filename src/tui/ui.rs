@@ -61,7 +61,12 @@ fn highlight(focused: bool) -> Style {
 
 /// What a column shows when it holds nothing: why it is empty, or that it is still
 /// waiting for an answer.
-fn placeholder(loading: bool, error: Option<&String>, idle: &str, tick: usize) -> Vec<ListItem<'static>> {
+fn placeholder(
+    loading: bool,
+    error: Option<&String>,
+    idle: &str,
+    tick: usize,
+) -> Vec<ListItem<'static>> {
     let line = if loading {
         Line::from(vec![
             accent(SPINNER[tick % SPINNER.len()]),
@@ -300,7 +305,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let focus = app.focus;
 
     let items: Vec<ListItem> = if app.series.items.is_empty() {
-        placeholder(app.series.loading, app.series.error.as_ref(), "Nothing here.", tick)
+        placeholder(
+            app.series.loading,
+            app.series.error.as_ref(),
+            "Nothing here.",
+            tick,
+        )
     } else {
         app.series.items.iter().map(series_row).collect()
     };
