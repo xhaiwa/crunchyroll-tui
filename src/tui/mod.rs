@@ -1,4 +1,5 @@
 mod app;
+pub mod theme;
 mod ui;
 mod worker;
 
@@ -13,6 +14,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use crate::api::CrunchyrollClient;
+use crate::config;
 use crate::download::{DownloadOptions, download_episode, episode_info};
 use crate::model::SeasonEpisode;
 
@@ -34,10 +36,24 @@ pub const QUALITIES: [&str; 5] = ["1080p", "720p", "480p", "360p", "240p"];
 const TICK: Duration = Duration::from_millis(100);
 
 /// Browses the catalogue and hands episodes to mpv, or to the downloader.
-pub fn run(client: CrunchyrollClient, options: DownloadOptions) -> Result<()> {
+///
+/// `theme_name` is what `--theme` asked for, and it wins over the config file.
+pub fn run(
+    client: CrunchyrollClient,
+    options: DownloadOptions,
+    theme_name: Option<String>,
+) -> Result<()> {
+    let (mut config, mut complaints) = config::load();
+    if theme_name.is_some() {
+        config.theme.name = theme_name;
+    }
+    let (theme, warnings) = config.theme.resolve(config.directory.as_deref());
+    complaints.extend(warnings);
+
     // Anything the client would print lands on top of the frame, so collect it and let
-    // the status line show it instead.
-    let notices = Arc::new(Mutex::new(Vec::new()));
+    // the status line show it instead. Anything wrong with the config goes in with it:
+    // printed now it would be scrolled away by the alternate screen before it was read.
+    let notices = Arc::new(Mutex::new(complaints));
     let sink = Arc::clone(&notices);
     let client = client.with_notices(Arc::new(move |message: &str| {
         sink.lock()
@@ -45,7 +61,7 @@ pub fn run(client: CrunchyrollClient, options: DownloadOptions) -> Result<()> {
             .push(message.to_owned());
     }));
 
-    let app = App::new(Worker::spawn(client.clone()), options, notices);
+    let app = App::new(Worker::spawn(client.clone()), options, theme, notices);
     let mut terminal = ratatui::try_init().context("set up the terminal")?;
     let result = event_loop(&mut terminal, &client, app);
     // Give the terminal back whether or not the loop ended well, so an error message

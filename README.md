@@ -4,7 +4,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 
 ## Features
 
-- Terminal interface for browsing the catalogue and starting playback
+- Terminal interface for browsing the catalogue and starting playback, in your own colourscheme
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Playback with mpv while the stream downloads, instead of writing a file
 - Selectable video and audio quality
@@ -107,6 +107,59 @@ option keeps the value it was given on the command line, so `--audio-lang`, `--s
 
 Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
 same with the progress bars.
+
+### Colours
+
+The interface ships with no colours of its own. It draws with the sixteen palette slots
+your terminal already resolves - yellow, grey, red - so it arrives wearing whatever
+colourscheme is installed and needs no configuration to match it. If you drive your
+palette with base16-shell, tinted-theming or anything else that recolours the sixteen
+slots, this follows it already.
+
+To pin the colours anyway, write `~/.config/crunchyroll-downloader/config.toml`
+(`$XDG_CONFIG_HOME` is honoured if it is set):
+
+```toml
+[theme]
+name = "catppuccin-mocha"
+```
+
+The schemes carried are `catppuccin-mocha`, `catppuccin-latte`, `gruvbox`, `nord`,
+`tokyo-night` and `rose-pine`. Spelling is forgiving: `Rosé Pine`, `rose_pine` and
+`rosepine` all name the same one, `catppuccin` means mocha, and `--theme NAME` tries one
+without editing the file.
+
+Anything else comes from a [base16 or tinted-theming](https://github.com/tinted-theming/schemes)
+scheme file, in either the flat or the `palette:` shape:
+
+```toml
+[theme]
+base16 = "~/.config/tinted-theming/schemes/base16/everforest.yaml"
+```
+
+A relative path is taken from the directory the config file is in. `base09` becomes the
+accent, `base00` the background, `base05` the text, `base04` a heading, `base03` the dim
+text and borders, and `base08` errors.
+
+Either of those can be overridden a colour at a time. A value is a hex triple, a palette
+name, or a 256-colour index, so a single colour can stay with the terminal while the rest
+of the scheme is pinned:
+
+```toml
+[theme]
+name = "gruvbox"
+accent = "#f47521"   # or "208", or "bright yellow", or "yellow"
+background = "#1d2021"
+foreground = "#ebdbb2"
+heading = "#a89984"
+dim = "#928374"
+border = "#504945"
+error = "#fb4934"
+```
+
+A name that does not exist, a file that cannot be read or a colour that cannot be parsed
+is reported on the status line and otherwise ignored - a typo in the config should not
+stand between you and the catalogue.
 
 ### Playing instead of downloading
 

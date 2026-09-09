@@ -1,4 +1,5 @@
 mod api;
+mod config;
 mod download;
 mod drm;
 mod manifest;
@@ -73,6 +74,11 @@ struct Cli {
     /// Browse the catalogue in a terminal interface instead of naming a URL.
     #[arg(long, conflicts_with_all = ["url", "file"])]
     tui: bool,
+
+    /// Colour scheme for the terminal interface, overriding the config file. Without
+    /// one the terminal's own palette is used.
+    #[arg(long, value_name = "NAME", requires = "tui")]
+    theme: Option<String>,
 
     /// URL of the episode or series to download.
     #[arg(long, conflicts_with = "file")]
@@ -158,7 +164,7 @@ fn run() -> Result<()> {
     let client = CrunchyrollClient::new(etp_rt.to_owned(), cli.debug_manifest)?;
 
     if cli.tui {
-        return tui::run(client, opts);
+        return tui::run(client, opts, cli.theme);
     }
 
     if let Some(path) = cli.file {
