@@ -126,6 +126,7 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Asks the CDN for `url`, or for the `range` of it that is wanted.
 fn media_request(client: &CrunchyrollClient, url: &str, range: Option<String>) -> Result<Response> {
     let mut request = client
         .media_client()
@@ -145,18 +146,31 @@ fn media_request(client: &CrunchyrollClient, url: &str, range: Option<String>) -
     Ok(response)
 }
 
+/// Reads a media body that is wanted in one piece.
+///
+/// `bytes()` would be shorter, but it hands the client's timeout to the whole response
+/// rather than to one read of it, which forces a choice between cutting off a slow
+/// connection that is still delivering and waiting out one that has died. Reading it by
+/// hand keeps the per-read stall timeout for these bodies too, so a segment still
+/// arriving is never given up on and a stalled one is noticed as soon as it stalls.
+fn read_body(mut response: Response) -> Result<Vec<u8>> {
+    // Only as a hint, and only up to a point: the length is the server's word, and a
+    // wrong one should cost a few reallocations rather than the memory it asked for.
+    let expected = response.content_length().unwrap_or(0).min(16 << 20) as usize;
+    let mut body = Vec::with_capacity(expected);
+    response
+        .read_to_end(&mut body)
+        .context("read media response")?;
+    Ok(body)
+}
+
 fn download_part(client: &CrunchyrollClient, url: &str) -> Result<Vec<u8>> {
     let mut last_error = None;
     for attempt in 0..5 {
         if attempt > 0 {
             thread::sleep(Duration::from_secs((attempt * 2) as u64));
         }
-        match media_request(client, url, None).and_then(|response| {
-            response
-                .bytes()
-                .map(|bytes| bytes.to_vec())
-                .context("read media response")
-        }) {
+        match media_request(client, url, None).and_then(read_body) {
             Ok(body) => return Ok(body),
             Err(error) => last_error = Some(error),
         }
@@ -382,10 +396,12 @@ fn stream_on_demand(
 }
 
 fn download_range(client: &CrunchyrollClient, url: &str, start: u64, end: u64) -> Result<Vec<u8>> {
-    media_request(client, url, Some(format!("bytes={start}-{end}")))?
-        .bytes()
-        .map(|bytes| bytes.to_vec())
-        .context("read ranged media response")
+    read_body(media_request(
+        client,
+        url,
+        Some(format!("bytes={start}-{end}")),
+    )?)
+    .context("read ranged media response")
 }
 
 /// The two shapes a DASH representation comes in: numbered segments listed in a
@@ -746,9 +762,8 @@ fn remove_track(track: Option<&MediaTrack>) {
 }
 
 fn download_subtitle(client: &CrunchyrollClient, subtitle: &Subtitle) -> Result<PathBuf> {
-    let body = media_request(client, &subtitle.url, None)?
-        .bytes()
-        .context("read subtitle response")?;
+    let body =
+        read_body(media_request(client, &subtitle.url, None)?).context("read subtitle response")?;
     let suffix = format!(
         ".{}",
         if subtitle.format.is_empty() {

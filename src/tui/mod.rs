@@ -40,7 +40,9 @@ pub fn run(client: CrunchyrollClient, options: DownloadOptions) -> Result<()> {
     let notices = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&notices);
     let client = client.with_notices(Arc::new(move |message: &str| {
-        sink.lock().expect("notices poisoned").push(message.to_owned());
+        sink.lock()
+            .expect("notices poisoned")
+            .push(message.to_owned());
     }));
 
     let app = App::new(Worker::spawn(client.clone()), options, notices);
@@ -87,10 +89,12 @@ fn event_loop(
 
 fn report(app: &mut App, outcome: Result<String>, what: &str) {
     match outcome {
-        Ok(message) => app.notice = Some(app::Notice {
-            text: message,
-            error: false,
-        }),
+        Ok(message) => {
+            app.notice = Some(app::Notice {
+                text: message,
+                error: false,
+            })
+        }
         Err(error) => app.complain(format!("{what} failed: {error:#}")),
     }
 }

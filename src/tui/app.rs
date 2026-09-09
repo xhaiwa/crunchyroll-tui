@@ -57,12 +57,13 @@ impl<T> Default for Pane<T> {
 
 impl<T> Pane<T> {
     pub fn selected(&self) -> Option<&T> {
-        self.state.selected().and_then(|index| self.items.get(index))
+        self.state
+            .selected()
+            .and_then(|index| self.items.get(index))
     }
 
     pub fn set(&mut self, items: Vec<T>) {
-        self.state
-            .select((!items.is_empty()).then_some(0));
+        self.state.select((!items.is_empty()).then_some(0));
         self.items = items;
         self.loading = false;
     }
@@ -81,7 +82,8 @@ impl<T> Pane<T> {
         }
         let last = self.items.len() as isize - 1;
         let current = self.state.selected().unwrap_or(0) as isize;
-        self.state.select(Some(current.saturating_add(delta).clamp(0, last) as usize));
+        self.state
+            .select(Some(current.saturating_add(delta).clamp(0, last) as usize));
     }
 
     pub fn select_edge(&mut self, last: bool) {
@@ -113,11 +115,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        worker: Worker,
-        options: DownloadOptions,
-        notices: Arc<Mutex<Vec<String>>>,
-    ) -> Self {
+    pub fn new(worker: Worker, options: DownloadOptions, notices: Arc<Mutex<Vec<String>>>) -> Self {
         let mut app = Self {
             worker,
             options,
@@ -522,7 +520,11 @@ mod tests {
         pane.move_by(-5);
         assert_eq!(pane.state.selected(), Some(0));
         pane.move_by(10);
-        assert_eq!(pane.state.selected(), Some(2), "a page down stops at the end");
+        assert_eq!(
+            pane.state.selected(),
+            Some(2),
+            "a page down stops at the end"
+        );
         assert_eq!(pane.selected(), Some(&"c"));
 
         pane.select_edge(false);

@@ -76,9 +76,7 @@ impl Worker {
                 let response = match request {
                     Request::Catalog(listing) => {
                         let result = match &listing {
-                            Listing::Browse(sort) => {
-                                client.browse(SORTS[*sort].0, CATALOG_PAGE, 0)
-                            }
+                            Listing::Browse(sort) => client.browse(SORTS[*sort].0, CATALOG_PAGE, 0),
                             Listing::Search(query) => client.search(query, CATALOG_PAGE),
                         };
                         Response::Catalog {
