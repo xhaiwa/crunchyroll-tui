@@ -194,7 +194,19 @@ A file that cannot be read, a key that is not a key, a colour that cannot be par
 one is reported - on the interface's status line, or on stderr for a plain download - and
 otherwise ignored. A typo should not stand between you and the catalogue.
 
-The whole file, with everything at its default:
+[`config.example.toml`](config.example.toml) is that file written out in full, commented,
+with every value at the one the program uses anyway - so copying it changes nothing and
+you can delete your way down to what you actually care about:
+
+```shell
+mkdir -p ~/.config/crunchyroll-downloader
+cp config.example.toml ~/.config/crunchyroll-downloader/config.toml
+```
+
+A test parses it on every run of the suite and checks each value against the built-in
+default, so it cannot quietly rot.
+
+The shape of it:
 
 ```toml
 # Posters and episode stills: "auto", "on" or "off". Top level, so it has to come

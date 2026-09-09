@@ -122,7 +122,7 @@ pub fn load() -> (Config, Vec<String>) {
 mod tests {
     use ratatui::style::Color;
 
-    use super::{Config, art};
+    use super::{Config, art, keys, theme};
 
     #[test]
     fn reads_a_theme_section() {
@@ -194,6 +194,66 @@ mpv-args = [\"--fullscreen\", \"--vf=lavfi=[hqdn3d]\"]
         assert_eq!(
             config.keys.0.get("quit").expect("quit").list(),
             ["q", "ctrl-q"]
+        );
+    }
+
+    /// The example file is what someone copies into their dotfiles, so it has to parse,
+    /// it has to name settings that still exist - `deny_unknown_fields` sees to that -
+    /// and every value in it has to be the one the program would have used anyway, so
+    /// that copying it changes nothing.
+    #[test]
+    fn the_example_config_is_the_defaults_written_out() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml"))
+            .expect("config.example.toml is valid config");
+        assert_eq!(config.images, art::Setting::Auto);
+
+        let defaults = &config.defaults;
+        assert_eq!(
+            defaults.audio_lang.as_ref().expect("audio-lang").langs(),
+            ["ja-JP"]
+        );
+        assert_eq!(
+            defaults.subs_lang.as_ref().expect("subs-lang").langs(),
+            ["en-US"]
+        );
+        assert!(
+            defaults
+                .cc_lang
+                .as_ref()
+                .expect("cc-lang")
+                .langs()
+                .is_empty()
+        );
+        assert_eq!(defaults.video_quality.as_deref(), Some("1080p"));
+        assert_eq!(defaults.audio_quality.as_deref(), Some("192k"));
+        assert!(
+            defaults
+                .mpv_args
+                .as_ref()
+                .expect("mpv-args")
+                .list()
+                .is_empty(),
+            "an example that hands mpv options to everyone who copies it is a trap"
+        );
+
+        // The colours are left commented out: the default is the terminal's own palette,
+        // which is not something the file can name.
+        let (colours, warnings) = config.theme.resolve(None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(colours, theme::Theme::default());
+
+        // Every command is written out at the key it already had, in the order it
+        // already had them.
+        let (bindings, warnings) = keys::resolve(&config.keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let shipped = keys::Bindings::default();
+        for (command, name, _) in keys::COMMANDS {
+            assert_eq!(bindings.keys(command), shipped.keys(command), "keys.{name}");
+        }
+        assert_eq!(
+            config.keys.0.len(),
+            keys::COMMANDS.len(),
+            "the example lists every command there is"
         );
     }
 
