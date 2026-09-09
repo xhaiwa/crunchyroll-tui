@@ -80,6 +80,12 @@ struct Cli {
     #[arg(long, value_name = "NAME", requires = "tui")]
     theme: Option<String>,
 
+    /// Whether the terminal interface draws posters and episode stills, overriding the
+    /// config file. `auto` draws them only where the terminal speaks kitty, sixel or
+    /// iTerm2; `on` falls back to half-blocks.
+    #[arg(long, value_name = "WHEN", requires = "tui")]
+    images: Option<tui::art::Setting>,
+
     /// URL of the episode or series to download.
     #[arg(long, conflicts_with = "file")]
     url: Option<String>,
@@ -164,7 +170,7 @@ fn run() -> Result<()> {
     let client = CrunchyrollClient::new(etp_rt.to_owned(), cli.debug_manifest)?;
 
     if cli.tui {
-        return tui::run(client, opts, cli.theme);
+        return tui::run(client, opts, cli.theme, cli.images);
     }
 
     if let Some(path) = cli.file {

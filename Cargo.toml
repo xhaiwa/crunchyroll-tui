@@ -10,11 +10,18 @@ anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
+# Crunchyroll serves its artwork as JPEG, with WebP and PNG turning up here and there.
+# The rest of the decoders are megabytes of binary for formats no CDN will ever send.
+image = { version = "0.25", default-features = false, features = ["jpeg", "webp", "png"] }
 indicatif = "0.18"
 libc = "0.2"
 once_cell = "1.21"
 quick-xml = { version = "0.38", features = ["serialize"] }
 ratatui = "0.30.2"
+# The default features pull in libchafa, which has to be installed on the machine that
+# builds and on the machine that runs. Its halfblock rendering is nicer than the one
+# built in, but not at the price of a C library between the user and `cargo install`.
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 regex = "1.11"
 # http2 is not optional: without it reqwest offers only http/1.1 in the TLS handshake,
 # and Cloudflare challenges a request that claims a Firefox user agent but never speaks
