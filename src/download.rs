@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use reqwest::StatusCode;
 use reqwest::blocking::Response;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use widevine::Key;
@@ -42,6 +44,10 @@ const MAX_CONCURRENT_REQUESTS: usize = MAX_WORKERS;
 const MAX_CONCURRENT_SESSION_OPENS: usize = 1;
 /// How many times a dropped on-demand response is picked up again before giving up.
 const ON_DEMAND_RETRIES: u32 = 5;
+/// How many times a segment or an initialization part is asked for before a track is
+/// given up on. Only worth spending on an error that might answer differently next
+/// time; see `is_retryable`.
+const PART_ATTEMPTS: u32 = 5;
 const MEDIA_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0";
 
@@ -138,12 +144,60 @@ fn media_request(client: &CrunchyrollClient, url: &str, range: Option<String>) -
         request = request.header(RANGE, range);
     }
     let response = request.send().with_context(|| format!("download {url}"))?;
-    if response.status() != reqwest::StatusCode::OK
-        && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
-    {
-        bail!("unexpected status {} downloading {url}", response.status());
+    let status = response.status();
+    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+        return Err(UnexpectedStatus {
+            status,
+            url: url.to_owned(),
+        }
+        .into());
     }
     Ok(response)
+}
+
+/// A status the CDN answered a media request with, kept as a typed error so that the
+/// retry loops can tell a server having a moment apart from one that has made up its
+/// mind.
+#[derive(Debug)]
+struct UnexpectedStatus {
+    status: StatusCode,
+    url: String,
+}
+
+impl fmt::Display for UnexpectedStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unexpected status {} downloading {}",
+            self.status, self.url
+        )
+    }
+}
+
+impl std::error::Error for UnexpectedStatus {}
+
+/// Whether `error` is worth waiting a few seconds and asking again.
+///
+/// A request that never came back with a status — a refused or dropped connection, a
+/// read that timed out, a body that ended early — says nothing about whether what was
+/// asked for is there, so it gets another attempt. A request that did come back with one
+/// has been answered: the 403 of an expired URL or the 404 of a segment that is not
+/// there reads exactly the same five seconds later, so retrying it only turns a failure
+/// that is already certain into a twenty-second one. Only the statuses that mean "not
+/// now" are worth sleeping on: 429, 408, and the 5xx a CDN hands out while a node of it
+/// is unwell.
+fn is_retryable(error: &anyhow::Error) -> bool {
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<UnexpectedStatus>())
+    {
+        Some(UnexpectedStatus { status, .. }) => {
+            status.is_server_error()
+                || *status == StatusCode::TOO_MANY_REQUESTS
+                || *status == StatusCode::REQUEST_TIMEOUT
+        }
+        None => true,
+    }
 }
 
 /// Reads a media body that is wanted in one piece.
@@ -164,20 +218,41 @@ fn read_body(mut response: Response) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn download_part(client: &CrunchyrollClient, url: &str) -> Result<Vec<u8>> {
-    let mut last_error = None;
-    for attempt in 0..5 {
-        if attempt > 0 {
-            thread::sleep(Duration::from_secs((attempt * 2) as u64));
-        }
-        match media_request(client, url, None).and_then(read_body) {
-            Ok(body) => return Ok(body),
-            Err(error) => last_error = Some(error),
+/// How long to wait before attempt number `attempt + 1`.
+fn retry_gap(attempt: u32) -> Duration {
+    Duration::from_secs(u64::from(attempt) * 2)
+}
+
+/// Runs `attempt` until it succeeds, fails in a way that another attempt cannot mend, or
+/// has been run `attempts` times.
+///
+/// `gap` says how long to wait after a failed attempt, and is a parameter so that a test
+/// can spend milliseconds on what the real backoff spends twenty seconds on.
+fn with_retries<T>(
+    attempts: u32,
+    gap: impl Fn(u32) -> Duration,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut number = 1;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) if !is_retryable(&error) => return Err(error),
+            Err(error) if number == attempts => {
+                return Err(error.context(format!("failed after {attempts} attempts")));
+            }
+            Err(_) => {
+                thread::sleep(gap(number));
+                number += 1;
+            }
         }
     }
-    Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("download failed"))
-        .context("failed after 5 attempts"))
+}
+
+fn download_part(client: &CrunchyrollClient, url: &str) -> Result<Vec<u8>> {
+    with_retries(PART_ATTEMPTS, retry_gap, || {
+        media_request(client, url, None).and_then(read_body)
+    })
 }
 
 /// Segments waiting for their turn at the writer, plus how far the writer has got,
@@ -379,15 +454,22 @@ fn stream_on_demand(
                 Err(error) => error,
             };
             failures += 1;
-            if failures > ON_DEMAND_RETRIES {
+            // A response that died mid-body is picked up again, but a status the CDN has
+            // already made up its mind about ends the track now rather than after five
+            // waits on an answer that will not change; see `is_retryable`.
+            let exhausted = failures > ON_DEMAND_RETRIES;
+            if exhausted || !is_retryable(&problem) {
                 return Err(problem).with_context(|| {
-                    format!(
-                        "read on-demand media: stopped at byte {position}{} after {ON_DEMAND_RETRIES} attempts to carry on",
-                        total.map_or(String::new(), |total| format!(" of {total}"))
-                    )
+                    let of_total = total.map_or(String::new(), |total| format!(" of {total}"));
+                    let attempts = if exhausted {
+                        format!(" after {ON_DEMAND_RETRIES} attempts to carry on")
+                    } else {
+                        String::new()
+                    };
+                    format!("read on-demand media: stopped at byte {position}{of_total}{attempts}")
                 });
             }
-            thread::sleep(Duration::from_secs(u64::from(failures) * 2));
+            thread::sleep(retry_gap(failures));
             opened = open_on_demand(client, url, start, position);
         }
     })();
@@ -1256,6 +1338,98 @@ pub fn download_season(
 mod tests {
     use super::*;
     use crate::model::DubVersion;
+
+    fn status_error(status: u16) -> anyhow::Error {
+        UnexpectedStatus {
+            status: StatusCode::from_u16(status).expect("a status code"),
+            url: "https://cdn.example/segment-1.m4s".to_owned(),
+        }
+        .into()
+    }
+
+    /// Counts the attempts a retry loop spends, and never sleeps between them.
+    fn attempts_spent(outcome: impl Fn() -> anyhow::Error) -> (usize, anyhow::Error) {
+        let spent = AtomicUsize::new(0);
+        let error = with_retries(
+            PART_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                spent.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(outcome())
+            },
+        )
+        .expect_err("every attempt was told to fail");
+        (spent.load(Ordering::SeqCst), error)
+    }
+
+    /// A segment the CDN has answered for is not asked about again. Retrying a 403 or a
+    /// 404 five times with a growing backoff spends twenty seconds on an answer that was
+    /// final the first time.
+    #[test]
+    fn a_definitive_status_is_asked_for_once() {
+        for status in [403, 404, 410, 416] {
+            let (spent, error) = attempts_spent(|| status_error(status));
+            assert_eq!(spent, 1, "status {status} was retried");
+            // And the reason still reaches the caller intact.
+            let reported = format!("{error:#}");
+            assert!(
+                reported.contains(&status.to_string())
+                    && reported.contains("https://cdn.example/segment-1.m4s"),
+                "unhelpful error for status {status}: {reported}"
+            );
+        }
+    }
+
+    /// Whereas the statuses that mean "not now" are worth the wait, as is anything that
+    /// never got as far as a status.
+    #[test]
+    fn a_busy_server_and_a_broken_connection_are_retried() {
+        for status in [429, 408, 500, 502, 503] {
+            let (spent, _) = attempts_spent(|| status_error(status));
+            assert_eq!(
+                spent as u32, PART_ATTEMPTS,
+                "status {status} was not retried"
+            );
+        }
+        let (spent, error) = attempts_spent(|| {
+            anyhow::Error::new(io::Error::new(io::ErrorKind::ConnectionReset, "reset"))
+                .context("read media response")
+        });
+        assert_eq!(spent as u32, PART_ATTEMPTS);
+        assert!(format!("{error:#}").contains("failed after 5 attempts"));
+    }
+
+    /// The status travels under whatever context the layers above it added, so the
+    /// classification has to look down the chain rather than at the outermost error.
+    #[test]
+    fn a_wrapped_status_is_still_recognised() {
+        assert!(!is_retryable(
+            &status_error(404).context("download initialization segment")
+        ));
+        assert!(is_retryable(
+            &status_error(503).context("download initialization segment")
+        ));
+    }
+
+    /// A transient failure that clears up is not held against the segment.
+    #[test]
+    fn a_recovered_attempt_succeeds() {
+        let spent = AtomicUsize::new(0);
+        let body = with_retries(
+            PART_ATTEMPTS,
+            |_| Duration::ZERO,
+            || {
+                if spent.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(status_error(503))
+                } else {
+                    Ok(b"segment".to_vec())
+                }
+            },
+        )
+        .expect("the third attempt was told to succeed");
+        assert_eq!(body, b"segment");
+        assert_eq!(spent.load(Ordering::SeqCst), 3);
+    }
 
     fn segment_body(index: usize) -> Vec<u8> {
         vec![b'a' + (index % 26) as u8; 1 + index % 7]
