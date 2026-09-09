@@ -8,6 +8,7 @@ use crate::model::{CatalogItem, Season, SeasonEpisode};
 use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
+use super::theme::Theme;
 use super::worker::{Listing, Request, Response, Worker};
 
 /// Which column the keyboard is pointed at.
@@ -127,6 +128,8 @@ impl Picker {
 pub struct App {
     worker: Worker,
     pub options: DownloadOptions,
+    /// The colours everything is drawn in.
+    pub theme: Theme,
     pub focus: Focus,
     pub series: Pane<CatalogItem>,
     pub seasons: Pane<Season>,
@@ -146,10 +149,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(worker: Worker, options: DownloadOptions, notices: Arc<Mutex<Vec<String>>>) -> Self {
+    pub fn new(
+        worker: Worker,
+        options: DownloadOptions,
+        theme: Theme,
+        notices: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
         let mut app = Self {
             worker,
             options,
+            theme,
             focus: Focus::Series,
             series: Pane::default(),
             seasons: Pane::default(),
