@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
@@ -8,17 +8,9 @@ use crate::model::{CatalogItem, Season, SeasonEpisode};
 use crate::util::language_name;
 
 use super::app::{App, Focus, Picker};
+use super::theme::Theme;
 
-const ACCENT: Color = Color::Rgb(244, 117, 33);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn dim(text: impl Into<String>) -> Span<'static> {
-    Span::styled(text.into(), Style::new().fg(Color::DarkGray))
-}
-
-fn accent(text: impl Into<String>) -> Span<'static> {
-    Span::styled(text.into(), Style::new().fg(ACCENT))
-}
 
 /// `1461000` becomes `24:21`, and an hour-long special `1:02:03`.
 fn duration(milliseconds: u64) -> String {
@@ -31,37 +23,19 @@ fn duration(milliseconds: u64) -> String {
     }
 }
 
-fn pane_block(title: &str, focused: bool) -> Block<'static> {
-    let (border, heading) = if focused {
-        (
-            Style::new().fg(ACCENT),
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )
+fn pane_block(theme: &Theme, title: &str, focused: bool) -> Block<'static> {
+    let heading = if focused {
+        theme.title(format!(" {title} "))
     } else {
-        (
-            Style::new().fg(Color::DarkGray),
-            Style::new().fg(Color::Gray),
-        )
+        Span::styled(format!(" {title} "), Style::new().fg(theme.heading))
     };
-    Block::bordered()
-        .border_style(border)
-        .title(Span::styled(format!(" {title} "), heading))
-}
-
-fn highlight(focused: bool) -> Style {
-    if focused {
-        Style::new()
-            .bg(ACCENT)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
-    }
+    theme.bordered(focused).title(heading)
 }
 
 /// What a column shows when it holds nothing: why it is empty, or that it is still
 /// waiting for an answer.
 fn placeholder(
+    theme: &Theme,
     loading: bool,
     error: Option<&String>,
     idle: &str,
@@ -69,21 +43,18 @@ fn placeholder(
 ) -> Vec<ListItem<'static>> {
     let line = if loading {
         Line::from(vec![
-            accent(SPINNER[tick % SPINNER.len()]),
-            Span::raw(" Loading..."),
+            theme.accent(SPINNER[tick % SPINNER.len()]),
+            theme.text(" Loading..."),
         ])
     } else if let Some(error) = error {
-        Line::from(Span::styled(
-            error.clone(),
-            Style::new().fg(Color::LightRed),
-        ))
+        Line::from(theme.error(error.clone()))
     } else {
-        Line::from(dim(idle.to_owned()))
+        Line::from(theme.dim(idle.to_owned()))
     };
     vec![ListItem::new(line)]
 }
 
-fn series_row(series: &CatalogItem) -> ListItem<'static> {
+fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
     let metadata = &series.series_metadata;
     let mut tags = Vec::new();
     if metadata.season_count > 1 {
@@ -92,14 +63,14 @@ fn series_row(series: &CatalogItem) -> ListItem<'static> {
     if metadata.is_dubbed {
         tags.push("dub".to_owned());
     }
-    let mut spans = vec![Span::raw(series.title.clone())];
+    let mut spans = vec![theme.text(series.title.clone())];
     if !tags.is_empty() {
-        spans.push(dim(format!("  {}", tags.join(" · "))));
+        spans.push(theme.dim(format!("  {}", tags.join(" · "))));
     }
     ListItem::new(Line::from(spans))
 }
 
-fn season_row(season: &Season, series_title: &str) -> ListItem<'static> {
+fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'static> {
     // A season usually carries the title of the series, which the column to the left
     // is already showing.
     let title = if season.title.is_empty() || season.title == series_title {
@@ -107,58 +78,53 @@ fn season_row(season: &Season, series_title: &str) -> ListItem<'static> {
     } else {
         season.title.clone()
     };
-    let mut spans = vec![Span::raw(title)];
+    let mut spans = vec![theme.text(title)];
     if season.number_of_episodes > 0 {
-        spans.push(dim(format!("  {} ep", season.number_of_episodes)));
+        spans.push(theme.dim(format!("  {} ep", season.number_of_episodes)));
     }
     ListItem::new(Line::from(spans))
 }
 
-fn episode_row(episode: &SeasonEpisode) -> ListItem<'static> {
+fn episode_row(theme: &Theme, episode: &SeasonEpisode) -> ListItem<'static> {
     let number = if episode.episode.is_empty() {
         episode.episode_number.to_string()
     } else {
         episode.episode.clone()
     };
-    let mut spans = vec![accent(format!("E{number:<3}"))];
+    let mut spans = vec![theme.accent(format!("E{number:<3}"))];
     if episode.duration_ms > 0 {
-        spans.push(dim(format!("{:>6}  ", duration(episode.duration_ms))));
+        spans.push(theme.dim(format!("{:>6}  ", duration(episode.duration_ms))));
     }
-    spans.push(Span::raw(episode.title.clone()));
+    spans.push(theme.text(episode.title.clone()));
     ListItem::new(Line::from(spans))
 }
 
 fn header(app: &App) -> Paragraph<'static> {
+    let theme = &app.theme;
     let left = match &app.editing {
         Some(query) => Line::from(vec![
-            Span::styled("Search: ", Style::new().fg(ACCENT)),
-            Span::raw(query.clone()),
-            Span::styled("▏", Style::new().fg(ACCENT)),
+            theme.accent("Search: "),
+            theme.text(query.clone()),
+            theme.accent("▏"),
         ]),
         None => Line::from(vec![
-            Span::styled(
-                app.listing.label(),
-                Style::new().add_modifier(Modifier::BOLD),
-            ),
-            dim(format!("   {} series", app.series.items.len())),
+            theme.strong(app.listing.label()),
+            theme.dim(format!("   {} series", app.series.items.len())),
         ]),
     };
     let right = Line::from(vec![
-        dim("audio "),
-        accent(language_name(&app.audio()).to_owned()),
-        dim("  subs "),
-        accent(language_name(&app.subs()).to_owned()),
-        dim("  video "),
-        accent(app.options.video_quality.clone()),
-        Span::raw(" "),
+        theme.dim("audio "),
+        theme.accent(language_name(&app.audio()).to_owned()),
+        theme.dim("  subs "),
+        theme.accent(language_name(&app.subs()).to_owned()),
+        theme.dim("  video "),
+        theme.accent(app.options.video_quality.clone()),
+        theme.text(" "),
     ])
     .right_aligned();
-    let block = Block::bordered()
-        .border_style(Style::new().fg(Color::DarkGray))
-        .title(Span::styled(
-            " Crunchyroll ",
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))
+    let block = theme
+        .bordered(false)
+        .title(theme.title(" Crunchyroll "))
         .title_top(right);
     Paragraph::new(left).block(block)
 }
@@ -166,6 +132,7 @@ fn header(app: &App) -> Paragraph<'static> {
 /// The panel under the columns: everything about the item the cursor is on that does
 /// not fit on its one line.
 fn details(app: &App) -> Vec<Line<'static>> {
+    let theme = &app.theme;
     let mut lines = Vec::new();
     match app.focus {
         Focus::Series | Focus::Seasons => {
@@ -173,10 +140,7 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 return lines;
             };
             let metadata = &series.series_metadata;
-            lines.push(Line::from(Span::styled(
-                series.title.clone(),
-                Style::new().add_modifier(Modifier::BOLD),
-            )));
+            lines.push(Line::from(theme.strong(series.title.clone())));
             let mut facts = Vec::new();
             if metadata.series_launch_year > 0 {
                 facts.push(metadata.series_launch_year.to_string());
@@ -194,17 +158,14 @@ fn details(app: &App) -> Vec<Line<'static>> {
             if metadata.is_simulcast {
                 facts.push("simulcast".to_owned());
             }
-            lines.push(Line::from(dim(facts.join(" · "))));
-            lines.push(Line::from(series.description.clone()));
+            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            lines.push(Line::from(theme.text(series.description.clone())));
         }
         Focus::Episodes => {
             let Some(episode) = app.episodes.selected() else {
                 return lines;
             };
-            lines.push(Line::from(Span::styled(
-                episode.title.clone(),
-                Style::new().add_modifier(Modifier::BOLD),
-            )));
+            lines.push(Line::from(theme.strong(episode.title.clone())));
             let mut facts = vec![format!(
                 "S{}E{}",
                 episode.season_number,
@@ -228,8 +189,8 @@ fn details(app: &App) -> Vec<Line<'static>> {
             {
                 facts.push(date.to_owned());
             }
-            lines.push(Line::from(dim(facts.join(" · "))));
-            lines.push(Line::from(episode.description.clone()));
+            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            lines.push(Line::from(theme.text(episode.description.clone())));
         }
     }
     lines
@@ -250,7 +211,13 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 
 /// The language list: every locale the selection offers, the one in use marked, and its
 /// code beside the name for anyone who thinks in locales rather than in languages.
-fn picker_overlay(frame: &mut Frame, area: Rect, picker: &mut Picker, current: &str) {
+fn picker_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    picker: &mut Picker,
+    current: &str,
+) {
     let column = picker
         .pane
         .items
@@ -266,9 +233,9 @@ fn picker_overlay(frame: &mut Frame, area: Rect, picker: &mut Picker, current: &
             let name = language_name(locale);
             let padding = " ".repeat(column - Span::raw(name).width() + 2);
             ListItem::new(Line::from(vec![
-                Span::raw(if locale == current { "● " } else { "  " }),
-                Span::raw(format!("{name}{padding}")),
-                dim(locale.clone()),
+                theme.text(if locale == current { "● " } else { "  " }),
+                theme.text(format!("{name}{padding}")),
+                theme.dim(locale.clone()),
             ]))
         })
         .collect();
@@ -283,15 +250,12 @@ fn picker_overlay(frame: &mut Frame, area: Rect, picker: &mut Picker, current: &
     frame.render_stateful_widget(
         List::new(items)
             .block(
-                Block::bordered()
-                    .border_style(Style::new().fg(ACCENT))
-                    .title(Span::styled(
-                        picker.title(),
-                        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ))
-                    .title_bottom(dim(" ⏎ apply · tab other list · esc cancel ")),
+                theme
+                    .bordered(true)
+                    .title(theme.title(picker.title()))
+                    .title_bottom(theme.dim(" ⏎ apply · tab other list · esc cancel ")),
             )
-            .highlight_style(highlight(true))
+            .highlight_style(theme.highlight(true))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
         area,
@@ -299,7 +263,7 @@ fn picker_overlay(frame: &mut Frame, area: Rect, picker: &mut Picker, current: &
     );
 }
 
-fn help_overlay(frame: &mut Frame, area: Rect) {
+fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
     let keys = [
         ("↑ ↓ / j k", "move the cursor"),
         ("⏎ / → / l", "open the selection, and play an episode"),
@@ -319,18 +283,11 @@ fn help_overlay(frame: &mut Frame, area: Rect) {
     let popup = popup(area, 66, keys.len() as u16 + 2);
     let lines: Vec<Line> = keys
         .iter()
-        .map(|(key, what)| Line::from(vec![accent(format!(" {key:<13}")), Span::raw(*what)]))
+        .map(|(key, what)| Line::from(vec![theme.accent(format!(" {key:<13}")), theme.text(*what)]))
         .collect();
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .border_style(Style::new().fg(ACCENT))
-                .title(Span::styled(
-                    " Keys ",
-                    Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )),
-        ),
+        Paragraph::new(lines).block(theme.bordered(true).title(theme.title(" Keys "))),
         popup,
     );
 }
@@ -360,24 +317,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(body);
 
+    // Copied out before the panes borrow the app to draw themselves.
+    let theme = app.theme;
     let tick = app.tick;
     let focus = app.focus;
 
     let items: Vec<ListItem> = if app.series.items.is_empty() {
         placeholder(
+            &theme,
             app.series.loading,
             app.series.error.as_ref(),
             "Nothing here.",
             tick,
         )
     } else {
-        app.series.items.iter().map(series_row).collect()
+        app.series
+            .items
+            .iter()
+            .map(|series| series_row(&theme, series))
+            .collect()
     };
     let focused = focus == Focus::Series;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block("Series", focused))
-            .highlight_style(highlight(focused))
+            .block(pane_block(&theme, "Series", focused))
+            .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
         left,
@@ -386,6 +350,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let items: Vec<ListItem> = if app.seasons.items.is_empty() {
         placeholder(
+            &theme,
             app.seasons.loading,
             app.seasons.error.as_ref(),
             "Pick a series.",
@@ -399,14 +364,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.seasons
             .items
             .iter()
-            .map(|season| season_row(season, series_title))
+            .map(|season| season_row(&theme, season, series_title))
             .collect()
     };
     let focused = focus == Focus::Seasons;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block("Seasons", focused))
-            .highlight_style(highlight(focused))
+            .block(pane_block(&theme, "Seasons", focused))
+            .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
         middle,
@@ -415,19 +380,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let items: Vec<ListItem> = if app.episodes.items.is_empty() {
         placeholder(
+            &theme,
             app.episodes.loading,
             app.episodes.error.as_ref(),
             "Pick a season.",
             tick,
         )
     } else {
-        app.episodes.items.iter().map(episode_row).collect()
+        app.episodes
+            .items
+            .iter()
+            .map(|episode| episode_row(&theme, episode))
+            .collect()
     };
     let focused = focus == Focus::Episodes;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block("Episodes", focused))
-            .highlight_style(highlight(focused))
+            .block(pane_block(&theme, "Episodes", focused))
+            .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
         right,
@@ -438,34 +408,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(
             Paragraph::new(details(app))
                 .wrap(Wrap { trim: true })
-                .block(
-                    Block::bordered()
-                        .border_style(Style::new().fg(Color::DarkGray))
-                        .title(dim(" Details ")),
-                ),
+                .block(theme.bordered(false).title(theme.dim(" Details "))),
             bottom,
         );
     }
 
     let line = match &app.notice {
-        Some(notice) if notice.error => Line::from(Span::styled(
-            format!(" {}", notice.text),
-            Style::new().fg(Color::LightRed),
-        )),
-        Some(notice) => Line::from(Span::raw(format!(" {}", notice.text))),
-        None => Line::from(dim(" Ready.")),
+        Some(notice) if notice.error => Line::from(theme.error(format!(" {}", notice.text))),
+        Some(notice) => Line::from(theme.text(format!(" {}", notice.text))),
+        None => Line::from(theme.dim(" Ready.")),
     };
     frame.render_widget(Paragraph::new(line), status);
 
     frame.render_widget(
-        Paragraph::new(Line::from(dim(
+        Paragraph::new(Line::from(theme.dim(
             " ↑↓ move   ⏎ open/play   ← back   / search   d download   a/s language   v quality   ? keys   q quit",
         ))),
         keys,
     );
 
     if app.show_help {
-        help_overlay(frame, area);
+        help_overlay(frame, area, &theme);
     }
 
     // Read what is in use before the list borrows the app to draw itself.
@@ -477,7 +440,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     });
     if let (Some(current), Some(picker)) = (current, app.picker.as_mut()) {
-        picker_overlay(frame, area, picker, &current);
+        picker_overlay(frame, area, &theme, picker, &current);
     }
 }
 
@@ -487,11 +450,14 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::style::Color;
 
     use crate::download::DownloadOptions;
     use crate::model::{CatalogItem, Season, SeasonEpisode, SeriesMetadata};
     use crate::tui::app::App;
+    use crate::tui::theme::{self, Theme};
     use crate::tui::worker::Worker;
 
     use super::{draw, duration};
@@ -504,6 +470,10 @@ mod tests {
     }
 
     fn app() -> App {
+        themed(Theme::default())
+    }
+
+    fn themed(theme: Theme) -> App {
         let options = DownloadOptions {
             audio_langs: vec!["ja-JP".to_owned()],
             subtitles_langs: vec!["en-US".to_owned()],
@@ -516,6 +486,7 @@ mod tests {
         let mut app = App::new(
             Worker::detached(),
             options,
+            theme,
             Arc::new(Mutex::new(Vec::new())),
         );
         app.series.set(vec![CatalogItem {
@@ -550,12 +521,25 @@ mod tests {
         app
     }
 
-    fn rendered(width: u16, height: u16, app: &mut App) -> String {
+    fn buffer(width: u16, height: u16, app: &mut App) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal.draw(|frame| draw(frame, app)).expect("draw");
-        terminal
-            .backend()
-            .buffer()
+        terminal.backend().buffer().clone()
+    }
+
+    /// The first cell of the cursor row of the focused column: the arrow the list draws
+    /// in front of the selected item.
+    fn cursor_cell(buffer: &Buffer) -> ratatui::buffer::Cell {
+        buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "\u{203a}")
+            .expect("a cursor on the focused column")
+            .clone()
+    }
+
+    fn rendered(width: u16, height: u16, app: &mut App) -> String {
+        buffer(width, height, app)
             .content()
             .iter()
             .map(ratatui::buffer::Cell::symbol)
@@ -579,6 +563,57 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
+    }
+
+    /// Nothing is worth less to someone with a colourscheme than an app that ignores it,
+    /// so out of the box every colour has to be one the terminal resolves.
+    #[test]
+    fn asks_for_no_colour_of_its_own() {
+        let mut app = app();
+        app.show_help = true;
+        for cell in buffer(120, 30, &mut app).content() {
+            for color in [cell.fg, cell.bg] {
+                assert!(
+                    !matches!(color, Color::Rgb(..)),
+                    "the default theme named {color:?} instead of leaving it to the terminal"
+                );
+            }
+        }
+    }
+
+    /// The cursor row on a light scheme is the one place a hard-coded black would show:
+    /// it has to be the theme's own page colour, whatever that is.
+    #[test]
+    fn paints_the_cursor_row_in_the_theme_background() {
+        let latte = theme::named("catppuccin-latte").expect("a shipped theme");
+        let mut app = themed(latte);
+        // The series column has the keyboard, and its one row is under the cursor.
+        let buffer = buffer(120, 30, &mut app);
+        let cell = cursor_cell(&buffer);
+        assert_eq!(cell.bg, latte.accent);
+        assert_eq!(cell.fg, latte.background);
+        assert_ne!(cell.fg, Color::Black);
+
+        // Including the text of the row, which carries colours of its own until the
+        // cursor lands on it.
+        let title = buffer
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "F")
+            .expect("the title of the selected series");
+        assert_eq!(title.bg, latte.accent);
+        assert_eq!(title.fg, latte.background);
+    }
+
+    /// Without a theme there is no background colour to name, so the terminal is asked to
+    /// swap the two round itself rather than being told to paint anything.
+    #[test]
+    fn leaves_the_cursor_row_to_the_terminal_by_default() {
+        let mut app = app();
+        let cell = cursor_cell(&buffer(120, 30, &mut app));
+        assert_eq!(cell.fg, Color::Yellow);
+        assert_eq!(cell.bg, Color::Reset);
+        assert!(cell.modifier.contains(ratatui::style::Modifier::REVERSED));
     }
 
     fn press(app: &mut App, code: KeyCode) {
