@@ -1,4 +1,5 @@
 mod app;
+pub mod art;
 pub mod theme;
 mod ui;
 mod worker;
@@ -37,11 +38,13 @@ const TICK: Duration = Duration::from_millis(100);
 
 /// Browses the catalogue and hands episodes to mpv, or to the downloader.
 ///
-/// `theme_name` is what `--theme` asked for, and it wins over the config file.
+/// `theme_name` is what `--theme` asked for and `images` what `--images` asked for; both
+/// win over the config file.
 pub fn run(
     client: CrunchyrollClient,
     options: DownloadOptions,
     theme_name: Option<String>,
+    images: Option<art::Setting>,
 ) -> Result<()> {
     let (mut config, mut complaints) = config::load();
     if theme_name.is_some() {
@@ -49,6 +52,7 @@ pub fn run(
     }
     let (theme, warnings) = config.theme.resolve(config.directory.as_deref());
     complaints.extend(warnings);
+    let images = images.unwrap_or(config.images);
 
     // Anything the client would print lands on top of the frame, so collect it and let
     // the status line show it instead. Anything wrong with the config goes in with it:
@@ -61,8 +65,18 @@ pub fn run(
             .push(message.to_owned());
     }));
 
-    let app = App::new(Worker::spawn(client.clone()), options, theme, notices);
     let mut terminal = ratatui::try_init().context("set up the terminal")?;
+    // The terminal is asked what graphics it can draw by writing escape sequences and
+    // reading the answer back off stdin, so this belongs after the alternate screen is
+    // entered and before the event loop starts taking keys off the same stdin.
+    let gallery = art::Gallery::open(images);
+    let app = App::new(
+        Worker::spawn(client.clone()),
+        options,
+        theme,
+        notices,
+        gallery,
+    );
     let result = event_loop(&mut terminal, &client, app);
     // Give the terminal back whether or not the loop ended well, so an error message
     // is not printed into the alternate screen that is about to disappear.
@@ -86,12 +100,15 @@ fn event_loop(
                     Action::None => {}
                     Action::Quit => app.quit = true,
                     Action::Play(episodes) => {
-                        let outcome = suspend(terminal, || play(client, &app.options, &episodes));
+                        let options = app.options.clone();
+                        let outcome = suspend(terminal, || play(client, &options, &episodes));
+                        app.art.forget();
                         report(&mut app, outcome, "Playback");
                     }
                     Action::Download(episodes) => {
-                        let outcome =
-                            suspend(terminal, || download(client, &app.options, &episodes));
+                        let options = app.options.clone();
+                        let outcome = suspend(terminal, || download(client, &options, &episodes));
+                        app.art.forget();
                         report(&mut app, outcome, "Download");
                     }
                 },
@@ -116,7 +133,8 @@ fn report(app: &mut App, outcome: Result<String>, what: &str) {
 }
 
 /// Hands the terminal back to whatever needs to draw on it - mpv, or a progress bar -
-/// and takes it again afterwards.
+/// and takes it again afterwards. Whatever had it may have cleared the artwork the
+/// terminal was holding on our behalf, so the caller drops what it had encoded.
 ///
 /// The panic hook ratatui installs is set up once, by `try_init`, so the screen is
 /// re-entered by hand rather than by initialising a second time.

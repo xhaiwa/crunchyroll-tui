@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::tui::theme;
+use crate::tui::{art, theme};
 
 /// `config.toml`. Nothing in it is required, and a file that is not there is not a
 /// problem - it is how most runs go.
@@ -13,6 +13,9 @@ use crate::tui::theme;
 pub struct Config {
     #[serde(default)]
     pub theme: theme::Settings,
+    /// Whether the posters and episode stills are drawn. `--images` overrides it.
+    #[serde(default)]
+    pub images: art::Setting,
     /// The directory the file was read from, so a relative path inside it points at the
     /// file the user meant rather than at the working directory.
     #[serde(skip)]
@@ -69,7 +72,7 @@ pub fn load() -> (Config, Vec<String>) {
 mod tests {
     use ratatui::style::Color;
 
-    use super::Config;
+    use super::{Config, art};
 
     #[test]
     fn reads_a_theme_section() {
@@ -87,6 +90,19 @@ dim = \"bright black\"
         assert_eq!(theme.accent, Color::Rgb(0xf4, 0x75, 0x21));
         assert_eq!(theme.dim, Color::DarkGray);
         assert_eq!(theme.background, Color::Rgb(0x28, 0x28, 0x28));
+    }
+
+    #[test]
+    fn reads_the_artwork_setting() {
+        for (text, expected) in [
+            ("", art::Setting::Auto),
+            ("images = \"on\"\n", art::Setting::On),
+            ("images = \"off\"\n", art::Setting::Off),
+        ] {
+            let config: Config = toml::from_str(text).expect("valid config");
+            assert_eq!(config.images, expected, "{text:?}");
+        }
+        assert!(toml::from_str::<Config>("images = \"yes\"\n").is_err());
     }
 
     /// A file with no `[theme]` in it is a valid file, and a misspelt key is worth

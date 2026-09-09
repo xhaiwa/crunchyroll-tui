@@ -8,6 +8,7 @@ use crate::model::{CatalogItem, Season, SeasonEpisode};
 use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
+use super::art::Gallery;
 use super::theme::Theme;
 use super::worker::{Listing, Request, Response, Worker};
 
@@ -130,6 +131,8 @@ pub struct App {
     pub options: DownloadOptions,
     /// The colours everything is drawn in.
     pub theme: Theme,
+    /// The posters and episode stills, and the terminal's ability to draw them.
+    pub art: Gallery,
     pub focus: Focus,
     pub series: Pane<CatalogItem>,
     pub seasons: Pane<Season>,
@@ -154,11 +157,13 @@ impl App {
         options: DownloadOptions,
         theme: Theme,
         notices: Arc<Mutex<Vec<String>>>,
+        art: Gallery,
     ) -> Self {
         let mut app = Self {
             worker,
             options,
             theme,
+            art,
             focus: Focus::Series,
             series: Pane::default(),
             seasons: Pane::default(),
@@ -300,6 +305,7 @@ impl App {
                 }
             }
         }
+        self.art.drain();
         let pending: Vec<String> = self
             .notices
             .lock()
@@ -634,6 +640,10 @@ impl App {
             KeyCode::Char('A') => self.cycle_locale(true),
             KeyCode::Char('S') => self.cycle_locale(false),
             KeyCode::Char('v') => self.cycle_quality(),
+            KeyCode::Char('i') => {
+                let message = self.art.toggle();
+                self.say(message);
+            }
             KeyCode::Char('o') => self.cycle_sort(),
             KeyCode::Char('r') => self.reload(),
             _ => {}
