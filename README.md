@@ -5,6 +5,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 ## Features
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme
+- Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Playback with mpv while the stream downloads, instead of writing a file
 - Selectable video and audio quality
@@ -92,6 +93,7 @@ cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE
 | `a`, `s` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
 | `A`, `S` | Step to the next audio or subtitle locale without opening the list |
 | `v` | Cycle the video quality |
+| `i` | Show or hide the poster and the episode still |
 | `r` | Reload the current column |
 | `?` | Show the keys |
 | `q` | Quit |
@@ -107,6 +109,44 @@ option keeps the value it was given on the command line, so `--audio-lang`, `--s
 
 Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
 same with the progress bars.
+
+### Cover art
+
+The series poster gets a column of its own beside the lists, and the still from the
+selected episode sits in the Details panel. They are drawn as pixels, with whichever
+graphics protocol the terminal answers to - kitty, sixel or iTerm2 - which is asked for
+once at startup rather than guessed from environment variables.
+
+By default they appear only where one of those protocols is available. Every terminal can
+manage half-blocks, but half-blocks are a mosaic of coloured cells rather than a picture,
+and they drag a hundred colours of their own across the colourscheme the rest of the
+interface is careful to wear - so they are opt-in:
+
+```shell
+cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --images on
+```
+
+`--images off` turns the artwork off altogether, and `i` toggles it while the interface is
+running - which also names the protocol in use, if you are wondering why a picture is not
+where you expected it. The same setting lives in the config file, above any `[theme]`
+section:
+
+```toml
+images = "auto"   # or "on", or "off"
+
+[theme]
+name = "gruvbox"
+```
+
+Posters and stills come off Crunchyroll's own image CDN, at the smallest size that covers
+the panel, on threads of their own so nothing waits on them. Nothing is written to disk.
+
+Pair it with mpv's own kitty output and the whole thing - catalogue, artwork and video -
+stays inside the terminal:
+
+```shell
+cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --mpv-arg --vo=kitty
+```
 
 ### Colours
 
