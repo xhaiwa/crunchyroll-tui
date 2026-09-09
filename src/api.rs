@@ -9,8 +9,8 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::model::{
-    Episode, EpisodeInfo, EpisodeMetadataResponse, Season, SeasonEpisode, SeasonEpisodesResponse,
-    SeasonsResponse,
+    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, Season,
+    SeasonEpisode, SeasonEpisodesResponse, SearchResponse, SeasonsResponse,
 };
 
 const USER_AGENT_VALUE: &str =
@@ -29,6 +29,9 @@ pub struct CrunchyrollClient {
     etp_rt: String,
     access_token: Arc<RwLock<String>>,
     refresh_lock: Arc<Mutex<()>>,
+    /// Where the running commentary goes. It is printed by default, but the TUI owns
+    /// the terminal and needs to collect it instead of having it drawn over the frame.
+    notice: Arc<dyn Fn(&str) + Send + Sync>,
     pub debug: bool,
 }
 
@@ -44,10 +47,17 @@ impl CrunchyrollClient {
             etp_rt,
             access_token: Arc::new(RwLock::new(String::new())),
             refresh_lock: Arc::new(Mutex::new(())),
+            notice: Arc::new(|message| println!("{message}")),
             debug,
         };
         client.refresh_access_token()?;
         Ok(client)
+    }
+
+    /// Sends everything this client would have printed to `notice` instead.
+    pub fn with_notices(mut self, notice: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.notice = notice;
+        self
     }
 
     fn refresh_access_token(&self) -> Result<()> {
@@ -120,7 +130,7 @@ impl CrunchyrollClient {
             if response.status() != reqwest::StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(response);
             }
-            println!("Access token expired. Refetching one...");
+            (self.notice)("Access token expired. Refetching one...");
             self.refresh_access_token()?;
         }
         unreachable!()
@@ -190,6 +200,45 @@ impl CrunchyrollClient {
             "https://www.crunchyroll.com/content/v2/cms/seasons/{id}/episodes?preferred_audio_language={audio_locale}&locale={sub_locale}"
         );
         Ok(self.get_json::<SeasonEpisodesResponse>(&url)?.data)
+    }
+
+    /// The catalogue, in whatever order `sort_by` asks for: `popularity`,
+    /// `newly_added` or `alphabetical`.
+    ///
+    /// Only series are asked for. A movie listing has no seasons and no episodes
+    /// endpoint, so one in the list would be a dead end for anyone who selected it.
+    pub fn browse(&self, sort_by: &str, count: usize, start: usize) -> Result<Vec<CatalogItem>> {
+        let mut url = reqwest::Url::parse("https://www.crunchyroll.com/content/v2/discover/browse")
+            .expect("valid browse URL");
+        url.query_pairs_mut()
+            .append_pair("sort_by", sort_by)
+            .append_pair("type", "series")
+            .append_pair("n", &count.to_string())
+            .append_pair("start", &start.to_string())
+            .append_pair("ratings", "true")
+            .append_pair("locale", "en-US");
+        Ok(self.get_json::<BrowseResponse>(url.as_str())?.data)
+    }
+
+    pub fn search(&self, query: &str, count: usize) -> Result<Vec<CatalogItem>> {
+        let mut url = reqwest::Url::parse("https://www.crunchyroll.com/content/v2/discover/search")
+            .expect("valid search URL");
+        url.query_pairs_mut()
+            .append_pair("q", query)
+            .append_pair("type", "series")
+            .append_pair("n", &count.to_string())
+            .append_pair("ratings", "true")
+            .append_pair("locale", "en-US");
+        // Search answers with one group per requested type, so a single `type=series`
+        // still arrives wrapped in a group. `top_results` mixes types in regardless of
+        // what was asked for, and anything that is not a series is a dead end here.
+        Ok(self
+            .get_json::<SearchResponse>(url.as_str())?
+            .data
+            .into_iter()
+            .flat_map(|group| group.items)
+            .filter(|item| item.kind == "series")
+            .collect())
     }
 
     pub fn manifest(&self, url: &str) -> Result<Vec<u8>> {

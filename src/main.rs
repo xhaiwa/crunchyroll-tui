@@ -6,6 +6,7 @@ mod model;
 mod output;
 mod play;
 mod progress;
+mod tui;
 mod util;
 
 use std::fs::File;
@@ -69,6 +70,10 @@ struct Cli {
     #[arg(long)]
     debug_manifest: bool,
 
+    /// Browse the catalogue in a terminal interface instead of naming a URL.
+    #[arg(long, conflicts_with_all = ["url", "file"])]
+    tui: bool,
+
     /// URL of the episode or series to download.
     #[arg(long, conflicts_with = "file")]
     url: Option<String>,
@@ -123,8 +128,8 @@ fn process_url(
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if cli.url.is_none() && cli.file.is_none() {
-        bail!("one of --url or --file must be supplied");
+    if cli.url.is_none() && cli.file.is_none() && !cli.tui {
+        bail!("one of --url, --file or --tui must be supplied");
     }
     let etp_rt = cli.etp_rt.trim();
     if etp_rt.is_empty() {
@@ -151,6 +156,10 @@ fn run() -> Result<()> {
         mpv_args: cli.mpv_arg,
     };
     let client = CrunchyrollClient::new(etp_rt.to_owned(), cli.debug_manifest)?;
+
+    if cli.tui {
+        return tui::run(client, opts);
+    }
 
     if let Some(path) = cli.file {
         let file = File::open(&path)
