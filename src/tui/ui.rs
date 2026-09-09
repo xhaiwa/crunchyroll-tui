@@ -8,6 +8,7 @@ use crate::model::{CatalogItem, Season, SeasonEpisode};
 use crate::util::language_name;
 
 use super::app::{App, Focus, Picker};
+use super::keys::{Bindings, HELP, HINTS};
 use super::theme::Theme;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -225,7 +226,9 @@ fn poster_width(body: Rect, cell: Size, enabled: bool) -> u16 {
     // the border takes.
     let tall = u32::from(body.height.saturating_sub(2)) * u32::from(cell.height);
     let wide = (tall * 2 / 3).div_ceil(u32::from(cell.width));
-    let wanted = u16::try_from(wide).unwrap_or(POSTER_LIMIT).saturating_add(2);
+    let wanted = u16::try_from(wide)
+        .unwrap_or(POSTER_LIMIT)
+        .saturating_add(2);
     // A sliver of poster is worse than none: it is a picture nobody can make out sitting
     // where a list could have been.
     match wanted.min(POSTER_LIMIT).min(room) {
@@ -330,34 +333,48 @@ fn picker_overlay(
     );
 }
 
-fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let keys = [
-        ("↑ ↓ / j k", "move the cursor"),
-        ("⏎ / → / l", "open the selection, and play an episode"),
-        ("← / h / esc", "go back a column, and leave a search"),
-        ("tab", "cycle the columns"),
-        ("/", "search the catalogue"),
-        ("o", "change the browse order"),
-        ("p / P", "play the episode / the rest of the season"),
-        ("d / D", "download the episode / the whole season"),
-        ("a / s", "pick the audio / subtitle language"),
-        ("A / S", "next audio / subtitle language, without the list"),
-        ("v", "cycle the video quality"),
-        ("i", "show or hide the poster and the episode still"),
-        ("r", "reload the current column"),
-        ("g / G", "jump to the first or last item"),
-        ("q", "quit"),
-    ];
-    let popup = popup(area, 66, keys.len() as u16 + 2);
-    let lines: Vec<Line> = keys
+/// The help overlay, built from the bindings in force rather than from a list written
+/// out here: a rebound key is no help at all if the overlay still names the old one. A
+/// row whose commands have all been unbound is left out.
+fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, keys: &Bindings) {
+    let rows: Vec<(String, &str)> = HELP
         .iter()
-        .map(|(key, what)| Line::from(vec![theme.accent(format!(" {key:<13}")), theme.text(*what)]))
+        .filter_map(|(group, what)| Some((keys.label(group, true)?, *what)))
+        .collect();
+    // Wide enough for the keys someone actually bound, within reason: past that the
+    // description is worth more of the line than a fourth spelling of "down".
+    let column = rows
+        .iter()
+        .map(|(label, _)| Span::raw(label).width())
+        .max()
+        .unwrap_or(0)
+        .clamp(13, 26);
+    let popup = popup(area, column as u16 + 53, rows.len() as u16 + 2);
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(label, what)| {
+            let padding = " ".repeat(column.saturating_sub(Span::raw(label).width()));
+            Line::from(vec![
+                theme.accent(format!(" {label}{padding}")),
+                theme.text(*what),
+            ])
+        })
         .collect();
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(theme.bordered(true).title(theme.title(" Keys "))),
         popup,
     );
+}
+
+/// The reminder along the bottom, in the same words as the overlay and off the same
+/// bindings, cut to the first key of each command so it stays one line.
+fn hint_line(keys: &Bindings) -> String {
+    HINTS
+        .iter()
+        .filter_map(|(group, what)| Some(format!("{} {what}", keys.label(group, false)?)))
+        .collect::<Vec<_>>()
+        .join("   ")
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -396,7 +413,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .series
         .selected()
         .filter(|_| panel > 0)
-        .and_then(|series| series.images.poster(pixels(panel.saturating_sub(2), cell.width)))
+        .and_then(|series| {
+            series
+                .images
+                .poster(pixels(panel.saturating_sub(2), cell.width))
+        })
         .map(str::to_owned);
     let [poster_area, body] = Layout::horizontal([
         Constraint::Length(if poster.is_some() { panel } else { 0 }),
@@ -540,14 +561,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(line), status);
 
     frame.render_widget(
-        Paragraph::new(Line::from(theme.dim(
-            " ↑↓ move   ⏎ open/play   ← back   / search   d download   a/s language   v quality   ? keys   q quit",
-        ))),
+        Paragraph::new(Line::from(theme.dim(format!(" {}", hint_line(&app.keys))))),
         keys,
     );
 
     if app.show_help {
-        help_overlay(frame, area, &theme);
+        help_overlay(frame, area, &theme, &app.keys);
     }
 
     // Read what is in use before the list borrows the app to draw itself.
@@ -570,7 +589,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::{Rect, Size};
     use ratatui::style::Color;
 
@@ -580,6 +599,7 @@ mod tests {
     use crate::model::{Artwork, CatalogItem, Images, Season, SeasonEpisode, SeriesMetadata};
     use crate::tui::app::{App, Focus};
     use crate::tui::art::Gallery;
+    use crate::tui::keys::{self, Bindings};
     use crate::tui::theme::{self, Theme};
     use crate::tui::worker::Worker;
 
@@ -641,6 +661,7 @@ mod tests {
             Worker::detached(),
             options,
             theme,
+            Bindings::default(),
             Arc::new(Mutex::new(Vec::new())),
             art,
         );
@@ -783,6 +804,77 @@ mod tests {
         app.on_key(KeyEvent::from(code));
     }
 
+    fn press_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.on_key(KeyEvent::new(code, modifiers));
+    }
+
+    /// Puts a `[keys]` section in force, the way the config file would.
+    fn bound(app: &mut App, section: &str) {
+        let settings: keys::Settings = toml::from_str(section).expect("valid keys");
+        let (bindings, warnings) = keys::resolve(&settings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        app.keys = bindings;
+    }
+
+    /// The overlay and the line along the bottom are where someone finds out what a key
+    /// does, so both have to follow the config file rather than a list written out
+    /// beside them.
+    #[test]
+    fn the_help_follows_the_bindings() {
+        let mut app = app();
+        app.show_help = true;
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("↑ k / ↓ j"), "{screen}");
+        assert!(screen.contains("d / D"), "{screen}");
+        assert!(screen.contains("d download"), "the reminder line: {screen}");
+
+        bound(&mut app, "download = \"ctrl-s\"\nquality = []\n");
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("ctrl-s / D"), "{screen}");
+        assert!(screen.contains("ctrl-s download"), "{screen}");
+        assert!(
+            !screen.contains("cycle the video quality"),
+            "an unbound command has no row: {screen}"
+        );
+    }
+
+    /// A key that was moved reaches its command, the one it left behind does nothing,
+    /// and the search box still takes letters as letters.
+    #[test]
+    fn a_rebound_key_drives_the_interface() {
+        let mut app = app();
+        bound(
+            &mut app,
+            "open = \"space\"\nsearch = \"ctrl-f\"\nback = \"esc\"\n",
+        );
+
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.focus, Focus::Seasons, "space opens the selection");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Seasons, "enter was given up");
+
+        press_with(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert_eq!(app.editing.as_deref(), Some(""));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            app.editing.as_deref(),
+            Some(" "),
+            "a bound key is still a letter inside the search box"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.editing, None);
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.editing, None, "the default search key was given up");
+
+        // The language list follows the same bindings, and leaving it leaves the list
+        // rather than the interface.
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.picker.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none());
+        assert!(!app.quit);
+    }
+
     /// The language list is the way a locale gets changed, so it has to offer what the
     /// season has, say which one is in use, and hand the choice back to the options.
     #[test]
@@ -901,7 +993,10 @@ mod tests {
         assert_eq!(poster_width(Rect::new(0, 3, 120, 16), cell, true), 21);
         assert_eq!(poster_width(Rect::new(0, 3, 120, 16), cell, false), 0);
         // A tall, narrow cell needs more columns for the same picture.
-        assert_eq!(poster_width(Rect::new(0, 3, 120, 16), Size::new(7, 21), true), 30);
+        assert_eq!(
+            poster_width(Rect::new(0, 3, 120, 16), Size::new(7, 21), true),
+            30
+        );
         // And a terminal with nothing to spare keeps its columns and loses the picture.
         assert_eq!(poster_width(Rect::new(0, 3, 70, 16), cell, true), 0);
         assert_eq!(poster_width(Rect::new(0, 3, 40, 16), cell, true), 0);

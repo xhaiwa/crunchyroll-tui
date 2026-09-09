@@ -18,31 +18,36 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::api::CrunchyrollClient;
+use crate::config::OneOrMany;
 use crate::download::{DownloadOptions, download_episode, download_season};
 use crate::util::{check_etp_rt, parse_langs, parse_url};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Downloads Crunchyroll anime and outputs MKV files")]
+// Every option that a `[defaults]` entry can set is an `Option` with no clap default of
+// its own: a value that is only there because clap put it there cannot be told apart
+// from one the user typed, and the config file has to lose to the second and win over
+// the first.
 struct Cli {
-    /// Audio language(s), comma-separated. First is the default track.
-    #[arg(long, default_value = "ja-JP")]
-    audio_lang: String,
+    /// Audio language(s), comma-separated. First is the default track. [default: ja-JP]
+    #[arg(long)]
+    audio_lang: Option<String>,
 
-    /// Subtitle language(s), comma-separated. First is the default track.
-    #[arg(long = "subs-lang", default_value = "en-US")]
-    subtitles_lang: String,
+    /// Subtitle language(s), comma-separated. First is the default track. [default: en-US]
+    #[arg(long = "subs-lang")]
+    subtitles_lang: Option<String>,
 
     /// Closed-caption language(s), comma-separated.
-    #[arg(long, default_value = "")]
-    cc_lang: String,
+    #[arg(long)]
+    cc_lang: Option<String>,
 
-    /// Video quality.
-    #[arg(long, default_value = "1080p")]
-    video_quality: String,
+    /// Video quality. [default: 1080p]
+    #[arg(long)]
+    video_quality: Option<String>,
 
-    /// Audio quality.
-    #[arg(long, default_value = "192k")]
-    audio_quality: String,
+    /// Audio quality. [default: 192k]
+    #[arg(long)]
+    audio_quality: Option<String>,
 
     /// Season number. Ignored for an episode URL.
     #[arg(long, default_value_t = 0)]
@@ -58,13 +63,9 @@ struct Cli {
 
     /// Extra argument passed straight to mpv. Repeat for more than one.
     // mpv options start with a dash, so they have to be taken as values rather than as
-    // arguments of our own.
-    #[arg(
-        long = "mpv-arg",
-        value_name = "ARG",
-        requires = "play",
-        allow_hyphen_values = true
-    )]
+    // arguments of our own. They are not tied to `--play`: the interface plays without
+    // it, and an argument that never reaches mpv costs nothing.
+    #[arg(long = "mpv-arg", value_name = "ARG", allow_hyphen_values = true)]
     mpv_arg: Vec<String>,
 
     /// Log raw playback JSON and manifest XML.
@@ -138,6 +139,19 @@ fn process_url(
     }
 }
 
+/// The command line where it said something, the config file where it did not, and the
+/// value the program has always used where neither did.
+///
+/// A value that was written down is kept even when it is empty, since asking for no
+/// subtitles at all is a thing to ask for; only the absence of one falls through.
+fn langs(cli: Option<&str>, configured: Option<&OneOrMany>, fallback: &str) -> Vec<String> {
+    match (cli, configured) {
+        (Some(value), _) => parse_langs(value),
+        (None, Some(configured)) => configured.langs(),
+        (None, None) => parse_langs(fallback),
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.url.is_none() && cli.file.is_none() && !cli.tui {
@@ -151,26 +165,64 @@ fn run() -> Result<()> {
     }
     check_etp_rt(etp_rt)?;
 
+    let (mut config, complaints) = config::load();
+    // The interface shows these on its status line instead, since anything printed now
+    // is scrolled away by the alternate screen before it can be read.
+    if !cli.tui {
+        for complaint in &complaints {
+            eprintln!("! {complaint}");
+        }
+    }
+    let defaults = &config.defaults;
+
     let opts = DownloadOptions {
         audio_langs: {
-            let parsed = parse_langs(&cli.audio_lang);
+            let parsed = langs(
+                cli.audio_lang.as_deref(),
+                defaults.audio_lang.as_ref(),
+                "ja-JP",
+            );
             if parsed.is_empty() {
                 vec!["ja-JP".into()]
             } else {
                 parsed
             }
         },
-        subtitles_langs: parse_langs(&cli.subtitles_lang),
-        cc_langs: parse_langs(&cli.cc_lang),
-        video_quality: cli.video_quality,
-        audio_quality: cli.audio_quality,
+        subtitles_langs: langs(
+            cli.subtitles_lang.as_deref(),
+            defaults.subs_lang.as_ref(),
+            "en-US",
+        ),
+        cc_langs: langs(cli.cc_lang.as_deref(), defaults.cc_lang.as_ref(), ""),
+        video_quality: cli
+            .video_quality
+            .clone()
+            .or_else(|| defaults.video_quality.clone())
+            .unwrap_or_else(|| "1080p".to_owned()),
+        audio_quality: cli
+            .audio_quality
+            .clone()
+            .or_else(|| defaults.audio_quality.clone())
+            .unwrap_or_else(|| "192k".to_owned()),
         play: cli.play,
-        mpv_args: cli.mpv_arg,
+        // Repeating `--mpv-arg` is how more than one is given, so an empty set is the
+        // only way the command line has of saying nothing about them.
+        mpv_args: if cli.mpv_arg.is_empty() {
+            defaults
+                .mpv_args
+                .as_ref()
+                .map(OneOrMany::list)
+                .unwrap_or_default()
+        } else {
+            cli.mpv_arg.clone()
+        },
     };
     let client = CrunchyrollClient::new(etp_rt.to_owned(), cli.debug_manifest)?;
 
     if cli.tui {
-        return tui::run(client, opts, cli.theme, cli.images);
+        config.theme.name = cli.theme.or(config.theme.name);
+        config.images = cli.images.unwrap_or(config.images);
+        return tui::run(client, opts, config, complaints);
     }
 
     if let Some(path) = cli.file {
@@ -219,5 +271,30 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OneOrMany, langs};
+
+    #[test]
+    fn the_command_line_wins_then_the_config_file_then_the_built_in() {
+        let configured = OneOrMany::One("fr-FR,de-DE".to_owned());
+        assert_eq!(
+            langs(Some("en-US"), Some(&configured), "ja-JP"),
+            ["en-US"],
+            "a flag beats the config file"
+        );
+        assert_eq!(
+            langs(None, Some(&configured), "ja-JP"),
+            ["fr-FR", "de-DE"],
+            "the config file beats the built-in default"
+        );
+        assert_eq!(langs(None, None, "ja-JP"), ["ja-JP"]);
+        assert!(
+            langs(Some(""), Some(&configured), "ja-JP").is_empty(),
+            "asking for none of a track is a thing to ask for"
+        );
     }
 }

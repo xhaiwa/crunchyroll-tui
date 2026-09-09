@@ -1,5 +1,6 @@
 mod app;
 pub mod art;
+pub mod keys;
 pub mod theme;
 mod ui;
 mod worker;
@@ -15,7 +16,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use crate::api::CrunchyrollClient;
-use crate::config;
+use crate::config::Config;
 use crate::download::{DownloadOptions, download_episode, episode_info};
 use crate::model::SeasonEpisode;
 
@@ -38,21 +39,19 @@ const TICK: Duration = Duration::from_millis(100);
 
 /// Browses the catalogue and hands episodes to mpv, or to the downloader.
 ///
-/// `theme_name` is what `--theme` asked for and `images` what `--images` asked for; both
-/// win over the config file.
+/// `config` arrives with whatever the command line had to say already folded into it,
+/// and `complaints` with whatever reading it went wrong.
 pub fn run(
     client: CrunchyrollClient,
     options: DownloadOptions,
-    theme_name: Option<String>,
-    images: Option<art::Setting>,
+    config: Config,
+    mut complaints: Vec<String>,
 ) -> Result<()> {
-    let (mut config, mut complaints) = config::load();
-    if theme_name.is_some() {
-        config.theme.name = theme_name;
-    }
     let (theme, warnings) = config.theme.resolve(config.directory.as_deref());
     complaints.extend(warnings);
-    let images = images.unwrap_or(config.images);
+    let (bindings, warnings) = keys::resolve(&config.keys);
+    complaints.extend(warnings);
+    let images = config.images;
 
     // Anything the client would print lands on top of the frame, so collect it and let
     // the status line show it instead. Anything wrong with the config goes in with it:
@@ -74,6 +73,7 @@ pub fn run(
         Worker::spawn(client.clone()),
         options,
         theme,
+        bindings,
         notices,
         gallery,
     );

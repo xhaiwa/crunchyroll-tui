@@ -5,6 +5,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 ## Features
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme
+- One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Playback with mpv while the stream downloads, instead of writing a file
@@ -98,14 +99,17 @@ cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE
 | `?` | Show the keys |
 | `q` | Quit |
 
+Every one of these can be moved somewhere else; see [Keys](#keys) below.
+
 The languages offered by `a` and `s` are the ones the selected season lists, falling back
 to the series, then to what was asked for on the command line, then to every locale
 Crunchyroll publishes - so the list follows whatever the series actually has. The locale
 in use is always among them, marked with a dot, and the list opens on it. Changing a
 language asks Crunchyroll for the open list again, since titles come back localised and
 an episode carries the dub that was asked for; the cursor stays where it was. Every other
-option keeps the value it was given on the command line, so `--audio-lang`, `--subs-lang`,
-`--cc-lang` and `--audio-quality` still set what the interface starts with.
+option keeps the value it was given on the command line or in the config file, so
+`--audio-lang`, `--subs-lang`, `--cc-lang` and `--audio-quality` still set what the
+interface starts with.
 
 Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
 same with the progress bars.
@@ -128,15 +132,8 @@ cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --images on
 
 `--images off` turns the artwork off altogether, and `i` toggles it while the interface is
 running - which also names the protocol in use, if you are wondering why a picture is not
-where you expected it. The same setting lives in the config file, above any `[theme]`
-section:
-
-```toml
-images = "auto"   # or "on", or "off"
-
-[theme]
-name = "gruvbox"
-```
+where you expected it. The same setting lives in the [config file](#configuration), as
+`images = "auto"`.
 
 Posters and stills come off Crunchyroll's own image CDN, at the smallest size that covers
 the panel, on threads of their own so nothing waits on them. Nothing is written to disk.
@@ -148,6 +145,144 @@ stays inside the terminal:
 cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --mpv-arg --vo=kitty
 ```
 
+### Playing instead of downloading
+
+`--play` streams the episode straight into mpv rather than writing an MKV. Segments go into named pipes, ffmpeg decrypts and muxes them as they arrive, and mpv starts on the first few seconds instead of waiting for the whole episode:
+
+```shell
+cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play
+```
+
+Every track option still applies, so the audio and subtitle locales you ask for all show up as switchable tracks in mpv. `--mpv-arg` passes options through, repeat it for more than one, and `[defaults] mpv-args` in the [config file](#configuration) sets them once and for all:
+
+```shell
+cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play \
+  --audio-lang ja-JP,en-US --subs-lang en-US,de-DE \
+  --mpv-arg --fullscreen --mpv-arg --slang=fre
+```
+
+A series or `--file` URL plays its episodes one after another: quitting mpv moves on to the next.
+
+Notes:
+
+- The stream is a pipe, so it cannot be seeked past what mpv has already buffered. mpv keeps a 256 MiB forward and 128 MiB backward window in memory, which covers a few minutes of seeking either way.
+- Nothing is kept: no MKV is written, and the already-downloaded episode check is skipped.
+- `--play` needs mpv in `PATH`, and named pipes, so it is Unix-only. Downloading is unaffected.
+
+Batch mode accepts one URL per line and ignores blank or non-HTTP lines:
+
+```shell
+cargo run --release -- --file list.txt --etp-rt YOUR_COOKIE_VALUE
+```
+
+Run `cargo run --release -- --help` for every option.
+
+## Configuration
+
+Everything the interface can be told lives in one file, so a setup can go in a dotfiles
+repo and follow you to the next machine:
+
+```
+$XDG_CONFIG_HOME/crunchyroll-downloader/config.toml
+~/.config/crunchyroll-downloader/config.toml     # when $XDG_CONFIG_HOME is not set
+```
+
+Nothing in it is required, and not having one at all is the normal case. **The command
+line wins over the file**, so a flag is how you try something without editing it.
+
+A file that cannot be read, a key that is not a key, a colour that cannot be parsed: each
+one is reported - on the interface's status line, or on stderr for a plain download - and
+otherwise ignored. A typo should not stand between you and the catalogue.
+
+The whole file, with everything at its default:
+
+```toml
+# Posters and episode stills: "auto", "on" or "off". Top level, so it has to come
+# before the first section - that is TOML, not us.
+images = "auto"
+
+# What a run starts with when the command line does not say. Each one is named after
+# the flag that overrides it.
+[defaults]
+audio-lang = "ja-JP"          # or ["ja-JP", "en-US"], or "all"
+subs-lang = "en-US"
+cc-lang = []
+video-quality = "1080p"       # 1080p, 720p, 480p, 360p, 240p
+audio-quality = "192k"
+mpv-args = []                 # ["--fullscreen", "--vo=kitty"]
+
+[theme]
+# See Colours below.
+
+[keys]
+# See Keys below.
+```
+
+Anything that is a list can be written as one value when there is only one, so
+`subs-lang = "en-US"` and `subs-lang = ["en-US"]` are the same thing. A language entry
+may also be a comma-separated string, the way the flag takes it:
+`audio-lang = "ja-JP,en-US"`.
+
+`mpv-args` holds one option per entry, as `--mpv-arg` passes them, and is never split on
+anything - so a value with a comma in it survives. Passing `--mpv-arg` on the command
+line replaces the list rather than adding to it.
+
+The `etp_rt` cookie is deliberately not a config setting. It is a credential with a short
+life, and a dotfiles repo is the last place it should be.
+
+### Keys
+
+Every key in the interface can be moved. A `[keys]` entry names a command and the key, or
+the keys, that reach it; the defaults it replaces are given up, so the old key is free for
+something else:
+
+```toml
+[keys]
+play = "o"                    # o plays; p no longer does anything
+quit = ["q", "ctrl-q"]        # two keys for one command
+download-season = []          # an empty list unbinds it altogether
+next-pane = "ctrl-w"
+```
+
+The commands, and the keys they answer to out of the box:
+
+| Command | Default | What it does |
+| --- | --- | --- |
+| `up` `down` | `↑` `k`, `↓` `j` | Move the cursor |
+| `page-up` `page-down` | `page-up`, `page-down` | Move it ten rows |
+| `first` `last` | `home` `g`, `end` `G` | Jump to the first or last item |
+| `open` | `enter` `right` `l` | Open the selection, and play an episode |
+| `back` | `left` `h` `esc` | Go back a column, and leave a search |
+| `next-pane` | `tab` | Cycle the columns |
+| `search` | `/` | Search the catalogue |
+| `sort` | `o` | Change the browse order |
+| `reload` | `r` | Reload the current column |
+| `play` `play-season` | `p`, `P` | Play the episode, or the rest of the season |
+| `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
+| `audio-language` `subtitle-language` | `a`, `s` | Open the language list |
+| `next-audio` `next-subtitle` | `A`, `S` | Step to the next locale without the list |
+| `quality` | `v` | Cycle the video quality |
+| `images` | `i` | Show or hide the poster and the episode still |
+| `help` | `?` | Show the keys |
+| `quit` | `q` | Quit |
+
+A key is written the way you would say it: a single character (`q`, `/`, `?`, `-`), a
+name (`enter`, `esc`, `tab`, `space`, `backspace`, `delete`, `insert`, `up`, `down`,
+`left`, `right`, `home`, `end`, `page-up`, `page-down`, `f1` to `f24`), or either with
+`ctrl-`, `alt-`, `shift-` or `super-` in front. `+` separates as well as `-`, so
+`alt+enter` works, and a lone `-` or `+` is the key itself rather than a separator.
+`P` and `shift-p` are the same key.
+
+`ctrl-c` always quits and cannot be rebound, so a half-finished `[keys]` section can never
+leave you stuck in the alternate screen. The help overlay and the reminder along the
+bottom are both drawn from the bindings in force, so they say what your keys do rather
+than what the defaults did.
+
+The language list uses the same bindings: `up`/`down`/`first`/`last` move, `open`
+applies, `next-pane` swaps between the audio and subtitle lists, and `back` or `quit`
+closes it. Inside the search box every key is a letter, so only `enter`, `esc` and
+`backspace` mean anything there.
+
 ### Colours
 
 The interface ships with no colours of its own. It draws with the sixteen palette slots
@@ -156,8 +291,7 @@ colourscheme is installed and needs no configuration to match it. If you drive y
 palette with base16-shell, tinted-theming or anything else that recolours the sixteen
 slots, this follows it already.
 
-To pin the colours anyway, write `~/.config/crunchyroll-downloader/config.toml`
-(`$XDG_CONFIG_HOME` is honoured if it is set):
+To pin the colours anyway:
 
 ```toml
 [theme]
@@ -198,40 +332,7 @@ error = "#fb4934"
 ```
 
 A name that does not exist, a file that cannot be read or a colour that cannot be parsed
-is reported on the status line and otherwise ignored - a typo in the config should not
-stand between you and the catalogue.
-
-### Playing instead of downloading
-
-`--play` streams the episode straight into mpv rather than writing an MKV. Segments go into named pipes, ffmpeg decrypts and muxes them as they arrive, and mpv starts on the first few seconds instead of waiting for the whole episode:
-
-```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play
-```
-
-Every track option still applies, so the audio and subtitle locales you ask for all show up as switchable tracks in mpv. `--mpv-arg` passes options through, repeat it for more than one:
-
-```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play \
-  --audio-lang ja-JP,en-US --subs-lang en-US,de-DE \
-  --mpv-arg --fullscreen --mpv-arg --slang=fre
-```
-
-A series or `--file` URL plays its episodes one after another: quitting mpv moves on to the next.
-
-Notes:
-
-- The stream is a pipe, so it cannot be seeked past what mpv has already buffered. mpv keeps a 256 MiB forward and 128 MiB backward window in memory, which covers a few minutes of seeking either way.
-- Nothing is kept: no MKV is written, and the already-downloaded episode check is skipped.
-- `--play` needs mpv in `PATH`, and named pipes, so it is Unix-only. Downloading is unaffected.
-
-Batch mode accepts one URL per line and ignores blank or non-HTTP lines:
-
-```shell
-cargo run --release -- --file list.txt --etp-rt YOUR_COOKIE_VALUE
-```
-
-Run `cargo run --release -- --help` for every option.
+is reported on the status line and otherwise ignored.
 
 ## Finding `etp_rt`
 

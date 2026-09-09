@@ -4,22 +4,72 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::tui::{art, theme};
+use crate::tui::{art, keys, theme};
+use crate::util::parse_langs;
 
 /// `config.toml`. Nothing in it is required, and a file that is not there is not a
 /// problem - it is how most runs go.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default)]
-    pub theme: theme::Settings,
     /// Whether the posters and episode stills are drawn. `--images` overrides it.
     #[serde(default)]
     pub images: art::Setting,
+    /// What a run starts with when the command line does not say.
+    #[serde(default)]
+    pub defaults: Defaults,
+    #[serde(default)]
+    pub theme: theme::Settings,
+    #[serde(default)]
+    pub keys: keys::Settings,
     /// The directory the file was read from, so a relative path inside it points at the
     /// file the user meant rather than at the working directory.
     #[serde(skip)]
     pub directory: Option<PathBuf>,
+}
+
+/// A setting that is naturally a list but is usually one thing, written either way:
+/// `subs-lang = "en-US"` and `subs-lang = ["en-US", "de-DE"]` both mean the same.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    /// The entries as written, which is what an mpv option or a key needs: neither can
+    /// be split on anything without breaking a value that contains it.
+    pub fn list(&self) -> Vec<String> {
+        match self {
+            Self::One(single) => vec![single.clone()],
+            Self::Many(many) => many.clone(),
+        }
+    }
+
+    /// The entries as locales, so a value copied straight off the command line -
+    /// `"ja-JP,en-US"` - means what it does there.
+    pub fn langs(&self) -> Vec<String> {
+        self.list()
+            .iter()
+            .flat_map(|part| parse_langs(part))
+            .collect()
+    }
+}
+
+/// The `[defaults]` section: the command-line options a run starts with. Each one is
+/// named after the flag that overrides it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Defaults {
+    pub audio_lang: Option<OneOrMany>,
+    pub subs_lang: Option<OneOrMany>,
+    pub cc_lang: Option<OneOrMany>,
+    pub video_quality: Option<String>,
+    pub audio_quality: Option<String>,
+    /// Extra arguments for mpv, one per entry, as `--mpv-arg` passes them.
+    #[serde(alias = "mpv-arg")]
+    pub mpv_args: Option<OneOrMany>,
 }
 
 /// `$XDG_CONFIG_HOME/crunchyroll-downloader/config.toml`, falling back to
@@ -105,6 +155,48 @@ dim = \"bright black\"
         assert!(toml::from_str::<Config>("images = \"yes\"\n").is_err());
     }
 
+    #[test]
+    fn reads_the_run_defaults_written_either_way() {
+        let config: Config = toml::from_str(
+            "\
+[defaults]
+audio-lang = \"ja-JP,en-US\"
+subs-lang = [\"en-US\", \"de-DE\"]
+video-quality = \"720p\"
+mpv-args = [\"--fullscreen\", \"--vf=lavfi=[hqdn3d]\"]
+",
+        )
+        .expect("valid config");
+        let defaults = &config.defaults;
+        assert_eq!(
+            defaults.audio_lang.as_ref().expect("audio").langs(),
+            ["ja-JP", "en-US"],
+            "a value copied off the command line still means two locales"
+        );
+        assert_eq!(
+            defaults.subs_lang.as_ref().expect("subs").langs(),
+            ["en-US", "de-DE"]
+        );
+        assert_eq!(defaults.video_quality.as_deref(), Some("720p"));
+        assert_eq!(defaults.audio_quality, None);
+        assert_eq!(
+            defaults.mpv_args.as_ref().expect("mpv args").list(),
+            ["--fullscreen", "--vf=lavfi=[hqdn3d]"],
+            "an mpv option is passed on whole, commas and all"
+        );
+    }
+
+    #[test]
+    fn reads_a_keys_section() {
+        let config: Config = toml::from_str("[keys]\nplay = \"o\"\nquit = [\"q\", \"ctrl-q\"]\n")
+            .expect("valid config");
+        assert_eq!(config.keys.0.len(), 2);
+        assert_eq!(
+            config.keys.0.get("quit").expect("quit").list(),
+            ["q", "ctrl-q"]
+        );
+    }
+
     /// A file with no `[theme]` in it is a valid file, and a misspelt key is worth
     /// refusing rather than silently ignoring.
     #[test]
@@ -113,5 +205,12 @@ dim = \"bright black\"
         let error = toml::from_str::<Config>("[theme]\naccnet = \"red\"\n")
             .expect_err("an unknown key is refused");
         assert!(error.message().contains("accnet"), "{}", error.message());
+        let error = toml::from_str::<Config>("[defaults]\nvideo_quality = \"720p\"\n")
+            .expect_err("an unknown key is refused");
+        assert!(
+            error.message().contains("video_quality"),
+            "{}",
+            error.message()
+        );
     }
 }

@@ -9,6 +9,7 @@ use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
 use super::art::Gallery;
+use super::keys::{Bindings, Command};
 use super::theme::Theme;
 use super::worker::{Listing, Request, Response, Worker};
 
@@ -131,6 +132,8 @@ pub struct App {
     pub options: DownloadOptions,
     /// The colours everything is drawn in.
     pub theme: Theme,
+    /// What each key does.
+    pub keys: Bindings,
     /// The posters and episode stills, and the terminal's ability to draw them.
     pub art: Gallery,
     pub focus: Focus,
@@ -156,6 +159,7 @@ impl App {
         worker: Worker,
         options: DownloadOptions,
         theme: Theme,
+        keys: Bindings,
         notices: Arc<Mutex<Vec<String>>>,
         art: Gallery,
     ) -> Self {
@@ -163,6 +167,7 @@ impl App {
             worker,
             options,
             theme,
+            keys,
             art,
             focus: Focus::Series,
             series: Pane::default(),
@@ -562,27 +567,28 @@ impl App {
         }
     }
 
-    /// The language list has the keys of a column, plus tab to look at the other list
-    /// without going back out first.
-    fn edit_picker(&mut self, key: KeyEvent) {
-        let Some(picker) = self.picker.as_mut() else {
+    /// The language list has the keys of a column, plus the one that cycles the columns
+    /// to look at the other list without going back out first.
+    fn edit_picker(&mut self, command: Option<Command>) {
+        let (Some(picker), Some(command)) = (self.picker.as_mut(), command) else {
             return;
         };
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
-            KeyCode::Up | KeyCode::Char('k') => picker.pane.move_by(-1),
-            KeyCode::Down | KeyCode::Char('j') => picker.pane.move_by(1),
-            KeyCode::PageUp => picker.pane.move_by(-10),
-            KeyCode::PageDown => picker.pane.move_by(10),
-            KeyCode::Home | KeyCode::Char('g') => picker.pane.select_edge(false),
-            KeyCode::End | KeyCode::Char('G') => picker.pane.select_edge(true),
-            KeyCode::Tab => {
+        match command {
+            // Quitting out of the list leaves the list, not the interface.
+            Command::Back | Command::Quit => self.picker = None,
+            Command::Up => picker.pane.move_by(-1),
+            Command::Down => picker.pane.move_by(1),
+            Command::PageUp => picker.pane.move_by(-10),
+            Command::PageDown => picker.pane.move_by(10),
+            Command::First => picker.pane.select_edge(false),
+            Command::Last => picker.pane.select_edge(true),
+            Command::NextPane => {
                 let other = !picker.audio;
                 self.open_picker(other);
             }
-            KeyCode::Char('a') => self.open_picker(true),
-            KeyCode::Char('s') => self.open_picker(false),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            Command::AudioLanguage => self.open_picker(true),
+            Command::SubtitleLanguage => self.open_picker(false),
+            Command::Open => {
                 let audio = picker.audio;
                 let chosen = picker.pane.selected().cloned();
                 self.picker = None;
@@ -595,58 +601,66 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        // ctrl-c is the terminal's own way out, and stays wired to quitting whatever the
+        // config file says - including while the search box has the keyboard.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        // The search box takes letters as letters, so nothing is looked up while it is
+        // open.
         if self.editing.is_some() {
             self.edit_search(key);
             return Action::None;
         }
+        let command = self.keys.command(key);
         if self.picker.is_some() {
             self.notice = None;
-            self.edit_picker(key);
+            self.edit_picker(command);
             return Action::None;
         }
+        // Any key at all puts the help away, bound or not.
         if self.show_help {
             self.show_help = false;
             return Action::None;
         }
         self.notice = None;
-        match key.code {
-            KeyCode::Char('q') => return Action::Quit,
-            KeyCode::Char('?') => self.show_help = true,
-            KeyCode::Char('/') => self.editing = Some(String::new()),
-            KeyCode::Up | KeyCode::Char('k') => self.focused_pane_move(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.focused_pane_move(1),
-            KeyCode::PageUp => self.focused_pane_move(-10),
-            KeyCode::PageDown => self.focused_pane_move(10),
-            KeyCode::Home | KeyCode::Char('g') => self.focused_pane_edge(false),
-            KeyCode::End | KeyCode::Char('G') => self.focused_pane_edge(true),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => return self.descend(),
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc => self.ascend(),
-            KeyCode::Tab => {
+        let Some(command) = command else {
+            return Action::None;
+        };
+        match command {
+            Command::Quit => return Action::Quit,
+            Command::Help => self.show_help = true,
+            Command::Search => self.editing = Some(String::new()),
+            Command::Up => self.focused_pane_move(-1),
+            Command::Down => self.focused_pane_move(1),
+            Command::PageUp => self.focused_pane_move(-10),
+            Command::PageDown => self.focused_pane_move(10),
+            Command::First => self.focused_pane_edge(false),
+            Command::Last => self.focused_pane_edge(true),
+            Command::Open => return self.descend(),
+            Command::Back => self.ascend(),
+            Command::NextPane => {
                 self.focus = match self.focus {
                     Focus::Series => Focus::Seasons,
                     Focus::Seasons => Focus::Episodes,
                     Focus::Episodes => Focus::Series,
                 }
             }
-            KeyCode::Char('p') => return self.play(false),
-            KeyCode::Char('P') => return self.play(true),
-            KeyCode::Char('d') => return self.download(false),
-            KeyCode::Char('D') => return self.download(true),
-            KeyCode::Char('a') => self.open_picker(true),
-            KeyCode::Char('s') => self.open_picker(false),
-            KeyCode::Char('A') => self.cycle_locale(true),
-            KeyCode::Char('S') => self.cycle_locale(false),
-            KeyCode::Char('v') => self.cycle_quality(),
-            KeyCode::Char('i') => {
+            Command::Play => return self.play(false),
+            Command::PlaySeason => return self.play(true),
+            Command::Download => return self.download(false),
+            Command::DownloadSeason => return self.download(true),
+            Command::AudioLanguage => self.open_picker(true),
+            Command::SubtitleLanguage => self.open_picker(false),
+            Command::NextAudio => self.cycle_locale(true),
+            Command::NextSubtitle => self.cycle_locale(false),
+            Command::Quality => self.cycle_quality(),
+            Command::Images => {
                 let message = self.art.toggle();
                 self.say(message);
             }
-            KeyCode::Char('o') => self.cycle_sort(),
-            KeyCode::Char('r') => self.reload(),
-            _ => {}
+            Command::Sort => self.cycle_sort(),
+            Command::Reload => self.reload(),
         }
         Action::None
     }
