@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
@@ -11,6 +11,14 @@ use super::app::{App, Focus, Picker};
 use super::theme::Theme;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The narrowest the columns may be squeezed to before the poster is given up: below this
+/// the three lists are already fighting for room and a picture is a luxury.
+const COLUMNS_NEED: u16 = 62;
+
+/// The most columns the poster may take. A poster is a nice thing to look at; it is not
+/// what the interface is for.
+const POSTER_LIMIT: u16 = 34;
 
 /// `1461000` becomes `24:21`, and an hour-long special `1:02:03`.
 fn duration(milliseconds: u64) -> String {
@@ -196,6 +204,65 @@ fn details(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+/// A run of cells turned into the pixels behind it, which is what the CDN is asked for:
+/// a poster twenty columns wide on a ten-pixel font is a two-hundred-pixel poster.
+fn pixels(cells: u16, cell_width: u16) -> u32 {
+    u32::from(cells) * u32::from(cell_width)
+}
+
+/// How many columns the poster gets: enough for a two-by-three picture to fill the height
+/// the lists have, and none at all when the artwork is off or the terminal cannot spare
+/// the room.
+///
+/// `cell` is the terminal's character size in pixels, which is the only thing that turns
+/// a number of rows into the number of columns a given shape needs.
+fn poster_width(body: Rect, cell: Size, enabled: bool) -> u16 {
+    let room = body.width.saturating_sub(COLUMNS_NEED);
+    if !enabled || cell.width == 0 || room == 0 {
+        return 0;
+    }
+    // The inside of the panel in pixels, at two by three, back into columns; plus the two
+    // the border takes.
+    let tall = u32::from(body.height.saturating_sub(2)) * u32::from(cell.height);
+    let wide = (tall * 2 / 3).div_ceil(u32::from(cell.width));
+    let wanted = u16::try_from(wide).unwrap_or(POSTER_LIMIT).saturating_add(2);
+    // A sliver of poster is worse than none: it is a picture nobody can make out sitting
+    // where a list could have been.
+    match wanted.min(POSTER_LIMIT).min(room) {
+        0..=9 => 0,
+        width => width,
+    }
+}
+
+/// How many columns the episode still gets: sixteen by nine, as tall as the details panel
+/// is, and never more than a third of it so the description keeps somewhere to go.
+fn thumbnail_width(inner: Rect, cell: Size, enabled: bool) -> u16 {
+    if !enabled || cell.width == 0 || inner.height == 0 {
+        return 0;
+    }
+    let tall = u32::from(inner.height) * u32::from(cell.height);
+    let wide = (tall * 16 / 9).div_ceil(u32::from(cell.width));
+    let wanted = u16::try_from(wide).unwrap_or(u16::MAX);
+    match wanted.min(inner.width / 3) {
+        0..=7 => 0,
+        width => width,
+    }
+}
+
+/// One row across the middle of an area, for the word that stands in for a picture that
+/// has not arrived. An empty bordered box reads as a bug.
+fn middle_row(area: Rect) -> Rect {
+    Rect {
+        y: area.y + area.height / 2,
+        height: area.height.min(1),
+        ..area
+    }
+}
+
+fn waiting(theme: &Theme) -> Paragraph<'static> {
+    Paragraph::new(Line::from(theme.dim("..."))).centered()
+}
+
 /// A box in the middle of the screen, as tall as it needs to be and no taller than the
 /// terminal allows.
 fn popup(area: Rect, width: u16, height: u16) -> Rect {
@@ -276,6 +343,7 @@ fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
         ("a / s", "pick the audio / subtitle language"),
         ("A / S", "next audio / subtitle language, without the list"),
         ("v", "cycle the video quality"),
+        ("i", "show or hide the poster and the episode still"),
         ("r", "reload the current column"),
         ("g / G", "jump to the first or last item"),
         ("q", "quit"),
@@ -294,9 +362,20 @@ fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    // Copied out before the panes borrow the app to draw themselves.
+    let theme = app.theme;
+    let tick = app.tick;
+    let focus = app.focus;
+    let art = app.art.enabled();
+    let cell = app.art.cell();
+
     let details_height = match area.height {
         0..=15 => 0,
         16..=21 => 5,
+        22..=27 => 7,
+        // Two more rows once there is a still to put in the panel: seven rows of picture
+        // is about as small as a sixteen-by-nine frame gets and stays a picture.
+        _ if art => 9,
         _ => 7,
     };
     let [top, body, bottom, status, keys] = Layout::vertical([
@@ -310,17 +389,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(header(app), top);
 
+    // The poster takes a column off the left of the body and the three lists share what
+    // is left, in the proportions they had the whole width in.
+    let panel = poster_width(body, cell, art);
+    let poster = app
+        .series
+        .selected()
+        .filter(|_| panel > 0)
+        .and_then(|series| series.images.poster(pixels(panel.saturating_sub(2), cell.width)))
+        .map(str::to_owned);
+    let [poster_area, body] = Layout::horizontal([
+        Constraint::Length(if poster.is_some() { panel } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .areas(body);
+
+    if let Some(url) = poster {
+        let block = theme.bordered(false).title(theme.dim(" Poster "));
+        let inner = block.inner(poster_area);
+        frame.render_widget(block, poster_area);
+        if !app.art.draw(frame, inner, &url) {
+            frame.render_widget(waiting(&theme), middle_row(inner));
+        }
+    }
+
     let [left, middle, right] = Layout::horizontal([
         Constraint::Percentage(34),
         Constraint::Percentage(22),
         Constraint::Percentage(44),
     ])
     .areas(body);
-
-    // Copied out before the panes borrow the app to draw themselves.
-    let theme = app.theme;
-    let tick = app.tick;
-    let focus = app.focus;
 
     let items: Vec<ListItem> = if app.series.items.is_empty() {
         placeholder(
@@ -405,12 +503,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
 
     if details_height > 0 {
-        frame.render_widget(
-            Paragraph::new(details(app))
-                .wrap(Wrap { trim: true })
-                .block(theme.bordered(false).title(theme.dim(" Details "))),
-            bottom,
-        );
+        let block = theme.bordered(false).title(theme.dim(" Details "));
+        let inner = block.inner(bottom);
+        frame.render_widget(block, bottom);
+
+        // The still belongs to the episode under the cursor, so it appears alongside the
+        // episode's own facts and not while a series is being looked at.
+        let panel = thumbnail_width(inner, cell, art && focus == Focus::Episodes);
+        let still = app
+            .episodes
+            .selected()
+            .filter(|_| panel > 0)
+            .and_then(|episode| episode.images.thumbnail(pixels(panel, cell.width)))
+            .map(str::to_owned);
+        let [still_area, _gap, text] = Layout::horizontal([
+            Constraint::Length(if still.is_some() { panel } else { 0 }),
+            Constraint::Length(if still.is_some() { 2 } else { 0 }),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
+
+        let lines = details(app);
+        if let Some(url) = still
+            && !app.art.draw(frame, still_area, &url)
+        {
+            frame.render_widget(waiting(&theme), middle_row(still_area));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
     }
 
     let line = match &app.notice {
@@ -452,15 +571,19 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::layout::{Rect, Size};
     use ratatui::style::Color;
 
+    use image::{DynamicImage, Rgb, RgbImage};
+
     use crate::download::DownloadOptions;
-    use crate::model::{CatalogItem, Season, SeasonEpisode, SeriesMetadata};
-    use crate::tui::app::App;
+    use crate::model::{Artwork, CatalogItem, Images, Season, SeasonEpisode, SeriesMetadata};
+    use crate::tui::app::{App, Focus};
+    use crate::tui::art::Gallery;
     use crate::tui::theme::{self, Theme};
     use crate::tui::worker::Worker;
 
-    use super::{draw, duration};
+    use super::{draw, duration, poster_width, thumbnail_width};
 
     #[test]
     fn formats_a_running_time() {
@@ -469,11 +592,42 @@ mod tests {
         assert_eq!(duration(9_000), "0:09");
     }
 
-    fn app() -> App {
-        themed(Theme::default())
+    /// Where the test artwork lives. Nothing ever fetches these: the pictures are put
+    /// into the gallery by hand.
+    const POSTER: &str = "https://img.example/poster.jpg";
+    const STILL: &str = "https://img.example/still.jpg";
+
+    /// One set of artwork, shaped the way the API sends it: a list of lists.
+    fn artwork(url: &str, width: u32) -> Vec<Vec<Artwork>> {
+        vec![vec![Artwork {
+            width,
+            source: url.to_owned(),
+        }]]
     }
 
-    fn themed(theme: Theme) -> App {
+    fn app() -> App {
+        themed(Theme::default(), Gallery::detached(false))
+    }
+
+    /// A picture with something in it. A flat colour would draw as blank cells: the
+    /// half-block protocol only puts a character down where the top and bottom halves of
+    /// a cell differ, so the test picture is a gradient rather than one shade.
+    fn picture(width: u32, height: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        }))
+    }
+
+    /// An interface with the artwork switched on and both pictures already in hand, so a
+    /// draw has everything it needs without a byte going over the wire.
+    fn illustrated() -> App {
+        let mut gallery = Gallery::detached(true);
+        gallery.preload(POSTER, picture(240, 360));
+        gallery.preload(STILL, picture(320, 180));
+        themed(Theme::default(), gallery)
+    }
+
+    fn themed(theme: Theme, art: Gallery) -> App {
         let options = DownloadOptions {
             audio_langs: vec!["ja-JP".to_owned()],
             subtitles_langs: vec!["en-US".to_owned()],
@@ -488,6 +642,7 @@ mod tests {
             options,
             theme,
             Arc::new(Mutex::new(Vec::new())),
+            art,
         );
         app.series.set(vec![CatalogItem {
             id: "GY5P48XEY".to_owned(),
@@ -499,6 +654,10 @@ mod tests {
                 season_count: 1,
                 series_launch_year: 2023,
                 ..SeriesMetadata::default()
+            },
+            images: Images {
+                poster_tall: artwork(POSTER, 360),
+                ..Images::default()
             },
         }]);
         app.seasons.set(vec![Season {
@@ -516,6 +675,10 @@ mod tests {
             season_number: 1,
             title: "The Journey Ends".to_owned(),
             duration_ms: 1_461_000,
+            images: Images {
+                thumbnail: artwork(STILL, 320),
+                ..Images::default()
+            },
             ..SeasonEpisode::default()
         }]);
         app
@@ -586,7 +749,7 @@ mod tests {
     #[test]
     fn paints_the_cursor_row_in_the_theme_background() {
         let latte = theme::named("catppuccin-latte").expect("a shipped theme");
-        let mut app = themed(latte);
+        let mut app = themed(latte, Gallery::detached(false));
         // The series column has the keyboard, and its one row is under the cursor.
         let buffer = buffer(120, 30, &mut app);
         let cell = cursor_cell(&buffer);
@@ -661,10 +824,111 @@ mod tests {
         assert_eq!(app.audio(), "de-DE", "the list opens on what is in use");
     }
 
+    /// How many cells in `rows` are part of a picture. Half-blocks are what the fallback
+    /// protocol draws with, and the only protocol a test can count on being able to use.
+    fn picture_cells(buffer: &Buffer, rows: std::ops::Range<u16>) -> usize {
+        rows.flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| matches!(buffer[(*x, *y)].symbol(), "\u{2580}" | "\u{2584}"))
+            .count()
+    }
+
+    /// The whole point: the poster of the selected series in a column of its own, drawn
+    /// as pixels, with the three lists still there beside it.
+    #[test]
+    fn draws_the_poster_beside_the_columns() {
+        let mut app = illustrated();
+        let buffer = buffer(120, 30, &mut app);
+        let screen: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(screen.contains("Poster"), "no poster panel");
+        // Inside the poster panel's border, which is the body less its own top and bottom.
+        assert!(
+            picture_cells(&buffer, 4..18) > 100,
+            "the poster panel was left empty"
+        );
+        for expected in ["Series", "Seasons", "Episodes", "The Journey Ends"] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    /// The still belongs to the episode, so it turns up when the episode column has the
+    /// keyboard and not while a series is being looked at.
+    #[test]
+    fn draws_the_still_only_beside_the_episode_details() {
+        let mut app = illustrated();
+        let details = 20..28;
+        assert_eq!(
+            picture_cells(&buffer(120, 30, &mut app), details.clone()),
+            0,
+            "a series has no still to show"
+        );
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Episodes);
+        let buffer = buffer(120, 30, &mut app);
+        assert!(picture_cells(&buffer, details) > 40, "no still was drawn");
+    }
+
+    /// Nobody wants a picture they cannot turn off, and the answer to "why can I not see
+    /// the posters" should be one keypress away.
+    #[test]
+    fn i_puts_the_artwork_away_and_says_what_drew_it() {
+        let mut app = illustrated();
+        assert!(rendered(120, 30, &mut app).contains("Poster"));
+
+        press(&mut app, KeyCode::Char('i'));
+        let screen = rendered(120, 30, &mut app);
+        assert!(!screen.contains("Poster"), "the panel is still there");
+        assert!(screen.contains("Artwork off"));
+
+        press(&mut app, KeyCode::Char('i'));
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Poster"), "the panel did not come back");
+        assert!(screen.contains("half-blocks"), "no word on what drew it");
+    }
+
+    /// The poster keeps a two-by-three shape whatever the terminal's font is, and gives
+    /// itself up rather than squeeze the three lists into nothing.
+    #[test]
+    fn the_poster_column_keeps_its_shape() {
+        let cell = Size::new(10, 20);
+        // Fourteen rows inside the border are 280 pixels, so 186 across, so 19 columns
+        // and the two the border takes.
+        assert_eq!(poster_width(Rect::new(0, 3, 120, 16), cell, true), 21);
+        assert_eq!(poster_width(Rect::new(0, 3, 120, 16), cell, false), 0);
+        // A tall, narrow cell needs more columns for the same picture.
+        assert_eq!(poster_width(Rect::new(0, 3, 120, 16), Size::new(7, 21), true), 30);
+        // And a terminal with nothing to spare keeps its columns and loses the picture.
+        assert_eq!(poster_width(Rect::new(0, 3, 70, 16), cell, true), 0);
+        assert_eq!(poster_width(Rect::new(0, 3, 40, 16), cell, true), 0);
+    }
+
+    /// The still is sixteen by nine and never takes more than a third of the panel, so
+    /// the description always has somewhere to go.
+    #[test]
+    fn the_still_leaves_room_for_the_description() {
+        let cell = Size::new(10, 20);
+        // Seven rows are 140 pixels, so 249 across, so 25 columns.
+        assert_eq!(thumbnail_width(Rect::new(1, 20, 118, 7), cell, true), 25);
+        assert_eq!(thumbnail_width(Rect::new(1, 20, 118, 7), cell, false), 0);
+        assert_eq!(thumbnail_width(Rect::new(1, 20, 60, 7), cell, true), 20);
+        assert_eq!(thumbnail_width(Rect::new(1, 20, 20, 7), cell, true), 0);
+    }
+
     /// Every panel is optional except the columns, so a terminal too short for the
     /// details or too narrow for the help popup still has to draw rather than panic.
     #[test]
     fn survives_a_cramped_terminal() {
+        let mut illustrated = illustrated();
+        for (width, height) in [(120, 14), (40, 10), (20, 6), (8, 4), (1, 1)] {
+            let screen = rendered(width, height, &mut illustrated);
+            assert!(!screen.is_empty());
+        }
+
         let mut app = app();
         for (width, height) in [(120, 14), (40, 10), (20, 6), (8, 4)] {
             let screen = rendered(width, height, &mut app);

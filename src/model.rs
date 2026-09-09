@@ -13,6 +13,58 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// One rendition of a piece of artwork. Crunchyroll publishes every poster and every
+/// thumbnail at half a dozen widths, so the one that suits the panel can be asked for
+/// rather than the largest being fetched and then thrown away.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Artwork {
+    #[serde(default, deserialize_with = "null_default")]
+    pub width: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub source: String,
+}
+
+/// The artwork hanging off a catalogue entry or an episode.
+///
+/// Each set arrives as a list of lists - one inner list of renditions per image - so both
+/// levels are flattened before anything is picked out of them.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Images {
+    #[serde(default, deserialize_with = "null_default")]
+    pub poster_tall: Vec<Vec<Artwork>>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub thumbnail: Vec<Vec<Artwork>>,
+}
+
+impl Images {
+    /// The series poster, portrait, roughly two by three.
+    pub fn poster(&self, at_least: u32) -> Option<&str> {
+        widest_under(&self.poster_tall, at_least)
+    }
+
+    /// The still from the episode, sixteen by nine.
+    pub fn thumbnail(&self, at_least: u32) -> Option<&str> {
+        widest_under(&self.thumbnail, at_least)
+    }
+}
+
+/// The narrowest rendition that still covers `at_least` pixels: nothing is upscaled, and
+/// no more is pulled over the wire than the panel can show. A set that stops short of the
+/// asked-for width gives up its largest instead of nothing.
+fn widest_under(sets: &[Vec<Artwork>], at_least: u32) -> Option<&str> {
+    let mut renditions: Vec<&Artwork> = sets
+        .iter()
+        .flatten()
+        .filter(|artwork| !artwork.source.is_empty())
+        .collect();
+    renditions.sort_by_key(|artwork| artwork.width);
+    renditions
+        .iter()
+        .find(|artwork| artwork.width >= at_least)
+        .or_else(|| renditions.last())
+        .map(|artwork| artwork.source.as_str())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Subtitle {
     #[serde(default)]
@@ -120,6 +172,8 @@ pub struct SeasonEpisode {
     pub duration_ms: u64,
     #[serde(default, deserialize_with = "null_default")]
     pub availability_starts: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub images: Images,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +237,8 @@ pub struct CatalogItem {
     pub description: String,
     #[serde(default)]
     pub series_metadata: SeriesMetadata,
+    #[serde(default, deserialize_with = "null_default")]
+    pub images: Images,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +287,39 @@ mod tests {
             let episode: Episode = serde_json::from_str(json).unwrap();
             assert_eq!(episode.error, error);
             assert_eq!(episode.reason, reason);
+        }
+    }
+
+    /// The artwork arrives wrapped in a list of lists, and the rendition worth fetching
+    /// is the smallest one that still covers the panel.
+    #[test]
+    fn picks_a_rendition_that_covers_the_panel() {
+        let json = r#"{"data":[{"id":"G1","images":{
+            "thumbnail":[[
+                {"width":320,"height":180,"source":"small.jpg"},
+                {"width":640,"height":360,"source":"medium.jpg"},
+                {"width":1920,"height":1080,"source":"huge.jpg"}
+            ]]
+        }}]}"#;
+        let response: SeasonEpisodesResponse = serde_json::from_str(json).unwrap();
+        let images = &response.data[0].images;
+        assert_eq!(images.thumbnail(300), Some("small.jpg"));
+        // Exactly wide enough is wide enough.
+        assert_eq!(images.thumbnail(320), Some("small.jpg"));
+        assert_eq!(images.thumbnail(500), Some("medium.jpg"));
+        // Nothing is big enough, so the biggest there is beats showing nothing.
+        assert_eq!(images.thumbnail(4000), Some("huge.jpg"));
+        // And a set that is not there at all is not an error.
+        assert_eq!(images.poster(300), None);
+    }
+
+    /// Crunchyroll sends `"images": null` for an episode it has no still for, and a
+    /// series listing may leave the field out altogether.
+    #[test]
+    fn takes_an_episode_with_no_artwork() {
+        for json in [r#"{"data":[{"id":"G1","images":null}]}"#, r#"{"data":[{"id":"G1"}]}"#] {
+            let response: SeasonEpisodesResponse = serde_json::from_str(json).unwrap();
+            assert_eq!(response.data[0].images.thumbnail(320), None, "{json}");
         }
     }
 
