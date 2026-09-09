@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph
 use crate::model::{CatalogItem, Season, SeasonEpisode};
 use crate::util::language_name;
 
-use super::app::{App, Focus};
+use super::app::{App, Focus, Picker};
 
 const ACCENT: Color = Color::Rgb(244, 117, 33);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -235,6 +235,70 @@ fn details(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+/// A box in the middle of the screen, as tall as it needs to be and no taller than the
+/// terminal allows.
+fn popup(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(2));
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+/// The language list: every locale the selection offers, the one in use marked, and its
+/// code beside the name for anyone who thinks in locales rather than in languages.
+fn picker_overlay(frame: &mut Frame, area: Rect, picker: &mut Picker, current: &str) {
+    let column = picker
+        .pane
+        .items
+        .iter()
+        .map(|locale| Span::raw(language_name(locale)).width())
+        .max()
+        .unwrap_or(0);
+    let items: Vec<ListItem> = picker
+        .pane
+        .items
+        .iter()
+        .map(|locale| {
+            let name = language_name(locale);
+            let padding = " ".repeat(column - Span::raw(name).width() + 2);
+            ListItem::new(Line::from(vec![
+                Span::raw(if locale == current { "● " } else { "  " }),
+                Span::raw(format!("{name}{padding}")),
+                dim(locale.clone()),
+            ]))
+        })
+        .collect();
+    // Wide enough for the longest language name, and never so narrow that the hint
+    // along the bottom edge is cut in half.
+    let area = popup(
+        area,
+        (column as u16 + 20).max(42),
+        picker.pane.items.len() as u16 + 2,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::bordered()
+                    .border_style(Style::new().fg(ACCENT))
+                    .title(Span::styled(
+                        picker.title(),
+                        Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ))
+                    .title_bottom(dim(" ⏎ apply · tab other list · esc cancel ")),
+            )
+            .highlight_style(highlight(true))
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always),
+        area,
+        &mut picker.pane.state,
+    );
+}
+
 fn help_overlay(frame: &mut Frame, area: Rect) {
     let keys = [
         ("↑ ↓ / j k", "move the cursor"),
@@ -245,19 +309,14 @@ fn help_overlay(frame: &mut Frame, area: Rect) {
         ("o", "change the browse order"),
         ("p / P", "play the episode / the rest of the season"),
         ("d / D", "download the episode / the whole season"),
-        ("a / s / v", "cycle audio, subtitles, video quality"),
+        ("a / s", "pick the audio / subtitle language"),
+        ("A / S", "next audio / subtitle language, without the list"),
+        ("v", "cycle the video quality"),
         ("r", "reload the current column"),
         ("g / G", "jump to the first or last item"),
         ("q", "quit"),
     ];
-    let width = 62.min(area.width.saturating_sub(4));
-    let height = (keys.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
+    let popup = popup(area, 66, keys.len() as u16 + 2);
     let lines: Vec<Line> = keys
         .iter()
         .map(|(key, what)| Line::from(vec![accent(format!(" {key:<13}")), Span::raw(*what)]))
@@ -400,13 +459,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(dim(
-            " ↑↓ move   ⏎ open/play   ← back   / search   d download   a audio   s subs   ? keys   q quit",
+            " ↑↓ move   ⏎ open/play   ← back   / search   d download   a/s language   v quality   ? keys   q quit",
         ))),
         keys,
     );
 
     if app.show_help {
         help_overlay(frame, area);
+    }
+
+    // Read what is in use before the list borrows the app to draw itself.
+    let current = app.picker.as_ref().map(|picker| {
+        if picker.audio {
+            app.audio()
+        } else {
+            app.subs()
+        }
+    });
+    if let (Some(current), Some(picker)) = (current, app.picker.as_mut()) {
+        picker_overlay(frame, area, picker, &current);
     }
 }
 
@@ -416,6 +487,7 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     use crate::download::DownloadOptions;
     use crate::model::{CatalogItem, Season, SeasonEpisode, SeriesMetadata};
@@ -463,7 +535,8 @@ mod tests {
             season_number: 1,
             title: "Frieren".to_owned(),
             number_of_episodes: 28,
-            ..Season::default()
+            audio_locales: vec!["ja-JP".to_owned(), "en-US".to_owned(), "fr-FR".to_owned()],
+            subtitle_locales: vec!["en-US".to_owned(), "fr-FR".to_owned()],
         }]);
         app.episodes.set(vec![SeasonEpisode {
             id: "E1".to_owned(),
@@ -508,6 +581,51 @@ mod tests {
         }
     }
 
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    /// The language list is the way a locale gets changed, so it has to offer what the
+    /// season has, say which one is in use, and hand the choice back to the options.
+    #[test]
+    fn picks_a_language_from_the_list() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('a'));
+        let screen = rendered(120, 30, &mut app);
+        for expected in ["Audio language", "English", "en-US", "Français", "fr-FR"] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+
+        // The list is sorted and opens on what is in use - ja-JP, last of the three - so
+        // one step up lands on fr-FR.
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none(), "choosing closes the list");
+        assert_eq!(app.audio(), "fr-FR");
+        assert!(rendered(120, 30, &mut app).contains("Audio: Français"));
+
+        // Tab looks at the other list without going back out, and esc changes nothing.
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Tab);
+        assert!(app.picker.as_ref().is_some_and(|picker| picker.audio));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none(), "esc closes the list");
+        assert_eq!(app.audio(), "fr-FR");
+    }
+
+    /// A locale nothing lists is still the one in use, so the list has to keep offering
+    /// it rather than opening on someone else's language.
+    #[test]
+    fn offers_the_locale_in_use_whatever_the_season_says() {
+        let mut app = app();
+        app.options.audio_langs = vec!["de-DE".to_owned()];
+        press(&mut app, KeyCode::Char('a'));
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Deutsch"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.audio(), "de-DE", "the list opens on what is in use");
+    }
+
     /// Every panel is optional except the columns, so a terminal too short for the
     /// details or too narrow for the help popup still has to draw rather than panic.
     #[test]
@@ -518,6 +636,12 @@ mod tests {
             assert!(!screen.is_empty());
         }
         app.show_help = true;
+        for (width, height) in [(120, 30), (20, 6), (8, 4)] {
+            let screen = rendered(width, height, &mut app);
+            assert!(!screen.is_empty());
+        }
+        app.show_help = false;
+        press(&mut app, KeyCode::Char('a'));
         for (width, height) in [(120, 30), (20, 6), (8, 4)] {
             let screen = rendered(width, height, &mut app);
             assert!(!screen.is_empty());

@@ -89,15 +89,21 @@ cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE
 | `o` | Change the browse order: popular, recently added, A to Z |
 | `p`, `P` | Play the episode, or the rest of the season one episode after another |
 | `d`, `D` | Download the episode, or the whole season |
-| `a`, `s`, `v` | Cycle the audio locale, the subtitle locale and the video quality |
+| `a`, `s` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
+| `A`, `S` | Step to the next audio or subtitle locale without opening the list |
+| `v` | Cycle the video quality |
 | `r` | Reload the current column |
 | `?` | Show the keys |
 | `q` | Quit |
 
-The locales offered by `a` and `s` are the ones the selected season lists, so they
-follow whatever the series actually has. Every other option keeps the value it was given
-on the command line, so `--audio-lang`, `--subs-lang`, `--cc-lang` and `--audio-quality`
-still set what the interface starts with.
+The languages offered by `a` and `s` are the ones the selected season lists, falling back
+to the series, then to what was asked for on the command line, then to every locale
+Crunchyroll publishes - so the list follows whatever the series actually has. The locale
+in use is always among them, marked with a dot, and the list opens on it. Changing a
+language asks Crunchyroll for the open list again, since titles come back localised and
+an episode carries the dub that was asked for; the cursor stays where it was. Every other
+option keeps the value it was given on the command line, so `--audio-lang`, `--subs-lang`,
+`--cc-lang` and `--audio-quality` still set what the interface starts with.
 
 Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
 same with the progress bars.
