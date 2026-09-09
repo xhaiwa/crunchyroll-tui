@@ -2,6 +2,17 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer};
 
+/// Crunchyroll sends `null` for a field it has no value for - the episode number of a
+/// special, the description of a season - rather than leaving it out, and
+/// `#[serde(default)]` only covers a field that is missing entirely.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Subtitle {
     #[serde(default)]
@@ -56,9 +67,9 @@ pub struct DubVersion {
 pub struct EpisodeMetadata {
     #[serde(default)]
     pub audio_locale: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub episode_number: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub season_number: i32,
     #[serde(default)]
     pub series_title: String,
@@ -73,7 +84,7 @@ pub struct EpisodeMetadata {
 pub struct EpisodeInfo {
     #[serde(default)]
     pub episode_metadata: EpisodeMetadata,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub title: String,
 }
 
@@ -89,17 +100,25 @@ pub struct SeasonEpisode {
     pub id: String,
     #[serde(default)]
     pub versions: Vec<DubVersion>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub season_number: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub episode_number: i32,
+    /// What Crunchyroll prints on the episode: usually the number, but "SP" or "1.5"
+    /// for the specials that `episode_number` has nothing to say about.
+    #[serde(default, deserialize_with = "null_default")]
+    pub episode: String,
     #[serde(default)]
     pub series_title: String,
     #[serde(default)]
     pub audio_locale: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub duration_ms: u64,
+    #[serde(default, deserialize_with = "null_default")]
     pub availability_starts: String,
 }
 
@@ -109,11 +128,19 @@ pub struct SeasonEpisodesResponse {
     pub data: Vec<SeasonEpisode>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Season {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub season_number: i32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub number_of_episodes: i32,
+    #[serde(default)]
+    pub audio_locales: Vec<String>,
+    #[serde(default)]
+    pub subtitle_locales: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,9 +149,67 @@ pub struct SeasonsResponse {
     pub data: Vec<Season>,
 }
 
+/// What the catalogue knows about a series before any season has been fetched.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SeriesMetadata {
+    #[serde(default, deserialize_with = "null_default")]
+    pub episode_count: i32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub season_count: i32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub series_launch_year: i32,
+    #[serde(default)]
+    pub audio_locales: Vec<String>,
+    #[serde(default)]
+    pub subtitle_locales: Vec<String>,
+    #[serde(default)]
+    pub maturity_ratings: Vec<String>,
+    #[serde(default)]
+    pub is_dubbed: bool,
+    #[serde(default)]
+    pub is_simulcast: bool,
+}
+
+/// One entry of the catalogue, as returned by browse and by search.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CatalogItem {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub description: String,
+    #[serde(default)]
+    pub series_metadata: SeriesMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BrowseResponse {
+    #[serde(default)]
+    pub data: Vec<CatalogItem>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub total: i64,
+}
+
+/// Search answers with one group per result type rather than a flat list.
+#[derive(Debug, Deserialize)]
+pub struct SearchGroup {
+    #[serde(default)]
+    pub items: Vec<CatalogItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchResponse {
+    #[serde(default)]
+    pub data: Vec<SearchGroup>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Episode;
+    use super::{Episode, SeasonEpisode, SeasonEpisodesResponse};
 
     #[test]
     fn accepts_all_playback_error_shapes() {
@@ -147,5 +232,21 @@ mod tests {
             assert_eq!(episode.error, error);
             assert_eq!(episode.reason, reason);
         }
+    }
+
+    #[test]
+    fn reads_a_special_with_null_numbers() {
+        // A special carries no episode number, and a season that has not aired yet
+        // carries no title: both arrive as null rather than as a missing field.
+        let json = r#"{"data":[
+            {"id":"G1","episode":"SP","episode_number":null,"season_number":1,"title":null},
+            {"id":"G2","episode":"2","episode_number":2,"title":"Second","duration_ms":1461000}
+        ]}"#;
+        let response: SeasonEpisodesResponse = serde_json::from_str(json).unwrap();
+        let episodes: Vec<SeasonEpisode> = response.data;
+        assert_eq!(episodes[0].episode, "SP");
+        assert_eq!(episodes[0].episode_number, 0);
+        assert_eq!(episodes[0].title, "");
+        assert_eq!(episodes[1].duration_ms, 1_461_000);
     }
 }

@@ -4,6 +4,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 
 ## Features
 
+- Terminal interface for browsing the catalogue and starting playback
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Playback with mpv while the stream downloads, instead of writing a file
 - Selectable video and audio quality
@@ -20,7 +21,7 @@ Only download content you are authorized to access and comply with Crunchyroll's
 ## Requirements
 
 - A current Rust toolchain
-- [FFmpeg](https://ffmpeg.org/) available in `PATH`, plus [mpv](https://mpv.io/) for `--play`
+- [FFmpeg](https://ffmpeg.org/) available in `PATH`, plus [mpv](https://mpv.io/) for `--play` and for playback from `--tui`
 - A Crunchyroll account with access to the requested content
 - A valid Widevine device provision in the working directory:
   - one `.wvd` file, or
@@ -68,6 +69,38 @@ Use `all` to request every available audio, subtitle or closed-caption locale:
 cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE \
   --audio-lang all --subs-lang all --cc-lang all
 ```
+
+### Browsing the catalogue
+
+`--tui` opens a terminal interface instead of taking a URL: three columns for series,
+seasons and episodes, with playback and downloading on a key.
+
+```shell
+cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE
+```
+
+| Key | What it does |
+| --- | --- |
+| `↑` `↓`, `j` `k` | Move the cursor. `g`/`G` jump to the first or last item |
+| `⏎`, `→`, `l` | Open the selection, and play the episode under the cursor |
+| `←`, `h`, `esc` | Go back a column, and leave a search |
+| `tab` | Cycle the columns |
+| `/` | Search the catalogue. An empty search goes back to browsing |
+| `o` | Change the browse order: popular, recently added, A to Z |
+| `p`, `P` | Play the episode, or the rest of the season one episode after another |
+| `d`, `D` | Download the episode, or the whole season |
+| `a`, `s`, `v` | Cycle the audio locale, the subtitle locale and the video quality |
+| `r` | Reload the current column |
+| `?` | Show the keys |
+| `q` | Quit |
+
+The locales offered by `a` and `s` are the ones the selected season lists, so they
+follow whatever the series actually has. Every other option keeps the value it was given
+on the command line, so `--audio-lang`, `--subs-lang`, `--cc-lang` and `--audio-quality`
+still set what the interface starts with.
+
+Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
+same with the progress bars.
 
 ### Playing instead of downloading
 

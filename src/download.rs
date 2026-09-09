@@ -1190,6 +1190,21 @@ pub fn download_episode(
     result
 }
 
+/// The shape `download_episode` wants, out of what a season listing gives.
+pub fn episode_info(episode: &SeasonEpisode) -> EpisodeInfo {
+    EpisodeInfo {
+        episode_metadata: EpisodeMetadata {
+            series_title: episode.series_title.clone(),
+            season_number: episode.season_number,
+            episode_number: episode.episode_number,
+            audio_locale: episode.audio_locale.clone(),
+            versions: episode.versions.clone(),
+            availability_starts: episode.availability_starts.clone(),
+        },
+        title: episode.title.clone(),
+    }
+}
+
 pub fn download_season(
     client: &CrunchyrollClient,
     options: &DownloadOptions,
@@ -1211,17 +1226,7 @@ pub fn download_season(
         episodes.len()
     );
     for episode in episodes {
-        let info = EpisodeInfo {
-            episode_metadata: EpisodeMetadata {
-                series_title: episode.series_title.clone(),
-                season_number: episode.season_number,
-                episode_number: episode.episode_number,
-                audio_locale: episode.audio_locale.clone(),
-                versions: episode.versions.clone(),
-                availability_starts: episode.availability_starts.clone(),
-            },
-            title: episode.title.clone(),
-        };
+        let info = episode_info(episode);
         if let Err(error) = download_episode(client, &episode.id, &info, options) {
             eprintln!(
                 "Failed to download episode {}: {error:#}",
