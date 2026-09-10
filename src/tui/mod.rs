@@ -1,5 +1,6 @@
 mod app;
 pub mod art;
+pub mod keys;
 pub mod theme;
 mod ui;
 mod worker;
@@ -52,6 +53,8 @@ pub fn run(
     }
     let (theme, warnings) = config.theme.resolve(config.directory.as_deref());
     complaints.extend(warnings);
+    let (bindings, warnings) = config.keys.resolve();
+    complaints.extend(warnings);
     let images = images.unwrap_or(config.images);
 
     // Anything the client would print lands on top of the frame, so collect it and let
@@ -74,6 +77,7 @@ pub fn run(
         Worker::spawn(client.clone()),
         options,
         theme,
+        bindings,
         notices,
         gallery,
     );
