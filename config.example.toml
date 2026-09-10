@@ -98,6 +98,18 @@ video-quality = "1080p"
 # Audio quality, as a bitrate.
 audio-quality = "192k"
 
+# Whether the video is drawn in this terminal rather than in a window of its
+# own. The terminal is asked which graphics protocol it speaks - kitty, sixel or
+# iTerm2 - and mpv is handed the video output and the scaler that go with the
+# answer, so the episode plays where the artwork already is and there is nothing
+# else to look up.
+#
+# It only ever says how a video is drawn, never that there should be one: a
+# download is still a download. `--in-terminal` turns it on for one run, and
+# `--in-terminal=false` turns it off again for one run when this line says
+# otherwise.
+in-terminal = false
+
 # Extra options handed straight to mpv, one per entry - the same thing
 # `--mpv-arg` passes, and the same thing the interface uses when it plays. The
 # list is never split on anything, so a value with a comma in it survives.
@@ -106,9 +118,10 @@ audio-quality = "192k"
 #
 #   mpv-args = ["--fullscreen", "--slang=fre"]
 #
-# `--vo=kitty` keeps the video inside the terminal, next to the artwork:
+# These come after whatever `in-terminal` worked out, and mpv keeps the last
+# value of an option it is given twice, so this is also how you overrule it:
 #
-#   mpv-args = ["--vo=kitty"]
+#   mpv-args = ["--vo=gpu"]
 mpv-args = []
 
 

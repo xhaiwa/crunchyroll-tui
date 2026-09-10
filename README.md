@@ -9,6 +9,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Playback with mpv while the stream downloads, instead of writing a file
+- `--in-terminal`: the video drawn in the terminal itself, protocol and mpv options worked out for you
 - Selectable video and audio quality
 - Widevine support with either a `.wvd` file or `client_id.bin` plus `private_key.pem`
 - Segmented and single-file/on-demand DASH manifests
@@ -192,11 +193,11 @@ where you expected it. The same setting lives in the [config file](#configuratio
 Posters and stills come off Crunchyroll's own image CDN, at the smallest size that covers
 the panel, on threads of their own so nothing waits on them. Nothing is written to disk.
 
-Pair it with mpv's own kitty output and the whole thing - catalogue, artwork and video -
-stays inside the terminal:
+Pair it with [`--in-terminal`](#video-in-the-terminal) and the whole thing - catalogue, artwork and video - stays
+inside the terminal:
 
 ```shell
-cargo run --release -- --tui --mpv-arg --vo=kitty
+cargo run --release -- --tui --in-terminal
 ```
 
 ### Playing instead of downloading
@@ -207,7 +208,7 @@ cargo run --release -- --tui --mpv-arg --vo=kitty
 cargo run --release -- --url EPISODE_URL --play
 ```
 
-Every track option still applies, so the audio and subtitle locales you ask for all show up as switchable tracks in mpv. `--mpv-arg` passes options through, repeat it for more than one, and `[defaults] mpv-args` in the [config file](#configuration) sets them once and for all:
+Every track option still applies, so the audio and subtitle locales you ask for all show up as switchable tracks in mpv. `--in-terminal` keeps the picture in the terminal; `--mpv-arg` passes options through, repeat it for more than one, and `[defaults] mpv-args` in the [config file](#configuration) sets them once and for all:
 
 ```shell
 cargo run --release -- --url EPISODE_URL --play \
@@ -222,6 +223,34 @@ Notes:
 - The stream is a pipe, so it cannot be seeked past what mpv has already buffered. mpv keeps a 256 MiB forward and 128 MiB backward window in memory, which covers a few minutes of seeking either way.
 - Nothing is kept: no MKV is written, and the already-downloaded episode check is skipped.
 - `--play` needs mpv in `PATH`, and named pipes, so it is Unix-only. Downloading is unaffected.
+
+### Video in the terminal
+
+`--in-terminal` plays the episode where you are rather than in a window of its own. The
+terminal is asked which graphics protocol it speaks - the same question the artwork asks,
+asked once - and mpv is handed the video output that goes with the answer:
+
+| The terminal speaks | mpv is given |
+| --- | --- |
+| kitty | `--vo=kitty,tct`, plus `--vo-kitty-use-shm=yes` when the terminal is on this machine |
+| sixel | `--vo=sixel,tct` |
+| iTerm2 | `--vo=sixel,tct` - mpv has no iTerm2 output, and a terminal that speaks it speaks sixel too |
+| nothing | `--vo=tct`, and a word on the status line saying why the picture looks like that |
+
+Each one ends in `tct` - true colour drawn as text - because `--vo` takes a list and uses
+the first output that starts, so a build of mpv without sixel compiled in still shows the
+episode. All of them are scaled on the CPU frame by frame, so `--profile=sw-fast` goes
+with every one: it is what decides whether the picture keeps up.
+
+```shell
+cargo run --release -- --url EPISODE_URL --play --in-terminal
+```
+
+It says how a video is drawn, never that there should be one, so it needs `--play` or
+`--tui` and leaves a download a download. `in-terminal = true` in the [config
+file](#configuration) sets it once and for all, and `--in-terminal=false` turns it back
+off for a single run. Anything you pass with `--mpv-arg` comes after it and mpv keeps the
+last value of an option it is given twice, so `--mpv-arg --vo=gpu` still opens a window.
 
 Batch mode accepts one URL per line and ignores blank or non-HTTP lines:
 
@@ -281,7 +310,8 @@ subs-lang = "en-US"
 cc-lang = []
 video-quality = "1080p"       # 1080p, 720p, 480p, 360p, 240p
 audio-quality = "192k"
-mpv-args = []                 # ["--fullscreen", "--vo=kitty"]
+in-terminal = false           # play in the terminal rather than in a window
+mpv-args = []                 # ["--fullscreen", "--slang=fre"]
 
 [theme]
 # See Colours below.
@@ -297,7 +327,9 @@ may also be a comma-separated string, the way the flag takes it:
 
 `mpv-args` holds one option per entry, as `--mpv-arg` passes them, and is never split on
 anything - so a value with a comma in it survives. Passing `--mpv-arg` on the command
-line replaces the list rather than adding to it.
+line replaces the list rather than adding to it. `in-terminal` is [the shortcut for
+playing in the terminal](#video-in-the-terminal), and whatever it works out goes ahead of
+`mpv-args`, which therefore overrules it.
 
 ### Keys
 
