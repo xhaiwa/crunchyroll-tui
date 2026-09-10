@@ -317,7 +317,10 @@ mod tests {
     /// series listing may leave the field out altogether.
     #[test]
     fn takes_an_episode_with_no_artwork() {
-        for json in [r#"{"data":[{"id":"G1","images":null}]}"#, r#"{"data":[{"id":"G1"}]}"#] {
+        for json in [
+            r#"{"data":[{"id":"G1","images":null}]}"#,
+            r#"{"data":[{"id":"G1"}]}"#,
+        ] {
             let response: SeasonEpisodesResponse = serde_json::from_str(json).unwrap();
             assert_eq!(response.data[0].images.thumbnail(320), None, "{json}");
         }

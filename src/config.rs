@@ -78,6 +78,9 @@ pub struct Defaults {
     pub cc_lang: Option<OneOrMany>,
     pub video_quality: Option<String>,
     pub audio_quality: Option<String>,
+    /// Whether playback is drawn in the terminal rather than in a window.
+    /// `--in-terminal=false` turns it back off for one run.
+    pub in_terminal: Option<bool>,
     /// Extra arguments for mpv, one per entry, as `--mpv-arg` passes them.
     #[serde(alias = "mpv-arg")]
     pub mpv_args: Option<OneOrMany>,
@@ -212,6 +215,7 @@ mpv-args = [\"--fullscreen\", \"--vf=lavfi=[hqdn3d]\"]
         );
         assert_eq!(defaults.video_quality.as_deref(), Some("720p"));
         assert_eq!(defaults.audio_quality, None);
+        assert_eq!(defaults.in_terminal, None);
         assert_eq!(
             defaults.mpv_args.as_ref().expect("mpv args").list(),
             ["--fullscreen", "--vf=lavfi=[hqdn3d]"],
@@ -268,6 +272,12 @@ download = [\"d\", \"ctrl-d\"]
         );
         assert_eq!(defaults.video_quality.as_deref(), Some("1080p"));
         assert_eq!(defaults.audio_quality.as_deref(), Some("192k"));
+        assert_eq!(
+            defaults.in_terminal,
+            Some(false),
+            "an example that plays in the terminal by default surprises everyone who \
+             copies it"
+        );
         assert!(
             defaults
                 .mpv_args

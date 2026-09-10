@@ -45,7 +45,7 @@ const TICK: Duration = Duration::from_millis(100);
 /// line rather than printed.
 pub fn run(
     client: CrunchyrollClient,
-    options: DownloadOptions,
+    mut options: DownloadOptions,
     config: Config,
     mut complaints: Vec<String>,
 ) -> Result<()> {
@@ -70,6 +70,17 @@ pub fn run(
     // reading the answer back off stdin, so this belongs after the alternate screen is
     // entered and before the event loop starts taking keys off the same stdin.
     let gallery = art::Gallery::open(images);
+    // The gallery has just asked the terminal what it can draw, so mpv can be told the
+    // same thing without a second round of escape sequences going out over stdin.
+    if config.defaults.in_terminal.unwrap_or(false) {
+        let (args, warning) = crate::terminal::mpv_args(gallery.protocol());
+        if let Some(warning) = warning {
+            notices.lock().expect("notices poisoned").push(warning);
+        }
+        // Ahead of what was asked for by hand: mpv keeps the last value of an option it
+        // is given twice, so `--mpv-arg --vo=gpu` still opens a window.
+        options.mpv_args.splice(0..0, args);
+    }
     let app = App::new(
         Worker::spawn(client.clone()),
         options,

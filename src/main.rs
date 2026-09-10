@@ -8,6 +8,7 @@ mod model;
 mod output;
 mod play;
 mod progress;
+mod terminal;
 mod tui;
 mod util;
 
@@ -16,7 +17,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 use crate::api::CrunchyrollClient;
 use crate::config::OneOrMany;
@@ -26,6 +27,10 @@ use crate::util::{parse_langs, parse_url};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Downloads Crunchyroll anime and outputs MKV files")]
+// `--in-terminal` says how a video is drawn rather than that there should be one, so it
+// only means anything on a run that plays: `--play`, or the interface, which plays at a
+// keypress.
+#[command(group = ArgGroup::new("playback").args(["play", "tui"]).multiple(true))]
 // Every option that a `[defaults]` entry can set is an `Option` with no clap default of
 // its own: a value that is only there because clap put it there cannot be told apart
 // from one the user typed, and the config file has to lose to the second and win over
@@ -64,6 +69,22 @@ struct Cli {
     /// Play the stream with mpv as it arrives instead of writing an MKV file.
     #[arg(long)]
     play: bool,
+
+    /// Draw the video in this terminal rather than in a window, working out the
+    /// graphics protocol it speaks and the mpv options that go with it. Needs `--play`
+    /// or `--tui`.
+    // Written as a flag but taking a value, so that `--in-terminal=false` can turn off
+    // what the config file turned on. `require_equals` is what keeps the value from
+    // swallowing the next argument.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        requires = "playback"
+    )]
+    in_terminal: Option<bool>,
 
     /// Extra argument passed straight to mpv. Repeat for more than one.
     // mpv options start with a dash, so they have to be taken as values rather than as
@@ -174,8 +195,9 @@ fn run() -> Result<()> {
         }
     }
     let defaults = &config.defaults;
+    let in_terminal = cli.in_terminal.or(defaults.in_terminal).unwrap_or(false);
 
-    let opts = DownloadOptions {
+    let mut opts = DownloadOptions {
         audio_langs: {
             let parsed = langs(
                 cli.audio_lang.as_deref(),
@@ -217,6 +239,18 @@ fn run() -> Result<()> {
             cli.mpv_arg.clone()
         },
     };
+    // The terminal can only be asked what it draws once it is not about to be handed to
+    // something else, and the interface asks on its own account when it opens, so a run
+    // that has one leaves this to it.
+    if in_terminal && !cli.tui {
+        let (args, warning) = terminal::mpv_args(terminal::detect());
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+        // Ahead of what was asked for by hand: mpv keeps the last value of an option it
+        // is given twice, so `--mpv-arg --vo=gpu` still opens a window.
+        opts.mpv_args.splice(0..0, args);
+    }
     let client = CrunchyrollClient::new(etp_rt, cli.debug_manifest)?;
 
     if cli.tui {
@@ -228,6 +262,7 @@ fn run() -> Result<()> {
         if let Some(images) = cli.images {
             config.images = images;
         }
+        config.defaults.in_terminal = Some(in_terminal);
         return tui::run(client, opts, config, complaints);
     }
 
@@ -282,7 +317,52 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{OneOrMany, langs};
+    use clap::CommandFactory;
+
+    use super::{Cli, OneOrMany, Parser, langs};
+
+    /// clap checks the shape of the whole command - groups that name arguments which
+    /// exist, `requires` that points somewhere - only when asked.
+    #[test]
+    fn the_command_line_is_wired_up() {
+        Cli::command().debug_assert();
+    }
+
+    /// `--in-terminal` is a flag, but one a config file can have turned on already, so
+    /// there has to be a way of saying no to it for a single run.
+    #[test]
+    fn in_terminal_is_a_flag_that_can_still_be_turned_off() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                std::iter::once("crunchyroll-downloader").chain(args.iter().copied()),
+            )
+        };
+        assert_eq!(
+            parse(&["--tui", "--in-terminal"])
+                .expect("bare flag")
+                .in_terminal,
+            Some(true)
+        );
+        assert_eq!(
+            parse(&["--tui", "--in-terminal=false"])
+                .expect("turned off")
+                .in_terminal,
+            Some(false)
+        );
+        assert_eq!(
+            parse(&["--tui"]).expect("left out").in_terminal,
+            None,
+            "nothing said on the command line leaves the config file to decide"
+        );
+
+        // It says how a video is drawn rather than that there should be one, so it takes
+        // a run that plays.
+        assert!(parse(&["--url", "URL", "--in-terminal"]).is_err());
+        assert!(parse(&["--url", "URL", "--play", "--in-terminal"]).is_ok());
+
+        // The value has to be attached: taken loose it would swallow whatever came next.
+        assert!(parse(&["--tui", "--in-terminal", "true"]).is_err());
+    }
 
     #[test]
     fn the_command_line_wins_then_the_config_file_then_the_built_in() {

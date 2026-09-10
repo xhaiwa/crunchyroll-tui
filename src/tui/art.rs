@@ -202,6 +202,13 @@ impl Gallery {
         self.enabled
     }
 
+    /// What the terminal answered when it was asked what it can draw. It was asked once,
+    /// at startup, and mpv has to be told the same thing when it takes the screen over -
+    /// so the answer is worth handing out rather than asking for again.
+    pub fn protocol(&self) -> ProtocolType {
+        self.picker.protocol_type()
+    }
+
     /// Turns the artwork on or off, and says what the terminal is drawing it with so the
     /// answer to "why can I not see the posters" is one keypress away.
     pub fn toggle(&mut self) -> String {
