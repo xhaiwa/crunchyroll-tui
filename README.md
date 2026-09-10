@@ -14,6 +14,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - Ten parallel segment workers with bounded memory use and retries
 - Concurrent video, audio and subtitle downloads
 - Automatic access-token refresh
+- The session cookie read from `pass`, the environment or the config file, instead of the command line
 - Batch downloads from a text file
 - MKV stream language, title and default-track metadata
 
@@ -36,21 +37,70 @@ cargo build --release
 
 The binary is written to `target/release/crunchyroll-downloader`.
 
+## Signing in
+
+Every run needs the `etp_rt` cookie from a logged-in Crunchyroll session. Log in to
+Crunchyroll in a browser, open Developer Tools, find the Crunchyroll cookies under
+Storage/Application, and copy the value of the `etp_rt` cookie. It is a 36-character
+UUID, and it is a session: whoever holds it is signed in as you until you log out.
+
+It can be given four ways, and the first of them that answers is the one used:
+
+1. `--etp-rt COOKIE`
+2. `$CRUNCHYROLL_ETP_RT`
+3. `etp_rt` in the config file
+4. `etp_rt_command` in the config file, whose first line of output is the cookie
+
+The last one keeps the cookie out of every file this program can see, which is what
+`pass`, `gopass` and the rest are for:
+
+```toml
+etp_rt_command = "pass show crunchyroll/etp_rt"
+```
+
+The command runs through `sh`, so a pipeline is fine, and it keeps the terminal while it
+runs, so gpg can ask for a passphrase on it. Only the first line of its output is read -
+`pass show` prints the whole entry, with the secret on the first line and notes under it.
+
+Top-level keys have to come before any `[section]`, the way TOML works:
+
+```toml
+etp_rt_command = "pass show crunchyroll/etp_rt"
+
+[theme]
+name = "gruvbox"
+```
+
+`etp_rt = "..."` puts the cookie in the file instead, which is simpler and worth a
+`chmod 600 ~/.config/crunchyroll-downloader/config.toml` - a file other users can read is
+reported on startup. For a single shell session, the environment does as well, and keeps
+the value out of the history that the command line lands in:
+
+```shell
+export CRUNCHYROLL_ETP_RT="$(pass show crunchyroll/etp_rt)"
+```
+
+`--etp-rt` is the one to avoid. An argument is written to the shell's history, is
+readable in `/proc` by anyone on the machine for as long as the program runs, and is on
+screen in every screenshot or asciinema recording of the command that started it. It is
+still accepted, with a word on stderr, because it is convenient for a one-off.
+
+However it arrives, the cookie is never printed back: not by the interface, not by the
+messages about it, and not by a `{:?}` of anything that holds it.
+
 ## Usage
 
 ```shell
 cargo run --release -- \
   --url https://www.crunchyroll.com/series/GJ0H7Q5ZJ/hells-paradise \
-  --season 1 \
-  --etp-rt YOUR_COOKIE_VALUE
+  --season 1
 ```
 
 Download one episode:
 
 ```shell
 cargo run --release -- \
-  --url https://www.crunchyroll.com/watch/GE00198973JAJP/dawn-and-confusion \
-  --etp-rt YOUR_COOKIE_VALUE
+  --url https://www.crunchyroll.com/watch/GE00198973JAJP/dawn-and-confusion
 ```
 
 Download several tracks, with the first audio and regular subtitle track marked as default:
@@ -58,7 +108,6 @@ Download several tracks, with the first audio and regular subtitle track marked 
 ```shell
 cargo run --release -- \
   --url EPISODE_URL \
-  --etp-rt YOUR_COOKIE_VALUE \
   --audio-lang ja-JP,en-US \
   --subs-lang en-US,es-419,de-DE \
   --cc-lang en-US
@@ -67,7 +116,7 @@ cargo run --release -- \
 Use `all` to request every available audio, subtitle or closed-caption locale:
 
 ```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE \
+cargo run --release -- --url EPISODE_URL \
   --audio-lang all --subs-lang all --cc-lang all
 ```
 
@@ -77,7 +126,7 @@ cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE \
 seasons and episodes, with playback and downloading on a key.
 
 ```shell
-cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE
+cargo run --release -- --tui
 ```
 
 | Key | Action | What it does |
@@ -128,7 +177,7 @@ and they drag a hundred colours of their own across the colourscheme the rest of
 interface is careful to wear - so they are opt-in:
 
 ```shell
-cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --images on
+cargo run --release -- --tui --images on
 ```
 
 `--images off` turns the artwork off altogether, and `i` toggles it while the interface is
@@ -150,7 +199,7 @@ Pair it with mpv's own kitty output and the whole thing - catalogue, artwork and
 stays inside the terminal:
 
 ```shell
-cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --mpv-arg --vo=kitty
+cargo run --release -- --tui --mpv-arg --vo=kitty
 ```
 
 ### Keys
@@ -250,13 +299,13 @@ stand between you and the catalogue.
 `--play` streams the episode straight into mpv rather than writing an MKV. Segments go into named pipes, ffmpeg decrypts and muxes them as they arrive, and mpv starts on the first few seconds instead of waiting for the whole episode:
 
 ```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play
+cargo run --release -- --url EPISODE_URL --play
 ```
 
 Every track option still applies, so the audio and subtitle locales you ask for all show up as switchable tracks in mpv. `--mpv-arg` passes options through, repeat it for more than one:
 
 ```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play \
+cargo run --release -- --url EPISODE_URL --play \
   --audio-lang ja-JP,en-US --subs-lang en-US,de-DE \
   --mpv-arg --fullscreen --mpv-arg --slang=fre
 ```
@@ -272,14 +321,10 @@ Notes:
 Batch mode accepts one URL per line and ignores blank or non-HTTP lines:
 
 ```shell
-cargo run --release -- --file list.txt --etp-rt YOUR_COOKIE_VALUE
+cargo run --release -- --file list.txt
 ```
 
 Run `cargo run --release -- --help` for every option.
-
-## Finding `etp_rt`
-
-Log in to Crunchyroll in a browser, open Developer Tools, inspect the Crunchyroll cookies under Storage/Application, and copy the value of the `etp_rt` cookie.
 
 ## Tests
 

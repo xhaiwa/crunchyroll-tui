@@ -16,7 +16,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use crate::api::CrunchyrollClient;
-use crate::config;
+use crate::config::Config;
 use crate::download::{DownloadOptions, download_episode, episode_info};
 use crate::model::SeasonEpisode;
 
@@ -39,27 +39,24 @@ const TICK: Duration = Duration::from_millis(100);
 
 /// Browses the catalogue and hands episodes to mpv, or to the downloader.
 ///
-/// `theme_name` is what `--theme` asked for and `images` what `--images` asked for; both
-/// win over the config file.
+/// `config` arrives with whatever the command line overrode already applied, and
+/// `complaints` carries what reading it - and finding the cookie - had to say: the
+/// terminal is about to belong to the alternate screen, so those are shown on the status
+/// line rather than printed.
 pub fn run(
     client: CrunchyrollClient,
     options: DownloadOptions,
-    theme_name: Option<String>,
-    images: Option<art::Setting>,
+    config: Config,
+    mut complaints: Vec<String>,
 ) -> Result<()> {
-    let (mut config, mut complaints) = config::load();
-    if theme_name.is_some() {
-        config.theme.name = theme_name;
-    }
     let (theme, warnings) = config.theme.resolve(config.directory.as_deref());
     complaints.extend(warnings);
     let (bindings, warnings) = config.keys.resolve();
     complaints.extend(warnings);
-    let images = images.unwrap_or(config.images);
+    let images = config.images;
 
     // Anything the client would print lands on top of the frame, so collect it and let
-    // the status line show it instead. Anything wrong with the config goes in with it:
-    // printed now it would be scrolled away by the alternate screen before it was read.
+    // the status line show it instead.
     let notices = Arc::new(Mutex::new(complaints));
     let sink = Arc::clone(&notices);
     let client = client.with_notices(Arc::new(move |message: &str| {

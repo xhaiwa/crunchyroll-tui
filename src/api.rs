@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
+use crate::credentials::Secret;
 use crate::model::{
     BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, SearchResponse,
     Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse,
@@ -53,7 +54,7 @@ pub struct CrunchyrollClient {
     http: Client,
     media: Client,
     device_id: String,
-    etp_rt: String,
+    etp_rt: Secret,
     access_token: Arc<RwLock<String>>,
     refresh_lock: Arc<Mutex<()>>,
     /// Where the running commentary goes. It is printed by default, but the TUI owns
@@ -87,7 +88,7 @@ fn build_media_client(stall: Duration) -> Result<Client> {
 }
 
 impl CrunchyrollClient {
-    pub fn new(etp_rt: String, debug: bool) -> Result<Self> {
+    pub fn new(etp_rt: Secret, debug: bool) -> Result<Self> {
         let client = Self {
             http: build_api_client()?,
             media: build_media_client(MEDIA_STALL_TIMEOUT)?,
@@ -118,7 +119,11 @@ impl CrunchyrollClient {
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(
                 COOKIE,
-                format!("device_id={}; etp_rt={}", self.device_id, self.etp_rt),
+                format!(
+                    "device_id={}; etp_rt={}",
+                    self.device_id,
+                    self.etp_rt.expose()
+                ),
             )
             .form(&[
                 ("device_id", self.device_id.as_str()),
