@@ -132,7 +132,8 @@ pub struct App {
     pub options: DownloadOptions,
     /// The colours everything is drawn in.
     pub theme: Theme,
-    /// What each key does.
+    /// Which key does what, so the help popup and the reminder along the bottom edge can
+    /// say what this particular config file asked for rather than what vim would.
     pub keys: Bindings,
     /// The posters and episode stills, and the terminal's ability to draw them.
     pub art: Gallery,
@@ -568,21 +569,22 @@ impl App {
     }
 
     /// The language list has the keys of a column, plus the one that cycles the columns
-    /// to look at the other list without going back out first.
-    fn edit_picker(&mut self, command: Option<Command>) {
-        let (Some(picker), Some(command)) = (self.picker.as_mut(), command) else {
+    /// to look at the other list without going back out first. Anything else does
+    /// nothing while it is open, which is what a new command should do here until
+    /// someone decides otherwise.
+    fn edit_picker(&mut self, command: Command) {
+        let Some(picker) = self.picker.as_mut() else {
             return;
         };
         match command {
-            // Quitting out of the list leaves the list, not the interface.
             Command::Back | Command::Quit => self.picker = None,
             Command::Up => picker.pane.move_by(-1),
             Command::Down => picker.pane.move_by(1),
             Command::PageUp => picker.pane.move_by(-10),
             Command::PageDown => picker.pane.move_by(10),
-            Command::First => picker.pane.select_edge(false),
-            Command::Last => picker.pane.select_edge(true),
-            Command::NextPane => {
+            Command::Top => picker.pane.select_edge(false),
+            Command::Bottom => picker.pane.select_edge(true),
+            Command::NextColumn => {
                 let other = !picker.audio;
                 self.open_picker(other);
             }
@@ -601,13 +603,13 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        // ctrl-c is the terminal's own way out, and stays wired to quitting whatever the
-        // config file says - including while the search box has the keyboard.
+        // ctrl-c is not one of the bindings. It is how a terminal program is left, and a
+        // config file has no business being able to take it away.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
-        // The search box takes letters as letters, so nothing is looked up while it is
-        // open.
+        // The search box is typing rather than commands: every letter belongs in the
+        // query, whatever it would otherwise do.
         if self.editing.is_some() {
             self.edit_search(key);
             return Action::None;
@@ -615,10 +617,13 @@ impl App {
         let command = self.keys.command(key);
         if self.picker.is_some() {
             self.notice = None;
-            self.edit_picker(command);
+            if let Some(command) = command {
+                self.edit_picker(command);
+            }
             return Action::None;
         }
-        // Any key at all puts the help away, bound or not.
+        // The help popup is read and dismissed, so any key at all closes it - including
+        // one that is bound to nothing.
         if self.show_help {
             self.show_help = false;
             return Action::None;
@@ -635,11 +640,11 @@ impl App {
             Command::Down => self.focused_pane_move(1),
             Command::PageUp => self.focused_pane_move(-10),
             Command::PageDown => self.focused_pane_move(10),
-            Command::First => self.focused_pane_edge(false),
-            Command::Last => self.focused_pane_edge(true),
+            Command::Top => self.focused_pane_edge(false),
+            Command::Bottom => self.focused_pane_edge(true),
             Command::Open => return self.descend(),
             Command::Back => self.ascend(),
-            Command::NextPane => {
+            Command::NextColumn => {
                 self.focus = match self.focus {
                     Focus::Series => Focus::Seasons,
                     Focus::Seasons => Focus::Episodes,
@@ -647,7 +652,7 @@ impl App {
                 }
             }
             Command::Play => return self.play(false),
-            Command::PlaySeason => return self.play(true),
+            Command::PlayRest => return self.play(true),
             Command::Download => return self.download(false),
             Command::DownloadSeason => return self.download(true),
             Command::AudioLanguage => self.open_picker(true),
@@ -659,7 +664,7 @@ impl App {
                 let message = self.art.toggle();
                 self.say(message);
             }
-            Command::Sort => self.cycle_sort(),
+            Command::Order => self.cycle_sort(),
             Command::Reload => self.reload(),
         }
         Action::None

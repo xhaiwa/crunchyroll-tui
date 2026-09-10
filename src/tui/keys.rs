@@ -1,34 +1,30 @@
-//! Which key does what.
-//!
-//! Everything the interface can be asked to do has a name, a default key and a place in
-//! the help overlay, so a `[keys]` section in the config file can move any of it
-//! somewhere else and the overlay still tells the truth about where it went.
-
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt;
+use std::collections::BTreeMap;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
-use crate::config::OneOrMany;
-
-/// Everything a key can be pointed at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Something the interface can be asked to do.
+///
+/// The name of a variant is the name it is written under in the config, so adding one
+/// adds a line someone can remap. The declaration order is the order warnings come out
+/// in, and the order a command's keys appear in the help popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Command {
     Up,
     Down,
     PageUp,
     PageDown,
-    First,
-    Last,
+    Top,
+    Bottom,
     Open,
     Back,
-    NextPane,
+    NextColumn,
     Search,
-    Sort,
+    Order,
     Reload,
     Play,
-    PlaySeason,
+    PlayRest,
     Download,
     DownloadSeason,
     AudioLanguage,
@@ -41,548 +37,528 @@ pub enum Command {
     Quit,
 }
 
-/// Every command: the name a `[keys]` entry calls it by, and the keys it answers to when
-/// the config file says nothing about it.
-///
-/// `ctrl-c` is deliberately not in here. It is the terminal's own way out and stays
-/// wired to quitting whatever the config file does, so a half-finished `[keys]` section
-/// cannot leave someone stuck in the alternate screen.
-pub const COMMANDS: [(Command, &str, &[&str]); 24] = [
-    (Command::Up, "up", &["up", "k"]),
-    (Command::Down, "down", &["down", "j"]),
-    (Command::PageUp, "page-up", &["page-up"]),
-    (Command::PageDown, "page-down", &["page-down"]),
-    (Command::First, "first", &["home", "g"]),
-    (Command::Last, "last", &["end", "G"]),
-    (Command::Open, "open", &["enter", "right", "l"]),
-    (Command::Back, "back", &["left", "h", "esc"]),
-    (Command::NextPane, "next-pane", &["tab"]),
-    (Command::Search, "search", &["/"]),
-    (Command::Sort, "sort", &["o"]),
-    (Command::Reload, "reload", &["r"]),
-    (Command::Play, "play", &["p"]),
-    (Command::PlaySeason, "play-season", &["P"]),
-    (Command::Download, "download", &["d"]),
-    (Command::DownloadSeason, "download-season", &["D"]),
-    (Command::AudioLanguage, "audio-language", &["a"]),
-    (Command::SubtitleLanguage, "subtitle-language", &["s"]),
-    (Command::NextAudio, "next-audio", &["A"]),
-    (Command::NextSubtitle, "next-subtitle", &["S"]),
-    (Command::Quality, "quality", &["v"]),
-    (Command::Images, "images", &["i"]),
-    (Command::Help, "help", &["?"]),
-    (Command::Quit, "quit", &["q"]),
-];
-
-/// The help overlay, a row at a time: the commands whose keys the row shows, and what it
-/// says they do. Commands are grouped the way someone reading the list thinks about them
-/// - play and play-the-rest-of-the-season are one line, not two.
-pub const HELP: [(&[Command], &str); 15] = [
-    (&[Command::Up, Command::Down], "move the cursor"),
-    (&[Command::Open], "open the selection, and play an episode"),
-    (&[Command::Back], "go back a column, and leave a search"),
-    (&[Command::NextPane], "cycle the columns"),
-    (&[Command::Search], "search the catalogue"),
-    (&[Command::Sort], "change the browse order"),
-    (
-        &[Command::Play, Command::PlaySeason],
-        "play the episode / the rest of the season",
-    ),
-    (
-        &[Command::Download, Command::DownloadSeason],
-        "download the episode / the whole season",
-    ),
-    (
-        &[Command::AudioLanguage, Command::SubtitleLanguage],
-        "pick the audio / subtitle language",
-    ),
-    (
-        &[Command::NextAudio, Command::NextSubtitle],
-        "next audio / subtitle language, without the list",
-    ),
-    (&[Command::Quality], "cycle the video quality"),
-    (
-        &[Command::Images],
-        "show or hide the poster and the episode still",
-    ),
-    (&[Command::Reload], "reload the current column"),
-    (
-        &[Command::First, Command::Last],
-        "jump to the first or last item",
-    ),
-    (&[Command::Quit], "quit"),
-];
-
-/// The one-line reminder along the bottom of the screen: the same idea as [`HELP`], cut
-/// down to what fits and to what someone actually reaches for.
-pub const HINTS: [(&[Command], &str); 9] = [
-    (&[Command::Up, Command::Down], "move"),
-    (&[Command::Open], "open/play"),
-    (&[Command::Back], "back"),
-    (&[Command::Search], "search"),
-    (&[Command::Download], "download"),
-    (
-        &[Command::AudioLanguage, Command::SubtitleLanguage],
-        "language",
-    ),
-    (&[Command::Quality], "quality"),
-    (&[Command::Help], "keys"),
-    (&[Command::Quit], "quit"),
-];
-
 impl Command {
-    pub fn name(self) -> &'static str {
-        COMMANDS
-            .iter()
-            .find(|(command, ..)| *command == self)
-            .map_or("", |(_, name, _)| *name)
-    }
-
-    fn from_name(name: &str) -> Option<Self> {
-        COMMANDS
-            .iter()
-            .find(|(_, key, _)| *key == name)
-            .map(|(command, ..)| *command)
+    /// What the command is called in the config file, and in anything said about it.
+    /// The match is exhaustive on purpose: a new command cannot be added without being
+    /// given a name here and a key in [`DEFAULTS`].
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::PageUp => "page-up",
+            Self::PageDown => "page-down",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::Open => "open",
+            Self::Back => "back",
+            Self::NextColumn => "next-column",
+            Self::Search => "search",
+            Self::Order => "order",
+            Self::Reload => "reload",
+            Self::Play => "play",
+            Self::PlayRest => "play-rest",
+            Self::Download => "download",
+            Self::DownloadSeason => "download-season",
+            Self::AudioLanguage => "audio-language",
+            Self::SubtitleLanguage => "subtitle-language",
+            Self::NextAudio => "next-audio",
+            Self::NextSubtitle => "next-subtitle",
+            Self::Quality => "quality",
+            Self::Images => "images",
+            Self::Help => "help",
+            Self::Quit => "quit",
+        }
     }
 }
 
-/// One key, as the terminal reports it and as the config file writes it down.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Key {
+/// Every command and the keys it answers to out of the box - vim's, with the arrows
+/// beside them. They are written the way a user would write them in the config and read
+/// by the same parser, so the defaults cannot mean something the config file cannot say.
+pub const DEFAULTS: [(Command, &[&str]); 24] = [
+    (Command::Up, &["up", "k"]),
+    (Command::Down, &["down", "j"]),
+    (Command::PageUp, &["pgup"]),
+    (Command::PageDown, &["pgdn"]),
+    (Command::Top, &["home", "g"]),
+    (Command::Bottom, &["end", "G"]),
+    (Command::Open, &["enter", "right", "l"]),
+    (Command::Back, &["left", "h", "esc"]),
+    (Command::NextColumn, &["tab"]),
+    (Command::Search, &["/"]),
+    (Command::Order, &["o"]),
+    (Command::Reload, &["r"]),
+    (Command::Play, &["p"]),
+    (Command::PlayRest, &["P"]),
+    (Command::Download, &["d"]),
+    (Command::DownloadSeason, &["D"]),
+    (Command::AudioLanguage, &["a"]),
+    (Command::SubtitleLanguage, &["s"]),
+    (Command::NextAudio, &["A"]),
+    (Command::NextSubtitle, &["S"]),
+    (Command::Quality, &["v"]),
+    (Command::Images, &["i"]),
+    (Command::Help, &["?"]),
+    (Command::Quit, &["q"]),
+];
+
+/// One keypress: the key, and the modifiers held with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chord {
     code: KeyCode,
     modifiers: KeyModifiers,
 }
 
-impl Key {
-    /// Puts a key into the one shape a lookup can compare.
-    ///
-    /// A shifted character arrives as the character itself - `P`, not `p` plus a flag -
-    /// and terminals are not consistent about whether the flag comes with it, so the
-    /// shift is folded into the character and dropped. Ctrl goes the other way: the
-    /// terminal always reports the unshifted letter, so `ctrl-C` and `ctrl-c` are the
-    /// same key however they were typed.
+/// The modifiers worth telling apart. A terminal reports others - a keypad flag, the
+/// state of caps lock - only once the enhanced protocol is asked for, which it is not,
+/// and a chord that carried one would match nothing.
+const HELD: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SHIFT);
+
+impl Chord {
+    /// Shift is already in the character the key produced, so it is dropped there: `G`
+    /// and `shift-g` are one chord, and a config that says either is understood.
     fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        let mut modifiers = modifiers
-            & (KeyModifiers::CONTROL
-                | KeyModifiers::ALT
-                | KeyModifiers::SHIFT
-                | KeyModifiers::SUPER);
-        let code = match code {
-            KeyCode::Char(character) if modifiers.contains(KeyModifiers::CONTROL) => {
-                modifiers.remove(KeyModifiers::SHIFT);
-                KeyCode::Char(character.to_ascii_lowercase())
-            }
-            KeyCode::Char(character) if modifiers.contains(KeyModifiers::SHIFT) => {
-                modifiers.remove(KeyModifiers::SHIFT);
-                KeyCode::Char(character.to_uppercase().next().unwrap_or(character))
-            }
-            code => code,
-        };
-        Self { code, modifiers }
+        let modifiers = modifiers.intersection(HELD);
+        match code {
+            KeyCode::Char(letter) if modifiers.contains(KeyModifiers::SHIFT) => Self {
+                code: KeyCode::Char(letter.to_ascii_uppercase()),
+                modifiers: modifiers.difference(KeyModifiers::SHIFT),
+            },
+            _ => Self { code, modifiers },
+        }
     }
 
-    pub fn from_event(event: KeyEvent) -> Self {
-        Self::new(event.code, event.modifiers)
+    fn of(key: KeyEvent) -> Self {
+        Self::new(key.code, key.modifiers)
     }
 
-    /// `q`, `ctrl-c`, `alt-enter`, `page-up`. A lone character is always the key itself,
-    /// so `-` and `+` can be bound without any escaping.
+    /// `k`, `ctrl-r`, `pgdn`. Anything that is not a key is `None`, so the config can be
+    /// told which line of it is wrong rather than being refused whole.
     pub fn parse(spec: &str) -> Option<Self> {
-        let mut rest = spec.trim();
         let mut modifiers = KeyModifiers::NONE;
-        while rest.chars().nth(1).is_some() {
-            let Some((head, tail)) = rest.split_once(['-', '+']) else {
-                break;
-            };
-            let modifier = match head.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => KeyModifiers::CONTROL,
-                "alt" | "meta" | "option" => KeyModifiers::ALT,
-                "shift" => KeyModifiers::SHIFT,
-                "super" | "cmd" | "win" => KeyModifiers::SUPER,
+        let mut rest = spec.trim();
+        // A modifier is a name and a separator, so a lone `-` or `+` is still a key.
+        while let Some((head, tail)) = rest
+            .split_once(['-', '+'])
+            .filter(|(_, tail)| !tail.is_empty())
+        {
+            modifiers |= match head.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" | "c" => KeyModifiers::CONTROL,
+                "alt" | "meta" | "m" => KeyModifiers::ALT,
+                "shift" | "s" => KeyModifiers::SHIFT,
                 _ => break,
             };
-            // `ctrl-` with nothing after it names no key.
-            if tail.is_empty() {
-                return None;
-            }
-            modifiers |= modifier;
             rest = tail;
         }
-        // Before the name table, so the case of a letter survives: `G` is not `g`.
-        let mut characters = rest.chars();
-        if let (Some(character), None) = (characters.next(), characters.next()) {
-            return Some(Self::new(KeyCode::Char(character), modifiers));
-        }
         let code = match rest.to_ascii_lowercase().as_str() {
-            "enter" | "return" | "cr" => KeyCode::Enter,
-            "esc" | "escape" => KeyCode::Esc,
-            "tab" => KeyCode::Tab,
-            "backtab" | "back-tab" | "shift-tab" => KeyCode::BackTab,
-            "space" => KeyCode::Char(' '),
-            "backspace" | "bs" => KeyCode::Backspace,
-            "delete" | "del" => KeyCode::Delete,
-            "insert" | "ins" => KeyCode::Insert,
             "up" => KeyCode::Up,
             "down" => KeyCode::Down,
             "left" => KeyCode::Left,
             "right" => KeyCode::Right,
+            "enter" | "return" | "cr" => KeyCode::Enter,
+            "esc" | "escape" => KeyCode::Esc,
+            "tab" => KeyCode::Tab,
+            "backtab" | "shift-tab" => KeyCode::BackTab,
+            "space" => KeyCode::Char(' '),
+            "backspace" | "bs" => KeyCode::Backspace,
+            "delete" | "del" => KeyCode::Delete,
+            "insert" | "ins" => KeyCode::Insert,
             "home" => KeyCode::Home,
             "end" => KeyCode::End,
-            "pageup" | "page-up" | "pgup" => KeyCode::PageUp,
-            "pagedown" | "page-down" | "pgdn" | "pgdown" => KeyCode::PageDown,
-            name => {
-                let number = name.strip_prefix('f')?.parse::<u8>().ok()?;
-                if !(1..=24).contains(&number) {
-                    return None;
+            "pageup" | "pgup" | "page-up" => KeyCode::PageUp,
+            "pagedown" | "pgdn" | "page-down" => KeyCode::PageDown,
+            function if matches!(function.as_bytes(), [b'f', ..]) && function.len() > 1 => {
+                KeyCode::F(
+                    function[1..]
+                        .parse()
+                        .ok()
+                        .filter(|n| (1..=12).contains(n))?,
+                )
+            }
+            _ => {
+                let mut letters = rest.chars();
+                match (letters.next(), letters.next()) {
+                    (Some(letter), None) => KeyCode::Char(letter),
+                    _ => return None,
                 }
-                KeyCode::F(number)
             }
         };
         Some(Self::new(code, modifiers))
     }
-}
 
-impl fmt::Display for Key {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// How the key is printed in the help popup and along the bottom edge.
+    pub fn label(&self) -> String {
+        let key = match self.code {
+            KeyCode::Up => "↑".to_owned(),
+            KeyCode::Down => "↓".to_owned(),
+            KeyCode::Left => "←".to_owned(),
+            KeyCode::Right => "→".to_owned(),
+            KeyCode::Enter => "⏎".to_owned(),
+            KeyCode::Esc => "esc".to_owned(),
+            KeyCode::Tab => "tab".to_owned(),
+            KeyCode::BackTab => "shift-tab".to_owned(),
+            KeyCode::Backspace => "backspace".to_owned(),
+            KeyCode::Delete => "del".to_owned(),
+            KeyCode::Insert => "ins".to_owned(),
+            KeyCode::Home => "home".to_owned(),
+            KeyCode::End => "end".to_owned(),
+            KeyCode::PageUp => "pgup".to_owned(),
+            KeyCode::PageDown => "pgdn".to_owned(),
+            KeyCode::Char(' ') => "space".to_owned(),
+            KeyCode::Char(letter) => letter.to_string(),
+            KeyCode::F(number) => format!("f{number}"),
+            other => format!("{other:?}").to_lowercase(),
+        };
+        let mut label = String::new();
         for (modifier, name) in [
             (KeyModifiers::CONTROL, "ctrl-"),
             (KeyModifiers::ALT, "alt-"),
             (KeyModifiers::SHIFT, "shift-"),
-            (KeyModifiers::SUPER, "super-"),
         ] {
             if self.modifiers.contains(modifier) {
-                formatter.write_str(name)?;
+                label.push_str(name);
             }
         }
-        match self.code {
-            KeyCode::Char(' ') => formatter.write_str("space"),
-            KeyCode::Char(character) => write!(formatter, "{character}"),
-            KeyCode::Enter => formatter.write_str("\u{23ce}"),
-            KeyCode::Esc => formatter.write_str("esc"),
-            KeyCode::Tab => formatter.write_str("tab"),
-            KeyCode::BackTab => formatter.write_str("shift-tab"),
-            KeyCode::Backspace => formatter.write_str("bksp"),
-            KeyCode::Delete => formatter.write_str("del"),
-            KeyCode::Insert => formatter.write_str("ins"),
-            KeyCode::Up => formatter.write_str("\u{2191}"),
-            KeyCode::Down => formatter.write_str("\u{2193}"),
-            KeyCode::Left => formatter.write_str("\u{2190}"),
-            KeyCode::Right => formatter.write_str("\u{2192}"),
-            KeyCode::Home => formatter.write_str("home"),
-            KeyCode::End => formatter.write_str("end"),
-            KeyCode::PageUp => formatter.write_str("pgup"),
-            KeyCode::PageDown => formatter.write_str("pgdn"),
-            KeyCode::F(number) => write!(formatter, "f{number}"),
-            other => write!(formatter, "{other:?}"),
-        }
+        label.push_str(&key);
+        label
     }
 }
 
-/// The `[keys]` section: a command name against the key, or the keys, that reach it.
-///
-/// Not a struct with a field per command, because a name that is not a command is worth
-/// a word on the status line rather than a config file the program refuses to read.
-/// Ordered, so which of two commands claiming the same key wins does not change between
-/// runs.
-#[derive(Debug, Default, Deserialize)]
-#[serde(transparent)]
-pub struct Settings(pub BTreeMap<String, OneOrMany>);
-
-/// What every key currently does.
+/// Which key does what, in the order the keys should be shown in.
+#[derive(Debug, Clone)]
 pub struct Bindings {
-    lookup: HashMap<Key, Command>,
-    /// The same thing in the order it was written down, so the help overlay lists a
-    /// command's keys the way its owner wrote them rather than however a hash landed.
-    order: Vec<(Key, Command)>,
+    table: Vec<(Chord, Command)>,
 }
 
 impl Default for Bindings {
     fn default() -> Self {
-        let mut bindings = Self {
-            lookup: HashMap::new(),
-            order: Vec::new(),
-        };
-        for (command, _, keys) in COMMANDS {
-            for spec in keys {
-                if let Some(key) = Key::parse(spec) {
-                    bindings.bind(key, command);
-                }
-            }
+        Self {
+            table: DEFAULTS
+                .iter()
+                .flat_map(|(command, specs)| {
+                    specs.iter().map(move |spec| {
+                        (Chord::parse(spec).expect("a default key parses"), *command)
+                    })
+                })
+                .collect(),
         }
-        bindings
     }
 }
 
 impl Bindings {
-    /// Points `key` at `command`, and says which command had it before.
-    fn bind(&mut self, key: Key, command: Command) -> Option<Command> {
-        let previous = self.lookup.insert(key, command);
-        self.order.retain(|(bound, _)| *bound != key);
-        self.order.push((key, command));
-        previous
+    pub fn command(&self, key: KeyEvent) -> Option<Command> {
+        let chord = Chord::of(key);
+        self.table
+            .iter()
+            .find(|(bound, _)| *bound == chord)
+            .map(|(_, command)| *command)
     }
 
-    /// Takes every key away from `command`, so a `[keys]` entry replaces the defaults
-    /// rather than piling onto them - which is the only way to give a default key back
-    /// to something else.
-    fn unbind(&mut self, command: Command) {
-        self.lookup.retain(|_, bound| *bound != command);
-        self.order.retain(|(_, bound)| *bound != command);
+    /// Every key the command answers to, as one label: `↑ k`. Empty if it has none,
+    /// which is what a `down = []` in the config asks for.
+    pub fn label(&self, command: Command) -> String {
+        self.labels(command).join(" ")
     }
 
-    pub fn command(&self, event: KeyEvent) -> Option<Command> {
-        self.lookup.get(&Key::from_event(event)).copied()
+    /// The first of the keys, for the one-line reminder along the bottom edge, where
+    /// there is no room to list the alternatives. It is the one written first in the
+    /// config, which is the one the user thinks of as the key.
+    pub fn first(&self, command: Command) -> String {
+        self.labels(command).into_iter().next().unwrap_or_default()
     }
 
-    /// The keys that reach `command`, in the order they were written down.
-    pub fn keys(&self, command: Command) -> Vec<Key> {
-        self.order
+    fn labels(&self, command: Command) -> Vec<String> {
+        self.table
             .iter()
             .filter(|(_, bound)| *bound == command)
-            .map(|(key, _)| *key)
+            .map(|(chord, _)| chord.label())
             .collect()
-    }
-
-    /// The keys of every command in `group`, written the way the help overlay wants
-    /// them: a command's own keys separated by spaces, one command from the next by a
-    /// slash. `None` when nothing in the group is bound at all, so the row can be left
-    /// out rather than drawn with an empty key column.
-    pub fn label(&self, group: &[Command], all: bool) -> Option<String> {
-        let label = group
-            .iter()
-            .filter_map(|command| {
-                let keys = self.keys(*command);
-                let keys = if all {
-                    &keys[..]
-                } else {
-                    &keys[..keys.len().min(1)]
-                };
-                (!keys.is_empty()).then(|| {
-                    keys.iter()
-                        .map(Key::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-            })
-            .collect::<Vec<_>>()
-            .join(" / ");
-        (!label.is_empty()).then_some(label)
     }
 }
 
-/// Builds the bindings, and says what it could not do rather than refusing to start. A
-/// misspelt key is worth a word on the status line; it is not worth taking the interface
-/// away from someone who only wanted to browse.
-pub fn resolve(settings: &Settings) -> (Bindings, Vec<String>) {
-    let mut bindings = Bindings::default();
-    let mut warnings = Vec::new();
-    let configured: HashSet<Command> = settings
-        .0
-        .keys()
-        .filter_map(|name| Command::from_name(name))
-        .collect();
+/// A command is given one key, or a list of them.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Keys {
+    One(String),
+    Many(Vec<String>),
+}
 
-    for (name, binding) in &settings.0 {
-        let Some(command) = Command::from_name(name) else {
-            warnings.push(format!(
-                "keys.{name} is not a command; try one of {}",
-                COMMANDS
-                    .iter()
-                    .map(|(_, key, _)| *key)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            continue;
-        };
-        bindings.unbind(command);
-        for spec in binding.list() {
-            let Some(key) = Key::parse(&spec) else {
-                warnings.push(format!("keys.{name}: {spec:?} is not a key"));
-                continue;
-            };
-            // Taking a key off a default is the whole point of rebinding, so only two
-            // entries in the file fighting over one key is worth mentioning.
-            if let Some(taken) = bindings.bind(key, command)
-                && taken != command
-                && configured.contains(&taken)
-            {
-                warnings.push(format!(
-                    "keys.{} and keys.{name} both bind {key}; {name} wins",
-                    taken.name()
-                ));
-            }
+impl Keys {
+    fn specs(&self) -> &[String] {
+        match self {
+            Self::One(spec) => std::slice::from_ref(spec),
+            Self::Many(specs) => specs,
         }
     }
-    (bindings, warnings)
+}
+
+/// The `[keys]` section: an action, and the key or keys that should do it.
+///
+/// Naming a command replaces its defaults rather than adding to them - someone who writes
+/// `down = "e"` is not asking for `j` as well - and takes the key off whatever else held
+/// it, so a whole layout can be moved without having to unbind the old one first.
+#[derive(Debug, Default, Deserialize)]
+#[serde(transparent)]
+pub struct Settings(BTreeMap<Command, Keys>);
+
+impl Settings {
+    /// Whether the file says anything about `command`, so the example config can be
+    /// checked for leaving one out.
+    #[cfg(test)]
+    pub fn names(&self, command: Command) -> bool {
+        self.0.contains_key(&command)
+    }
+
+    /// Builds the table, and says what it could not do rather than refusing to draw, the
+    /// way a misspelt colour does.
+    pub fn resolve(&self) -> (Bindings, Vec<String>) {
+        let mut bindings = Bindings::default();
+        let mut warnings = Vec::new();
+        let mut claimed: Vec<Chord> = Vec::new();
+
+        for (command, keys) in &self.0 {
+            bindings.table.retain(|(_, bound)| bound != command);
+            for spec in keys.specs() {
+                let Some(chord) = Chord::parse(spec) else {
+                    warnings.push(format!("keys.{}: {spec:?} is not a key", command.name()));
+                    continue;
+                };
+                if let Some(index) = bindings.table.iter().position(|(bound, _)| *bound == chord) {
+                    // Displacing a default is the point of the exercise; displacing
+                    // something the same file asked for is a contradiction in it.
+                    if claimed.contains(&chord) {
+                        warnings.push(format!(
+                            "keys.{}: {} is already {}",
+                            command.name(),
+                            chord.label(),
+                            bindings.table[index].1.name()
+                        ));
+                    }
+                    bindings.table.remove(index);
+                }
+                claimed.push(chord);
+                bindings.table.push((chord, *command));
+            }
+        }
+
+        // A command left with nothing cannot be reached. Asking for that is allowed - an
+        // empty list is how it is asked for - but arriving at it by taking the last key
+        // away for something else is worth a word.
+        for (command, _) in DEFAULTS {
+            if !self.0.contains_key(&command)
+                && !bindings.table.iter().any(|(_, bound)| *bound == command)
+            {
+                warnings.push(format!("keys: {} has no key left", command.name()));
+            }
+        }
+
+        (bindings, warnings)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Bindings, Chord, Command, DEFAULTS, Settings};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    fn event(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, modifiers)
+    fn settings(text: &str) -> Settings {
+        toml::from_str(text).expect("valid config")
     }
 
+    fn press(letter: char) -> KeyEvent {
+        KeyEvent::from(KeyCode::Char(letter))
+    }
+
+    /// Every command has a key out of the box, none of them share one, and all of them
+    /// are written in a form the config parser accepts.
     #[test]
-    fn parses_the_keys_a_config_file_writes() {
-        let cases = [
-            ("q", KeyCode::Char('q'), KeyModifiers::NONE),
-            ("G", KeyCode::Char('G'), KeyModifiers::NONE),
-            ("shift-g", KeyCode::Char('G'), KeyModifiers::NONE),
-            ("ctrl-d", KeyCode::Char('d'), KeyModifiers::CONTROL),
-            ("Ctrl-D", KeyCode::Char('d'), KeyModifiers::CONTROL),
-            ("alt+enter", KeyCode::Enter, KeyModifiers::ALT),
-            ("page-up", KeyCode::PageUp, KeyModifiers::NONE),
-            ("pgdn", KeyCode::PageDown, KeyModifiers::NONE),
-            ("f5", KeyCode::F(5), KeyModifiers::NONE),
-            ("space", KeyCode::Char(' '), KeyModifiers::NONE),
-            // A lone punctuation mark is the key, not a modifier separator.
-            ("-", KeyCode::Char('-'), KeyModifiers::NONE),
-            ("+", KeyCode::Char('+'), KeyModifiers::NONE),
-            ("ctrl--", KeyCode::Char('-'), KeyModifiers::CONTROL),
-        ];
-        for (spec, code, modifiers) in cases {
-            assert_eq!(
-                Key::parse(spec),
-                Some(Key::new(code, modifiers)),
-                "spec: {spec}"
+    fn the_defaults_are_a_complete_and_conflict_free_table() {
+        let bindings = Bindings::default();
+        for (command, specs) in DEFAULTS {
+            assert!(
+                !specs.is_empty() && !bindings.label(command).is_empty(),
+                "{} has no key",
+                command.name()
             );
         }
-        for spec in ["", "nonsense", "ctrl-", "f99", "ctrl-nonsense"] {
-            assert_eq!(Key::parse(spec), None, "spec: {spec}");
+        let mut chords: Vec<String> = bindings
+            .table
+            .iter()
+            .map(|(chord, _)| chord.label())
+            .collect();
+        let total = chords.len();
+        chords.sort();
+        chords.dedup();
+        assert_eq!(chords.len(), total, "a key is bound twice: {chords:?}");
+    }
+
+    /// Every way of writing a key that someone might reasonably write.
+    #[test]
+    fn takes_a_key_however_it_is_written() {
+        for (written, expected) in [
+            ("k", Chord::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            ("G", Chord::new(KeyCode::Char('G'), KeyModifiers::NONE)),
+            (
+                "shift-g",
+                Chord::new(KeyCode::Char('G'), KeyModifiers::NONE),
+            ),
+            (
+                "ctrl-r",
+                Chord::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            ),
+            ("C-r", Chord::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            ("alt+x", Chord::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+            ("Enter", Chord::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ("pgdn", Chord::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            (
+                "page-down",
+                Chord::new(KeyCode::PageDown, KeyModifiers::NONE),
+            ),
+            ("f5", Chord::new(KeyCode::F(5), KeyModifiers::NONE)),
+            ("space", Chord::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            ("-", Chord::new(KeyCode::Char('-'), KeyModifiers::NONE)),
+            (
+                "ctrl--",
+                Chord::new(KeyCode::Char('-'), KeyModifiers::CONTROL),
+            ),
+        ] {
+            assert_eq!(Chord::parse(written), Some(expected), "{written}");
+        }
+        for nonsense in ["", "ctrl-", "f13", "grande", "ctrl-grande"] {
+            assert_eq!(Chord::parse(nonsense), None, "{nonsense:?}");
         }
     }
 
-    /// Whether the terminal sends the shift flag along with an already-shifted character
-    /// is up to the terminal, and ctrl always reports the unshifted letter.
+    /// The terminal puts shift in the character as well as in the modifiers, so a key
+    /// written once has to match the event either way round.
     #[test]
-    fn a_key_is_the_same_key_however_the_terminal_reports_it() {
+    fn matches_an_uppercase_key_the_way_the_terminal_sends_it() {
         let bindings = Bindings::default();
-        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        let shifted = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(bindings.command(shifted), Some(Command::Bottom));
+        assert_eq!(bindings.command(press('G')), Some(Command::Bottom));
+        assert_eq!(bindings.command(press('g')), Some(Command::Top));
+    }
+
+    /// The point of the section: a layout that is not vim's. Naming a command drops the
+    /// keys it had, and takes the new one off whatever was holding it.
+    #[test]
+    fn remaps_a_command_and_frees_the_key_it_had() {
+        let (bindings, warnings) = settings(
+            "\
+up = \"u\"
+down = \"e\"
+subtitle-language = [\"s\", \"ctrl-s\"]
+",
+        )
+        .resolve();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(bindings.command(press('e')), Some(Command::Down));
+        assert_eq!(bindings.command(press('u')), Some(Command::Up));
+        assert_eq!(bindings.command(press('j')), None, "j is no longer down");
+        assert_eq!(bindings.command(press('k')), None, "k is no longer up");
+        assert_eq!(
+            bindings.command(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(Command::SubtitleLanguage)
+        );
+        // Replacing means replacing: the arrow went with the rest of what `down` had,
+        // and someone who wants it keeps it by writing it down.
+        assert_eq!(bindings.command(KeyEvent::from(KeyCode::Down)), None);
+        assert_eq!(bindings.label(Command::Down), "e");
+        // Everything not named keeps what it had.
+        assert_eq!(bindings.command(press('q')), Some(Command::Quit));
+        assert_eq!(
+            bindings.command(KeyEvent::from(KeyCode::Home)),
+            Some(Command::Top)
+        );
+        assert_eq!(bindings.label(Command::Top), "home g");
+        assert_eq!(
+            bindings.label(Command::SubtitleLanguage),
+            "s ctrl-s",
+            "the order keys are written in is the order they are shown in"
+        );
+    }
+
+    /// Taking a key for something else is allowed, and leaving an action unreachable by
+    /// doing it is worth saying out loud.
+    #[test]
+    fn says_what_it_could_not_do_and_carries_on() {
+        let (bindings, warnings) = settings(
+            "\
+up = [\"e\", \"grande\"]
+down = \"e\"
+images = \"q\"
+",
+        )
+        .resolve();
+        assert_eq!(bindings.command(press('e')), Some(Command::Down));
+        assert_eq!(bindings.command(press('q')), Some(Command::Images));
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("keys.up") && warnings[0].contains("grande"));
+        assert!(warnings[1].contains("keys.down") && warnings[1].contains("up"));
+        assert!(
+            warnings[2].contains("quit") && warnings[2].contains("no key left"),
+            "{}",
+            warnings[2]
+        );
+    }
+
+    /// An empty list is how an action is turned off, and it is not a mistake.
+    #[test]
+    fn unbinds_an_action_without_complaining() {
+        let (bindings, warnings) = settings("images = []\n").resolve();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(bindings.command(press('i')), None);
+        assert!(bindings.label(Command::Images).is_empty());
+    }
+
+    /// An action that does not exist is refused by name, the way a misspelt theme key is.
+    #[test]
+    fn names_an_unknown_action() {
+        let error = toml::from_str::<Settings>("dwon = \"j\"\n").expect_err("refused");
+        assert!(error.message().contains("dwon"), "{}", error.message());
+    }
+
+    /// The layout the README offers as an example. A config file that is documented and
+    /// does not work is worse than no example at all, so the one in the README is the one
+    /// here.
+    #[test]
+    fn the_colemak_example_is_a_working_config() {
+        let (bindings, warnings) = toml::from_str::<Settings>(
+            "\
+back = [\"n\", \"left\", \"esc\"]
+down = [\"e\", \"down\"]
+up = [\"i\", \"up\"]
+open = [\"o\", \"enter\", \"right\"]
+images = \"I\"
+order = \"O\"
+",
+        )
+        .expect("valid config")
+        .resolve();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for (letter, expected) in [
+            ('n', Command::Back),
+            ('e', Command::Down),
+            ('i', Command::Up),
+            ('o', Command::Open),
+            ('I', Command::Images),
+            ('O', Command::Order),
+        ] {
             assert_eq!(
-                bindings.command(event(KeyCode::Char('P'), modifiers)),
-                Some(Command::PlaySeason),
-                "modifiers: {modifiers:?}"
+                bindings.command(KeyEvent::from(KeyCode::Char(letter))),
+                Some(expected),
+                "{letter}"
             );
         }
+        // Nothing was left behind by moving four actions and the two they displaced.
+        let (_, none) = Settings::default().resolve();
+        assert!(none.is_empty(), "{none:?}");
         assert_eq!(
-            bindings.command(event(KeyCode::Char('p'), KeyModifiers::NONE)),
-            Some(Command::Play)
+            Bindings::default().command(KeyEvent::from(KeyCode::Char('i'))),
+            Some(Command::Images)
         );
-    }
-
-    #[test]
-    fn the_defaults_are_what_the_interface_has_always_had() {
-        let bindings = Bindings::default();
-        assert_eq!(
-            bindings.command(event(KeyCode::Char('j'), KeyModifiers::NONE)),
-            Some(Command::Down)
-        );
-        assert_eq!(
-            bindings.command(event(KeyCode::Esc, KeyModifiers::NONE)),
-            Some(Command::Back)
-        );
-        assert_eq!(
-            bindings.command(event(KeyCode::F(1), KeyModifiers::NONE)),
-            None
-        );
-        assert_eq!(
-            bindings
-                .label(&[Command::Up, Command::Down], true)
-                .as_deref(),
-            Some("\u{2191} k / \u{2193} j")
-        );
-    }
-
-    #[test]
-    fn a_rebind_replaces_the_defaults_and_takes_the_key_it_asks_for() {
-        let settings: Settings = toml::from_str(
-            "\
-play = \"o\"
-quit = [\"q\", \"ctrl-q\"]
-",
-        )
-        .expect("valid keys");
-        let (bindings, warnings) = resolve(&settings);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(
-            bindings.command(event(KeyCode::Char('o'), KeyModifiers::NONE)),
-            Some(Command::Play),
-            "the new key wins over the default that held it"
-        );
-        assert_eq!(
-            bindings.command(event(KeyCode::Char('p'), KeyModifiers::NONE)),
-            None,
-            "the old key is given up"
-        );
-        assert_eq!(
-            bindings.command(event(KeyCode::Char('q'), KeyModifiers::CONTROL)),
-            Some(Command::Quit)
-        );
-        // Everything else keeps what it had.
-        assert_eq!(
-            bindings.command(event(KeyCode::Char('d'), KeyModifiers::NONE)),
-            Some(Command::Download)
-        );
-    }
-
-    /// An empty list is how a key is taken away without being given to anything else.
-    #[test]
-    fn a_command_can_be_unbound() {
-        let settings: Settings = toml::from_str("download-season = []\n").expect("valid keys");
-        let (bindings, warnings) = resolve(&settings);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(
-            bindings.command(event(KeyCode::Char('D'), KeyModifiers::NONE)),
-            None
-        );
-        assert_eq!(bindings.label(&[Command::DownloadSeason], true), None);
-    }
-
-    #[test]
-    fn names_a_typo_and_a_fight_over_one_key() {
-        let settings: Settings = toml::from_str(
-            "\
-paly = \"p\"
-play = \"nonsense\"
-",
-        )
-        .expect("valid keys");
-        let (_, warnings) = resolve(&settings);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings[0].contains("paly"), "{}", warnings[0]);
-        assert!(warnings[1].contains("nonsense"), "{}", warnings[1]);
-
-        let settings: Settings = toml::from_str(
-            "\
-download = \"z\"
-play = \"z\"
-",
-        )
-        .expect("valid keys");
-        let (bindings, warnings) = resolve(&settings);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("both bind z"), "{}", warnings[0]);
-        assert_eq!(
-            bindings.command(event(KeyCode::Char('z'), KeyModifiers::NONE)),
-            Some(Command::Play)
-        );
-    }
-
-    /// Every command is reachable and every default spelling parses, so a command cannot
-    /// be added without a key to reach it by.
-    #[test]
-    fn every_command_has_a_name_and_a_working_default() {
-        let bindings = Bindings::default();
-        for (command, name, keys) in COMMANDS {
-            assert_eq!(command.name(), name);
-            assert_eq!(Command::from_name(name), Some(command));
-            assert!(!keys.is_empty(), "{name} has no default key");
-            for spec in keys {
-                let key = Key::parse(spec).unwrap_or_else(|| panic!("{name}: {spec}"));
-                assert_eq!(bindings.lookup.get(&key), Some(&command), "{name}: {spec}");
-            }
-        }
     }
 }

@@ -9,14 +9,37 @@
 # required, and having no config file at all is the normal case.
 #
 # The command line wins over this file, so a flag is how you try something
-# without editing it. Anything that cannot be read - a setting that is not a
-# setting, a key that is not a key, a colour that cannot be parsed - is reported
-# on the interface's status line, or on stderr for a plain download, and
-# otherwise ignored. A typo should not stand between you and the catalogue.
+# without editing it. A value that cannot be made sense of - a key that is not a
+# key, a colour that cannot be parsed - is reported on the interface's status
+# line, or on stderr for a plain download, and otherwise ignored: a typo should
+# not stand between you and the catalogue. A name that is not a setting at all
+# is a different matter, and costs the whole file, so the message that names it
+# is worth reading.
+
+
+# ============================================================================
+# Signing in
+# ============================================================================
+# The etp_rt cookie, out of your logged-in browser session. It is a credential,
+# so the order it is looked for in runs from the places that keep it best to the
+# places that keep it worst: --etp-rt, then $CRUNCHYROLL_ETP_RT, then `etp_rt`
+# below, then whatever `etp_rt_command` prints.
 #
-# The etp_rt cookie is deliberately not a setting here. It is a credential with
-# a short life, and a dotfiles repo is the last place it should be. Keep it in
-# your shell environment or a password manager and pass it with --etp-rt.
+# Naming a password manager is the one that keeps it out of both your shell
+# history and your dotfiles, and it is the reason this section exists:
+#
+#   etp_rt_command = "pass show crunchyroll"
+#
+# The command is run through sh, so a pipeline works, and the cookie is taken
+# off the first line of what it prints - which is the shape `pass show` already
+# has. It keeps the terminal, so a gpg passphrase prompt has somewhere to ask.
+#
+# Writing the cookie itself here means anyone who can read the file can sign in
+# as you, and a config file usually ends up in a dotfiles repo. If you do it
+# anyway, `chmod 600` the file - you are told if you did not.
+#
+# etp_rt = "00000000-0000-0000-0000-000000000000"
+# etp_rt_command = "pass show crunchyroll"
 
 
 # ============================================================================
@@ -146,11 +169,15 @@ mpv-args = []
 # and an empty list unbinds a command altogether.
 #
 # A key is written the way you would say it: a single character (q, /, ?, -), a
-# name (enter, esc, tab, space, backspace, delete, insert, up, down, left,
-# right, home, end, page-up, page-down, f1 to f24), or either of those with
-# ctrl-, alt-, shift- or super- in front. `+` separates as well as `-`, so
-# alt+enter works, and a lone `-` or `+` is the key itself rather than a
-# separator. `P` and `shift-p` are the same key.
+# name (enter, esc, tab, backtab, space, backspace, delete, insert, up, down,
+# left, right, home, end, pgup, pgdn, f1 to f12), or either of those with ctrl-,
+# alt- or shift- in front. `+` separates as well as `-`, so alt+enter works, and
+# a lone `-` or `+` is the key itself rather than a separator. `G` and `shift-g`
+# are the same key.
+#
+# Taking a key off something else is the point, and needs nothing said about it;
+# two entries here fighting over one key is a contradiction and is reported, as
+# is leaving a command with no key by giving its last one away.
 #
 # ctrl-c always quits and cannot be rebound, so a half-finished section here can
 # never leave you stuck in the alternate screen. The `?` overlay and the
@@ -162,27 +189,27 @@ mpv-args = []
 # Moving around a column.
 up = ["up", "k"]
 down = ["down", "j"]
-page-up = "page-up"
-page-down = "page-down"
-first = ["home", "g"]
-last = ["end", "G"]
+page-up = "pgup"
+page-down = "pgdn"
+top = ["home", "g"]
+bottom = ["end", "G"]
 
 # Moving between the three columns. `open` also plays the episode under the
 # cursor, and `back` also leaves a search.
 open = ["enter", "right", "l"]
 back = ["left", "h", "esc"]
-next-pane = "tab"
+next-column = "tab"
 
-# The catalogue. An empty search goes back to browsing, and `sort` cycles
+# The catalogue. An empty search goes back to browsing, and `order` cycles
 # popular, recently added and A to Z.
 search = "/"
-sort = "o"
+order = "o"
 reload = "r"
 
 # Getting an episode. The season forms take everything from the cursor down for
 # playing, and the whole season for downloading.
 play = "p"
-play-season = "P"
+play-rest = "P"
 download = "d"
 download-season = "D"
 

@@ -39,8 +39,10 @@ const TICK: Duration = Duration::from_millis(100);
 
 /// Browses the catalogue and hands episodes to mpv, or to the downloader.
 ///
-/// `config` arrives with whatever the command line had to say already folded into it,
-/// and `complaints` with whatever reading it went wrong.
+/// `config` arrives with whatever the command line overrode already applied, and
+/// `complaints` carries what reading it - and finding the cookie - had to say: the
+/// terminal is about to belong to the alternate screen, so those are shown on the status
+/// line rather than printed.
 pub fn run(
     client: CrunchyrollClient,
     options: DownloadOptions,
@@ -49,13 +51,12 @@ pub fn run(
 ) -> Result<()> {
     let (theme, warnings) = config.theme.resolve(config.directory.as_deref());
     complaints.extend(warnings);
-    let (bindings, warnings) = keys::resolve(&config.keys);
+    let (bindings, warnings) = config.keys.resolve();
     complaints.extend(warnings);
     let images = config.images;
 
     // Anything the client would print lands on top of the frame, so collect it and let
-    // the status line show it instead. Anything wrong with the config goes in with it:
-    // printed now it would be scrolled away by the alternate screen before it was read.
+    // the status line show it instead.
     let notices = Arc::new(Mutex::new(complaints));
     let sink = Arc::clone(&notices);
     let client = client.with_notices(Arc::new(move |message: &str| {

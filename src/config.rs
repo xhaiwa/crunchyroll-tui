@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::credentials::Secret;
 use crate::tui::{art, keys, theme};
 use crate::util::parse_langs;
 
@@ -12,6 +13,15 @@ use crate::util::parse_langs;
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The etp_rt cookie itself. Anyone who can read the file can sign in as you with
+    /// it, so `chmod 600` the file - or leave this out and name a password manager in
+    /// `etp_rt_command` instead.
+    #[serde(default)]
+    pub etp_rt: Option<Secret>,
+    /// A command whose first line of output is the cookie, `pass show crunchyroll` and
+    /// the like, so the file holds the name of the secret rather than the secret.
+    #[serde(default)]
+    pub etp_rt_command: Option<String>,
     /// Whether the posters and episode stills are drawn. `--images` overrides it.
     #[serde(default)]
     pub images: art::Setting,
@@ -20,6 +30,7 @@ pub struct Config {
     pub defaults: Defaults,
     #[serde(default)]
     pub theme: theme::Settings,
+    /// Which key does what. Anything left out keeps the default.
     #[serde(default)]
     pub keys: keys::Settings,
     /// The directory the file was read from, so a relative path inside it points at the
@@ -120,9 +131,12 @@ pub fn load() -> (Config, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::style::Color;
 
     use super::{Config, art, keys, theme};
+    use crate::credentials::Secret;
+    use crate::tui::keys::Command;
 
     #[test]
     fn reads_a_theme_section() {
@@ -153,6 +167,25 @@ dim = \"bright black\"
             assert_eq!(config.images, expected, "{text:?}");
         }
         assert!(toml::from_str::<Config>("images = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn reads_either_way_of_naming_the_cookie() {
+        let config: Config = toml::from_str(
+            "\
+etp_rt = \"e70b3d61-b8bc-4ecb-a9b3-1cf1f0a1b0d1\"
+etp_rt_command = \"pass show crunchyroll\"
+",
+        )
+        .expect("valid config");
+        assert_eq!(
+            config.etp_rt.as_ref().map(Secret::expose),
+            Some("e70b3d61-b8bc-4ecb-a9b3-1cf1f0a1b0d1")
+        );
+        assert_eq!(
+            config.etp_rt_command.as_deref(),
+            Some("pass show crunchyroll")
+        );
     }
 
     #[test]
@@ -188,13 +221,22 @@ mpv-args = [\"--fullscreen\", \"--vf=lavfi=[hqdn3d]\"]
 
     #[test]
     fn reads_a_keys_section() {
-        let config: Config = toml::from_str("[keys]\nplay = \"o\"\nquit = [\"q\", \"ctrl-q\"]\n")
-            .expect("valid config");
-        assert_eq!(config.keys.0.len(), 2);
+        let config: Config = toml::from_str(
+            "\
+[keys]
+down = \"e\"
+up = \"u\"
+download = [\"d\", \"ctrl-d\"]
+",
+        )
+        .expect("valid config");
+        let (bindings, warnings) = config.keys.resolve();
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
-            config.keys.0.get("quit").expect("quit").list(),
-            ["q", "ctrl-q"]
+            bindings.command(KeyEvent::from(KeyCode::Char('e'))),
+            Some(Command::Down)
         );
+        assert_eq!(bindings.label(Command::Download), "d ctrl-d");
     }
 
     /// The example file is what someone copies into their dotfiles, so it has to parse,
@@ -236,6 +278,10 @@ mpv-args = [\"--fullscreen\", \"--vf=lavfi=[hqdn3d]\"]
             "an example that hands mpv options to everyone who copies it is a trap"
         );
 
+        // The cookie is left commented out. An example that ships a secret-shaped line
+        // is one someone fills in and then commits.
+        assert!(config.etp_rt.is_none() && config.etp_rt_command.is_none());
+
         // The colours are left commented out: the default is the terminal's own palette,
         // which is not something the file can name.
         let (colours, warnings) = config.theme.resolve(None);
@@ -244,17 +290,22 @@ mpv-args = [\"--fullscreen\", \"--vf=lavfi=[hqdn3d]\"]
 
         // Every command is written out at the key it already had, in the order it
         // already had them.
-        let (bindings, warnings) = keys::resolve(&config.keys);
+        let (bindings, warnings) = config.keys.resolve();
         assert!(warnings.is_empty(), "{warnings:?}");
         let shipped = keys::Bindings::default();
-        for (command, name, _) in keys::COMMANDS {
-            assert_eq!(bindings.keys(command), shipped.keys(command), "keys.{name}");
+        for (command, _) in keys::DEFAULTS {
+            assert!(
+                config.keys.names(command),
+                "the example leaves out keys.{}",
+                command.name()
+            );
+            assert_eq!(
+                bindings.label(command),
+                shipped.label(command),
+                "keys.{}",
+                command.name()
+            );
         }
-        assert_eq!(
-            config.keys.0.len(),
-            keys::COMMANDS.len(),
-            "the example lists every command there is"
-        );
     }
 
     /// A file with no `[theme]` in it is a valid file, and a misspelt key is worth

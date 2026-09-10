@@ -4,7 +4,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 
 ## Features
 
-- Terminal interface for browsing the catalogue and starting playback, in your own colourscheme
+- Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
@@ -15,6 +15,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - Ten parallel segment workers with bounded memory use and retries
 - Concurrent video, audio and subtitle downloads
 - Automatic access-token refresh
+- The session cookie read from `pass`, the environment or the config file, instead of the command line
 - Batch downloads from a text file
 - MKV stream language, title and default-track metadata
 
@@ -37,21 +38,70 @@ cargo build --release
 
 The binary is written to `target/release/crunchyroll-downloader`.
 
+## Signing in
+
+Every run needs the `etp_rt` cookie from a logged-in Crunchyroll session. Log in to
+Crunchyroll in a browser, open Developer Tools, find the Crunchyroll cookies under
+Storage/Application, and copy the value of the `etp_rt` cookie. It is a 36-character
+UUID, and it is a session: whoever holds it is signed in as you until you log out.
+
+It can be given four ways, and the first of them that answers is the one used:
+
+1. `--etp-rt COOKIE`
+2. `$CRUNCHYROLL_ETP_RT`
+3. `etp_rt` in the config file
+4. `etp_rt_command` in the config file, whose first line of output is the cookie
+
+The last one keeps the cookie out of every file this program can see, which is what
+`pass`, `gopass` and the rest are for:
+
+```toml
+etp_rt_command = "pass show crunchyroll/etp_rt"
+```
+
+The command runs through `sh`, so a pipeline is fine, and it keeps the terminal while it
+runs, so gpg can ask for a passphrase on it. Only the first line of its output is read -
+`pass show` prints the whole entry, with the secret on the first line and notes under it.
+
+Top-level keys have to come before any `[section]`, the way TOML works:
+
+```toml
+etp_rt_command = "pass show crunchyroll/etp_rt"
+
+[theme]
+name = "gruvbox"
+```
+
+`etp_rt = "..."` puts the cookie in the file instead, which is simpler and worth a
+`chmod 600 ~/.config/crunchyroll-downloader/config.toml` - a file other users can read is
+reported on startup. For a single shell session, the environment does as well, and keeps
+the value out of the history that the command line lands in:
+
+```shell
+export CRUNCHYROLL_ETP_RT="$(pass show crunchyroll/etp_rt)"
+```
+
+`--etp-rt` is the one to avoid. An argument is written to the shell's history, is
+readable in `/proc` by anyone on the machine for as long as the program runs, and is on
+screen in every screenshot or asciinema recording of the command that started it. It is
+still accepted, with a word on stderr, because it is convenient for a one-off.
+
+However it arrives, the cookie is never printed back: not by the interface, not by the
+messages about it, and not by a `{:?}` of anything that holds it.
+
 ## Usage
 
 ```shell
 cargo run --release -- \
   --url https://www.crunchyroll.com/series/GJ0H7Q5ZJ/hells-paradise \
-  --season 1 \
-  --etp-rt YOUR_COOKIE_VALUE
+  --season 1
 ```
 
 Download one episode:
 
 ```shell
 cargo run --release -- \
-  --url https://www.crunchyroll.com/watch/GE00198973JAJP/dawn-and-confusion \
-  --etp-rt YOUR_COOKIE_VALUE
+  --url https://www.crunchyroll.com/watch/GE00198973JAJP/dawn-and-confusion
 ```
 
 Download several tracks, with the first audio and regular subtitle track marked as default:
@@ -59,7 +109,6 @@ Download several tracks, with the first audio and regular subtitle track marked 
 ```shell
 cargo run --release -- \
   --url EPISODE_URL \
-  --etp-rt YOUR_COOKIE_VALUE \
   --audio-lang ja-JP,en-US \
   --subs-lang en-US,es-419,de-DE \
   --cc-lang en-US
@@ -68,7 +117,7 @@ cargo run --release -- \
 Use `all` to request every available audio, subtitle or closed-caption locale:
 
 ```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE \
+cargo run --release -- --url EPISODE_URL \
   --audio-lang all --subs-lang all --cc-lang all
 ```
 
@@ -78,26 +127,31 @@ cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE \
 seasons and episodes, with playback and downloading on a key.
 
 ```shell
-cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE
+cargo run --release -- --tui
 ```
 
-| Key | What it does |
-| --- | --- |
-| `↑` `↓`, `j` `k` | Move the cursor. `g`/`G` jump to the first or last item |
-| `⏎`, `→`, `l` | Open the selection, and play the episode under the cursor |
-| `←`, `h`, `esc` | Go back a column, and leave a search |
-| `tab` | Cycle the columns |
-| `/` | Search the catalogue. An empty search goes back to browsing |
-| `o` | Change the browse order: popular, recently added, A to Z |
-| `p`, `P` | Play the episode, or the rest of the season one episode after another |
-| `d`, `D` | Download the episode, or the whole season |
-| `a`, `s` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
-| `A`, `S` | Step to the next audio or subtitle locale without opening the list |
-| `v` | Cycle the video quality |
-| `i` | Show or hide the poster and the episode still |
-| `r` | Reload the current column |
-| `?` | Show the keys |
-| `q` | Quit |
+| Key | Action | What it does |
+| --- | --- | --- |
+| `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
+| `pgup` `pgdn` | `page-up`, `page-down` | Move a page at a time |
+| `home` `end`, `g` `G` | `top`, `bottom` | Jump to the first or last item |
+| `⏎`, `→`, `l` | `open` | Open the selection, and play the episode under the cursor |
+| `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
+| `tab` | `next-column` | Cycle the columns |
+| `/` | `search` | Search the catalogue. An empty search goes back to browsing |
+| `o` | `order` | Change the browse order: popular, recently added, A to Z |
+| `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
+| `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
+| `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
+| `A`, `S` | `next-audio`, `next-subtitle` | Step to the next audio or subtitle locale without opening the list |
+| `v` | `quality` | Cycle the video quality |
+| `i` | `images` | Show or hide the poster and the episode still |
+| `r` | `reload` | Reload the current column |
+| `?` | `help` | Show the keys, as they are bound |
+| `q` | `quit` | Quit |
+
+The Action column is the name the key is written under in the config file; see
+[Keys](#keys) for moving any of them. `ctrl-c` quits whatever the config says.
 
 Every one of these can be moved somewhere else; see [Keys](#keys) below.
 
@@ -127,7 +181,7 @@ and they drag a hundred colours of their own across the colourscheme the rest of
 interface is careful to wear - so they are opt-in:
 
 ```shell
-cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --images on
+cargo run --release -- --tui --images on
 ```
 
 `--images off` turns the artwork off altogether, and `i` toggles it while the interface is
@@ -142,7 +196,7 @@ Pair it with mpv's own kitty output and the whole thing - catalogue, artwork and
 stays inside the terminal:
 
 ```shell
-cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --mpv-arg --vo=kitty
+cargo run --release -- --tui --mpv-arg --vo=kitty
 ```
 
 ### Playing instead of downloading
@@ -150,13 +204,13 @@ cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --mpv-arg --vo=kitty
 `--play` streams the episode straight into mpv rather than writing an MKV. Segments go into named pipes, ffmpeg decrypts and muxes them as they arrive, and mpv starts on the first few seconds instead of waiting for the whole episode:
 
 ```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play
+cargo run --release -- --url EPISODE_URL --play
 ```
 
 Every track option still applies, so the audio and subtitle locales you ask for all show up as switchable tracks in mpv. `--mpv-arg` passes options through, repeat it for more than one, and `[defaults] mpv-args` in the [config file](#configuration) sets them once and for all:
 
 ```shell
-cargo run --release -- --url EPISODE_URL --etp-rt YOUR_COOKIE_VALUE --play \
+cargo run --release -- --url EPISODE_URL --play \
   --audio-lang ja-JP,en-US --subs-lang en-US,de-DE \
   --mpv-arg --fullscreen --mpv-arg --slang=fre
 ```
@@ -172,7 +226,7 @@ Notes:
 Batch mode accepts one URL per line and ignores blank or non-HTTP lines:
 
 ```shell
-cargo run --release -- --file list.txt --etp-rt YOUR_COOKIE_VALUE
+cargo run --release -- --file list.txt
 ```
 
 Run `cargo run --release -- --help` for every option.
@@ -192,7 +246,9 @@ line wins over the file**, so a flag is how you try something without editing it
 
 A file that cannot be read, a key that is not a key, a colour that cannot be parsed: each
 one is reported - on the interface's status line, or on stderr for a plain download - and
-otherwise ignored. A typo should not stand between you and the catalogue.
+otherwise ignored. A typo should not stand between you and the catalogue. A name that is
+not a setting at all is the exception: it costs the whole file, so the message that names
+it is worth reading.
 
 [`config.example.toml`](config.example.toml) is that file written out in full, commented,
 with every value at the one the program uses anyway - so copying it changes nothing and
@@ -209,6 +265,10 @@ default, so it cannot quietly rot.
 The shape of it:
 
 ```toml
+# Where the etp_rt cookie comes from. See Signing in above - naming a password
+# manager keeps it out of the file altogether.
+etp_rt_command = "pass show crunchyroll"
+
 # Posters and episode stills: "auto", "on" or "off". Top level, so it has to come
 # before the first section - that is TOML, not us.
 images = "auto"
@@ -239,37 +299,44 @@ may also be a comma-separated string, the way the flag takes it:
 anything - so a value with a comma in it survives. Passing `--mpv-arg` on the command
 line replaces the list rather than adding to it.
 
-The `etp_rt` cookie is deliberately not a config setting. It is a credential with a short
-life, and a dotfiles repo is the last place it should be.
-
 ### Keys
 
-Every key in the interface can be moved. A `[keys]` entry names a command and the key, or
-the keys, that reach it; the defaults it replaces are given up, so the old key is free for
-something else:
+The defaults are vim's, with the arrows beside them, which is a layout and not a law: a
+`[keys]` section moves any of them. That matters if you type Colemak, Dvorak or Bépo,
+where `hjkl` is scattered across the keyboard rather than sitting under a hand.
 
 ```toml
 [keys]
-play = "o"                    # o plays; p no longer does anything
-quit = ["q", "ctrl-q"]        # two keys for one command
-download-season = []          # an empty list unbinds it altogether
-next-pane = "ctrl-w"
+# Colemak's navigation row - neio - with the arrows kept beside it
+back = ["n", "left", "esc"]
+down = ["e", "down"]
+up = ["i", "up"]
+open = ["o", "enter", "right"]
+# and somewhere to put the two that `i` and `o` were holding
+images = "I"
+order = "O"
 ```
+
+The name on the left is a command, and the right-hand side is a key or a list of them.
+Naming a command replaces what it had rather than adding to it - `down = "e"` means `j`
+and `↓` no longer move down, and `down = ["e", "down"]` keeps the arrow - and the key is
+taken off whatever else was holding it, so a whole layout can be moved across without
+unbinding the old one first. An empty list, `images = []`, turns a command off.
 
 The commands, and the keys they answer to out of the box:
 
 | Command | Default | What it does |
 | --- | --- | --- |
 | `up` `down` | `↑` `k`, `↓` `j` | Move the cursor |
-| `page-up` `page-down` | `page-up`, `page-down` | Move it ten rows |
-| `first` `last` | `home` `g`, `end` `G` | Jump to the first or last item |
+| `page-up` `page-down` | `pgup`, `pgdn` | Move it ten rows |
+| `top` `bottom` | `home` `g`, `end` `G` | Jump to the first or last item |
 | `open` | `enter` `right` `l` | Open the selection, and play an episode |
 | `back` | `left` `h` `esc` | Go back a column, and leave a search |
-| `next-pane` | `tab` | Cycle the columns |
+| `next-column` | `tab` | Cycle the columns |
 | `search` | `/` | Search the catalogue |
-| `sort` | `o` | Change the browse order |
+| `order` | `o` | Change the browse order |
 | `reload` | `r` | Reload the current column |
-| `play` `play-season` | `p`, `P` | Play the episode, or the rest of the season |
+| `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
 | `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
 | `audio-language` `subtitle-language` | `a`, `s` | Open the language list |
 | `next-audio` `next-subtitle` | `A`, `S` | Step to the next locale without the list |
@@ -278,22 +345,23 @@ The commands, and the keys they answer to out of the box:
 | `help` | `?` | Show the keys |
 | `quit` | `q` | Quit |
 
-A key is written the way you would say it: a single character (`q`, `/`, `?`, `-`), a
-name (`enter`, `esc`, `tab`, `space`, `backspace`, `delete`, `insert`, `up`, `down`,
-`left`, `right`, `home`, `end`, `page-up`, `page-down`, `f1` to `f24`), or either with
-`ctrl-`, `alt-`, `shift-` or `super-` in front. `+` separates as well as `-`, so
-`alt+enter` works, and a lone `-` or `+` is the key itself rather than a separator.
-`P` and `shift-p` are the same key.
+A key is a single character, one of `up`, `down`, `left`, `right`, `enter`, `esc`, `tab`,
+`backtab`, `space`, `backspace`, `home`, `end`, `pgup`, `pgdn`, `del`, `ins`, or `f1` to
+`f12`, with `ctrl-`, `alt-` and `shift-` in front of it as needed: `ctrl-r`, `alt+x`,
+`shift-g` - which is the same key as `G`. `+` separates as well as `-`, and a lone `-` or
+`+` is the key itself rather than a separator.
 
-`ctrl-c` always quits and cannot be rebound, so a half-finished `[keys]` section can never
-leave you stuck in the alternate screen. The help overlay and the reminder along the
-bottom are both drawn from the bindings in force, so they say what your keys do rather
-than what the defaults did.
+`?` and the line along the bottom edge show the keys as they are actually bound, so a
+remapped layout documents itself. Two things stay where they are: `ctrl-c` always quits,
+and the search box takes every letter literally, so `/` then `q` searches for `q`.
 
-The language list uses the same bindings: `up`/`down`/`first`/`last` move, `open`
-applies, `next-pane` swaps between the audio and subtitle lists, and `back` or `quit`
-closes it. Inside the search box every key is a letter, so only `enter`, `esc` and
-`backspace` mean anything there.
+The language list uses the same bindings: `up`/`down`/`top`/`bottom` move, `open`
+applies, `next-column` swaps between the audio and subtitle lists, and `back` or `quit`
+closes it.
+
+A command that does not exist is reported on the status line with the config file left
+unread, the way a misspelt theme key is. Taking a command's last key away for something
+else is reported too, and otherwise allowed.
 
 ### Colours
 
@@ -345,10 +413,6 @@ error = "#fb4934"
 
 A name that does not exist, a file that cannot be read or a colour that cannot be parsed
 is reported on the status line and otherwise ignored.
-
-## Finding `etp_rt`
-
-Log in to Crunchyroll in a browser, open Developer Tools, inspect the Crunchyroll cookies under Storage/Application, and copy the value of the `etp_rt` cookie.
 
 ## Tests
 
