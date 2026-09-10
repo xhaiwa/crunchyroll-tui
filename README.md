@@ -4,7 +4,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 
 ## Features
 
-- Terminal interface for browsing the catalogue and starting playback, in your own colourscheme
+- Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Playback with mpv while the stream downloads, instead of writing a file
@@ -80,23 +80,28 @@ seasons and episodes, with playback and downloading on a key.
 cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE
 ```
 
-| Key | What it does |
-| --- | --- |
-| `↑` `↓`, `j` `k` | Move the cursor. `g`/`G` jump to the first or last item |
-| `⏎`, `→`, `l` | Open the selection, and play the episode under the cursor |
-| `←`, `h`, `esc` | Go back a column, and leave a search |
-| `tab` | Cycle the columns |
-| `/` | Search the catalogue. An empty search goes back to browsing |
-| `o` | Change the browse order: popular, recently added, A to Z |
-| `p`, `P` | Play the episode, or the rest of the season one episode after another |
-| `d`, `D` | Download the episode, or the whole season |
-| `a`, `s` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
-| `A`, `S` | Step to the next audio or subtitle locale without opening the list |
-| `v` | Cycle the video quality |
-| `i` | Show or hide the poster and the episode still |
-| `r` | Reload the current column |
-| `?` | Show the keys |
-| `q` | Quit |
+| Key | Action | What it does |
+| --- | --- | --- |
+| `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
+| `pgup` `pgdn` | `page-up`, `page-down` | Move a page at a time |
+| `home` `end`, `g` `G` | `top`, `bottom` | Jump to the first or last item |
+| `⏎`, `→`, `l` | `open` | Open the selection, and play the episode under the cursor |
+| `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
+| `tab` | `next-column` | Cycle the columns |
+| `/` | `search` | Search the catalogue. An empty search goes back to browsing |
+| `o` | `order` | Change the browse order: popular, recently added, A to Z |
+| `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
+| `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
+| `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
+| `A`, `S` | `next-audio`, `next-subtitle` | Step to the next audio or subtitle locale without opening the list |
+| `v` | `quality` | Cycle the video quality |
+| `i` | `images` | Show or hide the poster and the episode still |
+| `r` | `reload` | Reload the current column |
+| `?` | `help` | Show the keys, as they are bound |
+| `q` | `quit` | Quit |
+
+The Action column is the name the key is written under in the config file; see
+[Keys](#keys) for moving any of them. `ctrl-c` quits whatever the config says.
 
 The languages offered by `a` and `s` are the ones the selected season lists, falling back
 to the series, then to what was asked for on the command line, then to every locale
@@ -147,6 +152,45 @@ stays inside the terminal:
 ```shell
 cargo run --release -- --tui --etp-rt YOUR_COOKIE_VALUE --mpv-arg --vo=kitty
 ```
+
+### Keys
+
+The defaults are vim's, with the arrows beside them, which is a layout and not a law: a
+`[keys]` section in the config file moves any of them. That matters if you type Colemak,
+Dvorak or Bépo, where `hjkl` is scattered across the keyboard rather than sitting under a
+hand.
+
+```toml
+[keys]
+# Colemak's navigation row - neio - with the arrows kept beside it
+back = ["n", "left", "esc"]
+down = ["e", "down"]
+up = ["i", "up"]
+open = ["o", "enter", "right"]
+# and somewhere to put the two that `i` and `o` were holding
+images = "I"
+order = "O"
+```
+
+The name on the left is one of the actions in the table above, and the right-hand side is
+a key or a list of them. Naming an action replaces what it had rather than adding to it -
+`down = "e"` means `j` and `↓` no longer move down, and `down = ["e", "down"]` keeps the
+arrow - and the key is taken off whatever else was holding it, so a whole layout can be
+moved across without unbinding the old one first. An empty list, `images = []`, turns an
+action off.
+
+A key is a single character, one of `up`, `down`, `left`, `right`, `enter`, `esc`, `tab`,
+`space`, `backspace`, `home`, `end`, `pgup`, `pgdn`, `del`, `ins`, or `f1` to `f12`, with
+`ctrl-`, `alt-` and `shift-` in front of it as needed: `ctrl-r`, `alt+x`, `shift-g` -
+which is the same key as `G`.
+
+`?` and the line along the bottom edge show the keys as they are actually bound, so a
+remapped layout documents itself. Two things stay where they are: `ctrl-c` always quits,
+and the search box takes every letter literally, so `/` then `q` searches for `q`.
+
+An action that does not exist is reported on the status line with the config file left
+unread, the way a misspelt theme key is. Taking an action's last key away for something
+else is reported too, and otherwise allowed.
 
 ### Colours
 

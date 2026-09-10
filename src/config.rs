@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::tui::{art, theme};
+use crate::tui::{art, keys, theme};
 
 /// `config.toml`. Nothing in it is required, and a file that is not there is not a
 /// problem - it is how most runs go.
@@ -13,6 +13,9 @@ use crate::tui::{art, theme};
 pub struct Config {
     #[serde(default)]
     pub theme: theme::Settings,
+    /// Which key does what. Anything left out keeps the default.
+    #[serde(default)]
+    pub keys: keys::Settings,
     /// Whether the posters and episode stills are drawn. `--images` overrides it.
     #[serde(default)]
     pub images: art::Setting,
@@ -70,9 +73,11 @@ pub fn load() -> (Config, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::style::Color;
 
     use super::{Config, art};
+    use crate::tui::keys::Command;
 
     #[test]
     fn reads_a_theme_section() {
@@ -103,6 +108,26 @@ dim = \"bright black\"
             assert_eq!(config.images, expected, "{text:?}");
         }
         assert!(toml::from_str::<Config>("images = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn reads_a_keys_section() {
+        let config: Config = toml::from_str(
+            "\
+[keys]
+down = \"e\"
+up = \"u\"
+download = [\"d\", \"ctrl-d\"]
+",
+        )
+        .expect("valid config");
+        let (bindings, warnings) = config.keys.resolve();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            bindings.command(KeyEvent::from(KeyCode::Char('e'))),
+            Some(Command::Down)
+        );
+        assert_eq!(bindings.label(Command::Download), "d ctrl-d");
     }
 
     /// A file with no `[theme]` in it is a valid file, and a misspelt key is worth
