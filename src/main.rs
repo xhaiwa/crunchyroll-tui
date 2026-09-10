@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod credentials;
 mod download;
 mod drm;
 mod manifest;
@@ -18,8 +19,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::api::CrunchyrollClient;
+use crate::credentials::Secret;
 use crate::download::{DownloadOptions, download_episode, download_season};
-use crate::util::{check_etp_rt, parse_langs, parse_url};
+use crate::util::{parse_langs, parse_url};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Downloads Crunchyroll anime and outputs MKV files")]
@@ -48,9 +50,11 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     season: i32,
 
-    /// Value of the Crunchyroll etp_rt cookie.
-    #[arg(long = "etp-rt", default_value = "")]
-    etp_rt: String,
+    /// Value of the Crunchyroll etp_rt cookie. Prefer $CRUNCHYROLL_ETP_RT or the config
+    /// file: an argument is kept in the shell's history and is shown in any recording of
+    /// the terminal.
+    #[arg(long = "etp-rt", value_name = "COOKIE")]
+    etp_rt: Option<Secret>,
 
     /// Play the stream with mpv as it arrives instead of writing an MKV file.
     #[arg(long)]
@@ -143,13 +147,18 @@ fn run() -> Result<()> {
     if cli.url.is_none() && cli.file.is_none() && !cli.tui {
         bail!("one of --url, --file or --tui must be supplied");
     }
-    let etp_rt = cli.etp_rt.trim();
-    if etp_rt.is_empty() {
-        bail!(
-            "You must specify --etp-rt. Copy the etp_rt cookie from your logged-in Crunchyroll browser session."
-        );
+    let (mut config, mut complaints) = config::load();
+    let (etp_rt, warnings) = credentials::resolve(cli.etp_rt.as_ref(), &config)?;
+    complaints.extend(warnings);
+    // The TUI collects these and shows them on its status line, since anything printed
+    // now would be scrolled away by the alternate screen before it was read. Without it
+    // they are worth saying straight away, before a request fails for the reason one of
+    // them names.
+    if !cli.tui {
+        for complaint in complaints.drain(..) {
+            eprintln!("{complaint}");
+        }
     }
-    check_etp_rt(etp_rt)?;
 
     let opts = DownloadOptions {
         audio_langs: {
@@ -167,10 +176,18 @@ fn run() -> Result<()> {
         play: cli.play,
         mpv_args: cli.mpv_arg,
     };
-    let client = CrunchyrollClient::new(etp_rt.to_owned(), cli.debug_manifest)?;
+    let client = CrunchyrollClient::new(etp_rt, cli.debug_manifest)?;
 
     if cli.tui {
-        return tui::run(client, opts, cli.theme, cli.images);
+        // What was asked for on the command line wins over the file it would have come
+        // from otherwise.
+        if cli.theme.is_some() {
+            config.theme.name = cli.theme;
+        }
+        if let Some(images) = cli.images {
+            config.images = images;
+        }
+        return tui::run(client, opts, config, complaints);
     }
 
     if let Some(path) = cli.file {

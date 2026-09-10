@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::credentials::Secret;
 use crate::tui::{art, keys, theme};
 
 /// `config.toml`. Nothing in it is required, and a file that is not there is not a
@@ -11,6 +12,15 @@ use crate::tui::{art, keys, theme};
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The etp_rt cookie itself. Anyone who can read the file can sign in as you with
+    /// it, so `chmod 600` the file - or leave this out and name a password manager in
+    /// `etp_rt_command` instead.
+    #[serde(default)]
+    pub etp_rt: Option<Secret>,
+    /// A command whose first line of output is the cookie, `pass show crunchyroll` and
+    /// the like, so the file holds the name of the secret rather than the secret.
+    #[serde(default)]
+    pub etp_rt_command: Option<String>,
     #[serde(default)]
     pub theme: theme::Settings,
     /// Which key does what. Anything left out keeps the default.
@@ -77,6 +87,7 @@ mod tests {
     use ratatui::style::Color;
 
     use super::{Config, art};
+    use crate::credentials::Secret;
     use crate::tui::keys::Command;
 
     #[test]
@@ -108,6 +119,25 @@ dim = \"bright black\"
             assert_eq!(config.images, expected, "{text:?}");
         }
         assert!(toml::from_str::<Config>("images = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn reads_either_way_of_naming_the_cookie() {
+        let config: Config = toml::from_str(
+            "\
+etp_rt = \"e70b3d61-b8bc-4ecb-a9b3-1cf1f0a1b0d1\"
+etp_rt_command = \"pass show crunchyroll\"
+",
+        )
+        .expect("valid config");
+        assert_eq!(
+            config.etp_rt.as_ref().map(Secret::expose),
+            Some("e70b3d61-b8bc-4ecb-a9b3-1cf1f0a1b0d1")
+        );
+        assert_eq!(
+            config.etp_rt_command.as_deref(),
+            Some("pass show crunchyroll")
+        );
     }
 
     #[test]
