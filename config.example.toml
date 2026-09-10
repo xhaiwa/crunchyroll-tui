@@ -1,0 +1,228 @@
+# crunchyroll-downloader
+#
+# Copy this to ~/.config/crunchyroll-downloader/config.toml, or to
+# $XDG_CONFIG_HOME/crunchyroll-downloader/config.toml when that is set.
+#
+# Every value written out below is the one the program uses anyway, so copying
+# this file as it stands changes nothing: it is a list of what you can change,
+# not a set of opinions. Delete whatever you do not care about - nothing here is
+# required, and having no config file at all is the normal case.
+#
+# The command line wins over this file, so a flag is how you try something
+# without editing it. A value that cannot be made sense of - a key that is not a
+# key, a colour that cannot be parsed - is reported on the interface's status
+# line, or on stderr for a plain download, and otherwise ignored: a typo should
+# not stand between you and the catalogue. A name that is not a setting at all
+# is a different matter, and costs the whole file, so the message that names it
+# is worth reading.
+
+
+# ============================================================================
+# Signing in
+# ============================================================================
+# The etp_rt cookie, out of your logged-in browser session. It is a credential,
+# so the order it is looked for in runs from the places that keep it best to the
+# places that keep it worst: --etp-rt, then $CRUNCHYROLL_ETP_RT, then `etp_rt`
+# below, then whatever `etp_rt_command` prints.
+#
+# Naming a password manager is the one that keeps it out of both your shell
+# history and your dotfiles, and it is the reason this section exists:
+#
+#   etp_rt_command = "pass show crunchyroll"
+#
+# The command is run through sh, so a pipeline works, and the cookie is taken
+# off the first line of what it prints - which is the shape `pass show` already
+# has. It keeps the terminal, so a gpg passphrase prompt has somewhere to ask.
+#
+# Writing the cookie itself here means anyone who can read the file can sign in
+# as you, and a config file usually ends up in a dotfiles repo. If you do it
+# anyway, `chmod 600` the file - you are told if you did not.
+#
+# etp_rt = "00000000-0000-0000-0000-000000000000"
+# etp_rt_command = "pass show crunchyroll"
+
+
+# ============================================================================
+# Artwork
+# ============================================================================
+
+# Whether the series posters and episode stills are drawn:
+#
+#   "auto"   only where the terminal speaks kitty, sixel or iTerm2
+#   "on"     anywhere, falling back to half-blocks
+#   "off"    never
+#
+# Half-blocks work in any terminal, but they are a mosaic of coloured cells
+# rather than a picture, and they drag a hundred colours of their own across the
+# colourscheme the rest of the interface is careful to wear - so they are opt-in.
+#
+# `--images` overrides this, and `i` toggles it while the interface is running,
+# which also names the graphics protocol in use if you are wondering why a
+# picture is not where you expected it.
+#
+# This one sits at the top level rather than in a section, so it has to come
+# before the first `[section]` heading. That is TOML, not us.
+images = "auto"
+
+
+# ============================================================================
+# What a run starts with
+# ============================================================================
+# Each setting is named after the flag that overrides it.
+
+[defaults]
+
+# Audio track(s), most wanted first. The first one is marked as the default
+# track in the MKV, and is what the interface starts on.
+#
+# One value or a list, and a comma-separated string works too, so a value can be
+# copied straight off the command line:
+#
+#   audio-lang = "ja-JP"
+#   audio-lang = ["ja-JP", "en-US"]
+#   audio-lang = "ja-JP,en-US"
+#
+# "all" asks for every locale the episode has.
+audio-lang = "ja-JP"
+
+# Subtitle track(s), same shape. An empty list asks for no subtitles at all.
+subs-lang = "en-US"
+
+# Closed-caption track(s), same shape. Off by default.
+cc-lang = []
+
+# Video quality: 1080p, 720p, 480p, 360p, and 240p. An episode that has no such
+# stream falls back to the nearest one and says so.
+video-quality = "1080p"
+
+# Audio quality, as a bitrate.
+audio-quality = "192k"
+
+# Extra options handed straight to mpv, one per entry - the same thing
+# `--mpv-arg` passes, and the same thing the interface uses when it plays. The
+# list is never split on anything, so a value with a comma in it survives.
+# Passing `--mpv-arg` on the command line replaces this list rather than adding
+# to it.
+#
+#   mpv-args = ["--fullscreen", "--slang=fre"]
+#
+# `--vo=kitty` keeps the video inside the terminal, next to the artwork:
+#
+#   mpv-args = ["--vo=kitty"]
+mpv-args = []
+
+
+# ============================================================================
+# Colours
+# ============================================================================
+# The interface ships with no colours of its own: it draws with the sixteen
+# palette slots your terminal already resolves, so it arrives wearing whatever
+# colourscheme is installed. If you drive your palette with base16-shell,
+# tinted-theming or anything else that recolours those slots, this follows it
+# already and the whole section is better left commented out.
+
+[theme]
+
+# A scheme carried in the binary. One of catppuccin-mocha, catppuccin-latte,
+# gruvbox, nord, tokyo-night, rose-pine. Spelling is forgiving: "Rosé Pine",
+# "rose_pine" and "rosepine" all name the same one, and "catppuccin" means
+# mocha. `--theme NAME` tries one without editing this file.
+#
+# name = "gruvbox"
+
+# Anything else comes from a base16 or tinted-theming scheme file, in either the
+# flat (`base00: "282828"`) or the `palette:` shape. base09 becomes the accent,
+# base00 the background, base05 the text, base04 a heading, base03 the dim text
+# and borders, and base08 errors. A relative path is taken from the directory
+# this file is in, and `~` means your home.
+#
+# base16 = "~/.config/tinted-theming/schemes/base16/everforest.yaml"
+
+# Either of the above can be overridden a colour at a time, and each one on its
+# own is enough - so a single colour can be pinned while the rest stays with the
+# terminal. A value is a hex triple, a palette name, or a 256-colour index:
+# "#f47521", "f47521", "208", "bright yellow" and "yellow" are all colours.
+#
+#   accent      focused borders, headings, the cursor row, the numbers
+#   background  the page the text sits on
+#   foreground  the text
+#   heading     the title of a column that does not have the keyboard
+#   dim         counts, running times, dates, hints
+#   border      the border of a column that does not have the keyboard
+#   error       what went wrong
+#
+# accent = "#f47521"
+# background = "#1d2021"
+# foreground = "#ebdbb2"
+# heading = "#a89984"
+# dim = "#928374"
+# border = "#504945"
+# error = "#fb4934"
+
+
+# ============================================================================
+# Keys
+# ============================================================================
+# Every command below is written out at the key it already answers to, so this
+# doubles as the list of what can be moved. An entry replaces the defaults it
+# names rather than adding to them, so the old key is freed for something else,
+# and an empty list unbinds a command altogether.
+#
+# A key is written the way you would say it: a single character (q, /, ?, -), a
+# name (enter, esc, tab, backtab, space, backspace, delete, insert, up, down,
+# left, right, home, end, pgup, pgdn, f1 to f12), or either of those with ctrl-,
+# alt- or shift- in front. `+` separates as well as `-`, so alt+enter works, and
+# a lone `-` or `+` is the key itself rather than a separator. `G` and `shift-g`
+# are the same key.
+#
+# Taking a key off something else is the point, and needs nothing said about it;
+# two entries here fighting over one key is a contradiction and is reported, as
+# is leaving a command with no key by giving its last one away.
+#
+# ctrl-c always quits and cannot be rebound, so a half-finished section here can
+# never leave you stuck in the alternate screen. The `?` overlay and the
+# reminder along the bottom of the screen are both drawn from whatever is in
+# force, so they say what your keys do rather than what these ones did.
+
+[keys]
+
+# Moving around a column.
+up = ["up", "k"]
+down = ["down", "j"]
+page-up = "pgup"
+page-down = "pgdn"
+top = ["home", "g"]
+bottom = ["end", "G"]
+
+# Moving between the three columns. `open` also plays the episode under the
+# cursor, and `back` also leaves a search.
+open = ["enter", "right", "l"]
+back = ["left", "h", "esc"]
+next-column = "tab"
+
+# The catalogue. An empty search goes back to browsing, and `order` cycles
+# popular, recently added and A to Z.
+search = "/"
+order = "o"
+reload = "r"
+
+# Getting an episode. The season forms take everything from the cursor down for
+# playing, and the whole season for downloading.
+play = "p"
+play-rest = "P"
+download = "d"
+download-season = "D"
+
+# Languages. The first pair open the list, which offers what the selected season
+# has; the second pair step to the next locale without opening anything.
+audio-language = "a"
+subtitle-language = "s"
+next-audio = "A"
+next-subtitle = "S"
+
+# The rest. `images` here is the key that shows or hides the artwork, not the
+# `images` setting at the top of the file.
+quality = "v"
+images = "i"
+help = "?"
+quit = "q"

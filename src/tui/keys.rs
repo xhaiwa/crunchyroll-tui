@@ -304,6 +304,13 @@ impl Keys {
 pub struct Settings(BTreeMap<Command, Keys>);
 
 impl Settings {
+    /// Whether the file says anything about `command`, so the example config can be
+    /// checked for leaving one out.
+    #[cfg(test)]
+    pub fn names(&self, command: Command) -> bool {
+        self.0.contains_key(&command)
+    }
+
     /// Builds the table, and says what it could not do rather than refusing to draw, the
     /// way a misspelt colour does.
     pub fn resolve(&self) -> (Bindings, Vec<String>) {
