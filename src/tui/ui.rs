@@ -363,7 +363,10 @@ const HELP: [(&[Command], &str); 17] = [
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
-    (&[Command::Order], "change the browse order"),
+    (
+        &[Command::Order],
+        "cycle the listing: browse orders, then your list",
+    ),
     (
         &[Command::Play, Command::PlayRest],
         "play the episode / the rest of the season",

@@ -1331,6 +1331,9 @@ pub fn download_episode(
 pub fn episode_info(episode: &SeasonEpisode) -> EpisodeInfo {
     EpisodeInfo {
         episode_metadata: EpisodeMetadata {
+            // A season listing names the series it belongs to but not its id, and
+            // nothing downstream of here wants one.
+            series_id: String::new(),
             series_title: episode.series_title.clone(),
             season_number: episode.season_number,
             episode_number: episode.episode_number,

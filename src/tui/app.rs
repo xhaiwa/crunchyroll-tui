@@ -152,7 +152,9 @@ pub struct App {
     pub show_help: bool,
     pub quit: bool,
     pub tick: usize,
-    sort: usize,
+    /// Which listing to browse, and to go back to when a search is left behind: one of
+    /// [`Listing::SOURCES`], counted the way [`Listing::nth_source`] counts them.
+    source: usize,
 }
 
 impl App {
@@ -182,7 +184,7 @@ impl App {
             show_help: false,
             quit: false,
             tick: 0,
-            sort: 0,
+            source: 0,
         };
         app.request_catalog();
         app
@@ -270,10 +272,15 @@ impl App {
                     }
                     match result {
                         Ok(items) => {
-                            let count = items.len();
+                            let empty = items.is_empty();
                             self.series.set(items);
-                            if count == 0 {
-                                self.say("No series found.");
+                            if empty {
+                                // An empty list means something different when it is the
+                                // account's own rather than a corner of the catalogue.
+                                self.say(match self.listing {
+                                    Listing::Watchlist => "Nothing on your list yet.",
+                                    _ => "No series found.",
+                                });
                             }
                         }
                         Err(error) => {
@@ -360,7 +367,7 @@ impl App {
             // Leaving the leftmost column means leaving the search behind.
             Focus::Series => {
                 if matches!(self.listing, Listing::Search(_)) {
-                    self.listing = Listing::Browse(self.sort);
+                    self.listing = Listing::nth_source(self.source);
                     self.request_catalog();
                 }
             }
@@ -516,9 +523,11 @@ impl App {
         self.say(format!("Video quality: {quality}"));
     }
 
-    fn cycle_sort(&mut self) {
-        self.sort = (self.sort + 1) % super::SORTS.len();
-        self.listing = Listing::Browse(self.sort);
+    /// Steps to the next source of series: the catalogue in its next order, and the
+    /// account's own list once the orders run out.
+    fn cycle_source(&mut self) {
+        self.source = (self.source + 1) % Listing::SOURCES;
+        self.listing = Listing::nth_source(self.source);
         self.request_catalog();
     }
 
@@ -548,7 +557,7 @@ impl App {
             KeyCode::Enter => {
                 let query = self.editing.take().unwrap_or_default().trim().to_owned();
                 self.listing = if query.is_empty() {
-                    Listing::Browse(self.sort)
+                    Listing::nth_source(self.source)
                 } else {
                     Listing::Search(query)
                 };
@@ -664,7 +673,7 @@ impl App {
                 let message = self.art.toggle();
                 self.say(message);
             }
-            Command::Order => self.cycle_sort(),
+            Command::Order => self.cycle_source(),
             Command::Reload => self.reload(),
         }
         Action::None

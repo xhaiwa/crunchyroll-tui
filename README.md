@@ -125,7 +125,10 @@ cargo run --release -- --url EPISODE_URL \
 ### Browsing the catalogue
 
 `--tui` opens a terminal interface instead of taking a URL: three columns for series,
-seasons and episodes, with playback and downloading on a key.
+seasons and episodes, with playback and downloading on a key. The series column browses
+the catalogue by popularity, by what arrived recently or alphabetically, and `o` steps
+on once more to your own Crunchyroll list, so what you have already bookmarked is a key
+away rather than a search away.
 
 ```shell
 cargo run --release -- --tui
@@ -140,7 +143,7 @@ cargo run --release -- --tui
 | `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns |
 | `/` | `search` | Search the catalogue. An empty search goes back to browsing |
-| `o` | `order` | Change the browse order: popular, recently added, A to Z |
+| `o` | `order` | Change the listing: popular, recently added, A to Z, then your own Crunchyroll list |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
 | `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
 | `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
@@ -376,7 +379,7 @@ The commands, and the keys they answer to out of the box:
 | `back` | `left` `h` `esc` | Go back a column, and leave a search |
 | `next-column` | `tab` | Cycle the columns |
 | `search` | `/` | Search the catalogue |
-| `order` | `o` | Change the browse order |
+| `order` | `o` | Change the listing the series column shows |
 | `reload` | `r` | Reload the current column |
 | `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
 | `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
