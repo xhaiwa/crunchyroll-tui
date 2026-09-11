@@ -11,13 +11,30 @@ use super::SORTS;
 pub enum Listing {
     /// An index into [`SORTS`].
     Browse(usize),
+    /// What the account has put on its own list.
+    Watchlist,
     Search(String),
 }
 
 impl Listing {
+    /// How many listings the order key steps through: the catalogue in each order
+    /// Crunchyroll offers, and then the account's own list. A search is not among them,
+    /// since it is arrived at by typing rather than by stepping.
+    pub const SOURCES: usize = SORTS.len() + 1;
+
+    /// The `index`th of those, the ones past [`SORTS`] being the account's list.
+    pub fn nth_source(index: usize) -> Self {
+        if index < SORTS.len() {
+            Self::Browse(index)
+        } else {
+            Self::Watchlist
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::Browse(sort) => SORTS[*sort].1.to_owned(),
+            Self::Watchlist => "My list".to_owned(),
             Self::Search(query) => format!("Search: {query}"),
         }
     }
@@ -77,6 +94,7 @@ impl Worker {
                     Request::Catalog(listing) => {
                         let result = match &listing {
                             Listing::Browse(sort) => client.browse(SORTS[*sort].0, CATALOG_PAGE, 0),
+                            Listing::Watchlist => client.watchlist(CATALOG_PAGE),
                             Listing::Search(query) => client.search(query, CATALOG_PAGE),
                         };
                         Response::Catalog {
@@ -136,5 +154,23 @@ impl Worker {
 
     pub fn try_recv(&self) -> Option<Response> {
         self.responses.try_recv().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Listing, SORTS};
+
+    /// The order key walks every catalogue order and then the account's own list,
+    /// rather than stepping off the end of [`SORTS`] into a panic.
+    #[test]
+    fn the_sources_are_the_orders_and_the_watchlist() {
+        let sources: Vec<Listing> = (0..Listing::SOURCES).map(Listing::nth_source).collect();
+        for (index, order) in SORTS.iter().enumerate() {
+            assert_eq!(sources[index], Listing::Browse(index));
+            assert_eq!(sources[index].label(), order.1);
+        }
+        assert_eq!(sources.last(), Some(&Listing::Watchlist));
+        assert_eq!(Listing::Watchlist.label(), "My list");
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -11,8 +12,9 @@ use uuid::Uuid;
 
 use crate::credentials::Secret;
 use crate::model::{
-    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, SearchResponse,
-    Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse,
+    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, ObjectsResponse,
+    SearchResponse, Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse,
+    WatchlistResponse,
 };
 
 const USER_AGENT_VALUE: &str =
@@ -47,6 +49,10 @@ const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// Which account the token was minted for. The per-account endpoints want it in
+    /// their path, and this is where it arrives without a request of its own.
+    #[serde(default)]
+    account_id: String,
 }
 
 #[derive(Clone)]
@@ -56,6 +62,7 @@ pub struct CrunchyrollClient {
     device_id: String,
     etp_rt: Secret,
     access_token: Arc<RwLock<String>>,
+    account_id: Arc<RwLock<String>>,
     refresh_lock: Arc<Mutex<()>>,
     /// Where the running commentary goes. It is printed by default, but the TUI owns
     /// the terminal and needs to collect it instead of having it drawn over the frame.
@@ -95,6 +102,7 @@ impl CrunchyrollClient {
             device_id: Uuid::new_v4().to_string(),
             etp_rt,
             access_token: Arc::new(RwLock::new(String::new())),
+            account_id: Arc::new(RwLock::new(String::new())),
             refresh_lock: Arc::new(Mutex::new(())),
             notice: Arc::new(|message| println!("{message}")),
             debug,
@@ -152,6 +160,9 @@ impl CrunchyrollClient {
             bail!("Crunchyroll returned an empty access token");
         }
         *self.access_token.write().expect("token lock poisoned") = token.access_token;
+        if !token.account_id.is_empty() {
+            *self.account_id.write().expect("account lock poisoned") = token.account_id;
+        }
         Ok(())
     }
 
@@ -292,6 +303,82 @@ impl CrunchyrollClient {
             .flat_map(|group| group.items)
             .filter(|item| item.kind == "series")
             .collect())
+    }
+
+    /// Which account the token belongs to, for the endpoints that want it in their
+    /// path. The token grant says so, and the account endpoint is only asked if a
+    /// grant ever stops saying so.
+    fn account_id(&self) -> Result<String> {
+        let known = self
+            .account_id
+            .read()
+            .expect("account lock poisoned")
+            .clone();
+        if !known.is_empty() {
+            return Ok(known);
+        }
+        #[derive(Deserialize)]
+        struct Me {
+            #[serde(default)]
+            account_id: String,
+        }
+        let me: Me = self.get_json("https://www.crunchyroll.com/accounts/v1/me")?;
+        if me.account_id.is_empty() {
+            bail!("Crunchyroll would not say which account this cookie belongs to");
+        }
+        *self.account_id.write().expect("account lock poisoned") = me.account_id.clone();
+        Ok(me.account_id)
+    }
+
+    /// The catalogue entries for `ids`, in the order they were asked for.
+    ///
+    /// One request covers a whole listing: the objects endpoint takes the ids as a
+    /// list, and a hundred of them - as many as a listing here holds - come back in
+    /// one answer. Which order they come back in is the endpoint's business, so they
+    /// are put back into the asked-for one, and an id it has nothing to say about
+    /// simply does not appear.
+    fn objects(&self, ids: &[String]) -> Result<Vec<CatalogItem>> {
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/cms/objects/{}?ratings=true&locale=en-US",
+            ids.join(",")
+        );
+        let mut found: HashMap<String, CatalogItem> = self
+            .get_json::<ObjectsResponse>(&url)?
+            .data
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect();
+        Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
+    }
+
+    /// The account's own list - My List on the website - in the order Crunchyroll
+    /// keeps it in.
+    ///
+    /// The list holds the episode each series was last left at rather than the series,
+    /// and this column is a column of series: an episode panel has no seasons to open
+    /// and no poster to draw. So the series behind the entries are what is asked for,
+    /// which also gets them in the same shape the rest of the catalogue arrives in.
+    /// Two entries can be about one series, so the ids are deduped on the way.
+    pub fn watchlist(&self, count: usize) -> Result<Vec<CatalogItem>> {
+        let account = self.account_id()?;
+        let mut url = reqwest::Url::parse(&format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account}/watchlist"
+        ))
+        .context("build watchlist URL")?;
+        url.query_pairs_mut()
+            .append_pair("n", &count.to_string())
+            .append_pair("locale", "en-US");
+        let mut ids: Vec<String> = Vec::new();
+        for entry in self.get_json::<WatchlistResponse>(url.as_str())?.data {
+            let id = entry.series_id();
+            if !id.is_empty() && !ids.iter().any(|seen| seen == id) {
+                ids.push(id.to_owned());
+            }
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.objects(&ids)
     }
 
     pub fn manifest(&self, url: &str) -> Result<Vec<u8>> {

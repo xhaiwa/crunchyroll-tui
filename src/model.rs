@@ -124,6 +124,8 @@ pub struct EpisodeMetadata {
     #[serde(default, deserialize_with = "null_default")]
     pub season_number: i32,
     #[serde(default)]
+    pub series_id: String,
+    #[serde(default)]
     pub series_title: String,
     #[serde(default)]
     #[allow(dead_code)]
@@ -241,6 +243,53 @@ pub struct CatalogItem {
     pub images: Images,
 }
 
+/// One entry of the account's own list.
+///
+/// The list is kept as the episode each series was last left at rather than as the
+/// series themselves, so the entry wraps an episode panel and what the catalogue
+/// column wants - the series - is the id hanging off its metadata. A panel that is a
+/// series already is taken as it stands, and anything else (a film, an entry whose
+/// panel Crunchyroll left out) carries no series id and is passed over.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WatchlistEntry {
+    #[serde(default, deserialize_with = "null_default")]
+    pub panel: WatchlistPanel,
+}
+
+impl WatchlistEntry {
+    /// The series this entry is about, or an empty string if it is not about one.
+    pub fn series_id(&self) -> &str {
+        if self.panel.kind == "series" {
+            &self.panel.id
+        } else {
+            &self.panel.episode_metadata.series_id
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WatchlistPanel {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub episode_metadata: EpisodeMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WatchlistResponse {
+    #[serde(default)]
+    pub data: Vec<WatchlistEntry>,
+}
+
+/// Catalogue entries fetched by id rather than found by browsing.
+#[derive(Debug, Deserialize)]
+pub struct ObjectsResponse {
+    #[serde(default)]
+    pub data: Vec<CatalogItem>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BrowseResponse {
     #[serde(default)]
@@ -265,7 +314,7 @@ pub struct SearchResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{Episode, SeasonEpisode, SeasonEpisodesResponse};
+    use super::{Episode, SeasonEpisode, SeasonEpisodesResponse, WatchlistResponse};
 
     #[test]
     fn accepts_all_playback_error_shapes() {
@@ -324,6 +373,33 @@ mod tests {
             let response: SeasonEpisodesResponse = serde_json::from_str(json).unwrap();
             assert_eq!(response.data[0].images.thumbnail(320), None, "{json}");
         }
+    }
+
+    /// The account's list arrives as the episode each series was left at, so the id
+    /// worth keeping is the series the panel belongs to rather than the panel's own.
+    /// An entry about anything else is passed over rather than becoming an empty row.
+    #[test]
+    fn finds_the_series_behind_a_watchlist_entry() {
+        let json = r#"{"total":3,"data":[
+            {"panel":{"id":"GQJUGQG3J","type":"episode","title":"The Time Has Come",
+                "episode_metadata":{"series_id":"G4PH0WEKE","series_title":"BLUE LOCK",
+                "season_number":1,"episode_number":24}},"playhead":0,"never_watched":false},
+            {"panel":{"id":"GRMG8ZQZR","type":"series","title":"One Piece"}},
+            {"panel":{"id":"G1","type":"movie_listing","title":"A film"}}
+        ]}"#;
+        let response: WatchlistResponse = serde_json::from_str(json).unwrap();
+        let entries = response.data;
+        assert_eq!(entries[0].series_id(), "G4PH0WEKE");
+        assert_eq!(
+            entries[0].panel.episode_metadata.series_title, "BLUE LOCK",
+            "the series title comes along for a listing that wants it"
+        );
+        assert_eq!(
+            entries[1].series_id(),
+            "GRMG8ZQZR",
+            "a panel that is a series already is the series"
+        );
+        assert_eq!(entries[2].series_id(), "", "a film is about no series");
     }
 
     #[test]
