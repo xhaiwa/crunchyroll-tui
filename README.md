@@ -242,6 +242,16 @@ the first output that starts, so a build of mpv without sixel compiled in still 
 episode. All of them are scaled on the CPU frame by frame, so `--profile=sw-fast` goes
 with every one: it is what decides whether the picture keeps up.
 
+Except on kitty with shared memory, a frame reaches the terminal as escape sequences -
+around 35 bytes for every character cell it covers, because each cell carries its own
+colour. A terminal filling a large screen is some 16000 cells, which at 24 frames a
+second is 13 MB/s of text to parse, lay out and paint; no terminal keeps up, and the
+frames mpv drops waiting are the picture stuttering. So the video is drawn into a box of
+at most 4000 cells - the shape of your terminal, shrunk - which is nearer 3 MB/s. The
+picture is made of fewer, larger cells and it runs at the frame rate instead of lurching.
+`--mpv-arg --vo-tct-width=200 --mpv-arg --vo-tct-height=56` asks for a bigger one if your
+terminal can take it.
+
 ```shell
 cargo run --release -- --url EPISODE_URL --play --in-terminal
 ```
