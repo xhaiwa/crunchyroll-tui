@@ -25,6 +25,13 @@ pub struct Config {
     /// Whether the posters and episode stills are drawn. `--images` overrides it.
     #[serde(default)]
     pub images: art::Setting,
+    /// Whether the terminal interface answers the mouse. `--mouse` overrides it.
+    ///
+    /// Asking the terminal to report the pointer takes its own click-and-drag text
+    /// selection away, which shift-drag gives back everywhere worth naming - but it is
+    /// somebody's way of working, so it is worth being able to say no.
+    #[serde(default)]
+    pub mouse: Option<bool>,
     /// What a run starts with when the command line does not say.
     #[serde(default)]
     pub defaults: Defaults,
@@ -172,6 +179,21 @@ dim = \"bright black\"
         assert!(toml::from_str::<Config>("images = \"yes\"\n").is_err());
     }
 
+    /// Left unsaid, the interface answers the mouse: a feature nobody finds is worth
+    /// nothing. Saying so either way has to win.
+    #[test]
+    fn reads_the_mouse_setting() {
+        for (text, expected) in [
+            ("", None),
+            ("mouse = true\n", Some(true)),
+            ("mouse = false\n", Some(false)),
+        ] {
+            let config: Config = toml::from_str(text).expect("valid config");
+            assert_eq!(config.mouse, expected, "{text:?}");
+        }
+        assert!(toml::from_str::<Config>("mouse = \"on\"\n").is_err());
+    }
+
     #[test]
     fn reads_either_way_of_naming_the_cookie() {
         let config: Config = toml::from_str(
@@ -252,6 +274,11 @@ download = [\"d\", \"ctrl-d\"]
         let config: Config = toml::from_str(include_str!("../config.example.toml"))
             .expect("config.example.toml is valid config");
         assert_eq!(config.images, art::Setting::Auto);
+        assert_eq!(
+            config.mouse,
+            Some(true),
+            "an example that says the mouse is off when it is on is worse than no example"
+        );
 
         let defaults = &config.defaults;
         assert_eq!(

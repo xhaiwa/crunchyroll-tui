@@ -1,6 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Position;
 use ratatui::widgets::ListState;
 
 use crate::download::DownloadOptions;
@@ -10,6 +13,7 @@ use crate::util::{LANGUAGES, language_name};
 use super::QUALITIES;
 use super::art::Gallery;
 use super::keys::{Bindings, Command};
+use super::mouse::{self, Regions, Target};
 use super::theme::Theme;
 use super::worker::{Listing, Request, Response, Worker};
 
@@ -108,6 +112,22 @@ impl<T> Pane<T> {
         self.state
             .select(Some(if last { self.items.len() - 1 } else { 0 }));
     }
+
+    /// Puts the cursor on `index`, and ignores one past the end: a list answered again
+    /// since the frame a click was aimed at may be shorter than that frame said it was.
+    pub fn select(&mut self, index: usize) {
+        if index < self.items.len() {
+            self.state.select(Some(index));
+        }
+    }
+
+    /// The first row the list drew and how many items it holds - everything the pointer
+    /// needs to turn a row of the screen into an index. The offset is what the list
+    /// widget wrote back as it drew, so it is where the list actually was rather than
+    /// where it was asked to be.
+    pub fn window(&self) -> (usize, usize) {
+        (self.state.offset(), self.items.len())
+    }
 }
 
 /// The language list while it is open: which of the two settings it is choosing for,
@@ -149,6 +169,8 @@ pub struct App {
     pub notice: Option<Notice>,
     /// What the API client would have printed had the interface not owned the screen.
     notices: Arc<Mutex<Vec<String>>>,
+    /// Where the last frame put everything, so a click can be aimed at it.
+    pub regions: Regions,
     pub show_help: bool,
     pub quit: bool,
     pub tick: usize,
@@ -179,6 +201,7 @@ impl App {
             picker: None,
             notice: None,
             notices,
+            regions: Regions::default(),
             show_help: false,
             quit: false,
             tick: 0,
@@ -209,6 +232,14 @@ impl App {
             text: text.into(),
             error: false,
         });
+    }
+
+    /// Forgets where the last frame put everything. A resize, or anything that drew over
+    /// the screen while the interface was handed away, leaves those boxes describing a
+    /// picture that is gone, and a click hit against them would land somewhere arbitrary
+    /// - so nothing may be clicked until the next frame has put them back.
+    pub fn forget_layout(&mut self) {
+        self.regions = Regions::default();
     }
 
     pub fn complain(&mut self, text: impl Into<String>) {
@@ -323,12 +354,49 @@ impl App {
         }
     }
 
-    fn focused_pane_move(&mut self, delta: isize) {
-        match self.focus {
+    fn pane_move(&mut self, focus: Focus, delta: isize) {
+        match focus {
             Focus::Series => self.series.move_by(delta),
             Focus::Seasons => self.seasons.move_by(delta),
             Focus::Episodes => self.episodes.move_by(delta),
         }
+    }
+
+    fn focused_pane_move(&mut self, delta: isize) {
+        self.pane_move(self.focus, delta);
+    }
+
+    /// Where a column's list was when it was last drawn: its first visible row, and how
+    /// many items it holds.
+    fn pane_window(&self, focus: Focus) -> (usize, usize) {
+        match focus {
+            Focus::Series => self.series.window(),
+            Focus::Seasons => self.seasons.window(),
+            Focus::Episodes => self.episodes.window(),
+        }
+    }
+
+    fn cursor(&self, focus: Focus) -> Option<usize> {
+        match focus {
+            Focus::Series => self.series.state.selected(),
+            Focus::Seasons => self.seasons.state.selected(),
+            Focus::Episodes => self.episodes.state.selected(),
+        }
+    }
+
+    fn put_cursor(&mut self, focus: Focus, index: usize) {
+        match focus {
+            Focus::Series => self.series.select(index),
+            Focus::Seasons => self.seasons.select(index),
+            Focus::Episodes => self.episodes.select(index),
+        }
+    }
+
+    /// The item on `row` of a column, if the pointer is on one rather than on a border,
+    /// a title, or the sentence an empty column draws.
+    fn item_at(&self, focus: Focus, row: u16) -> Option<usize> {
+        let (offset, len) = self.pane_window(focus);
+        mouse::row_at(self.regions.column(focus), offset, len, row)
     }
 
     fn focused_pane_edge(&mut self, last: bool) {
@@ -632,6 +700,14 @@ impl App {
         let Some(command) = command else {
             return Action::None;
         };
+        self.run(command)
+    }
+
+    /// Does what a command says, whatever asked for it: a key, or a word on the screen
+    /// that was clicked. One place decides what a command means, so what the pointer
+    /// does cannot drift away from what the keyboard does - and the help popup stays the
+    /// whole list of what the interface can be asked for.
+    fn run(&mut self, command: Command) -> Action {
         match command {
             Command::Quit => return Action::Quit,
             Command::Help => self.show_help = true,
@@ -669,6 +745,181 @@ impl App {
         }
         Action::None
     }
+
+    /// What the pointer does.
+    ///
+    /// The keyboard's rules read through a mouse: a click puts the cursor somewhere, a
+    /// click on where the cursor already is opens it, and every word drawn along an edge
+    /// runs the command it names. Nothing here does anything no key does.
+    pub fn on_mouse(&mut self, event: MouseEvent) -> Action {
+        let at = Position::new(event.column, event.row);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.click(at),
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.drag(at);
+                Action::None
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.back(at);
+                Action::None
+            }
+            MouseEventKind::ScrollUp => {
+                self.wheel(at, -mouse::WHEEL);
+                Action::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.wheel(at, mouse::WHEEL);
+                Action::None
+            }
+            // The middle button pastes the primary selection, which is not ours to take
+            // away; a touchpad tilted sideways is far too easy to do by accident for
+            // anything as coarse as changing column; and `Moved` never arrives, because
+            // the reporting this asks for does not include it.
+            _ => Action::None,
+        }
+    }
+
+    /// The left button pressed. On the press rather than the release: a press that turns
+    /// into a drag is the same gesture either way, and waiting for the release only
+    /// makes the interface answer late.
+    fn click(&mut self, at: Position) -> Action {
+        // The search box owns the pointer as it owns the keyboard: a click is the way
+        // out of it, as escape is, and nothing else.
+        if self.editing.is_some() {
+            self.editing = None;
+            return Action::None;
+        }
+        // The help popup is read and dismissed, so a click anywhere closes it - even one
+        // that landed on a word that would otherwise have answered.
+        if self.show_help {
+            self.show_help = false;
+            return Action::None;
+        }
+        let target = self.regions.at(at);
+        self.notice = None;
+        if self.picker.is_some() {
+            match target {
+                Target::Picker => self.click_picker(at),
+                _ => self.picker = None,
+            }
+            return Action::None;
+        }
+        match target {
+            Target::Button(command) => self.run(command),
+            Target::Column(focus) => {
+                let working_there = self.focus == focus;
+                self.focus = focus;
+                let Some(index) = self.item_at(focus, at.y) else {
+                    return Action::None;
+                };
+                // A click on the row the cursor is already on, in the column already
+                // being worked in, is what `open` is. The first click into a column can
+                // only ever choose, so nothing is ever played by surprise - and two
+                // quick clicks are two clicks on the same row, so a double click works
+                // without a clock, which is what makes it behave the same over ssh.
+                if working_there && self.cursor(focus) == Some(index) {
+                    return self.descend();
+                }
+                self.put_cursor(focus, index);
+                Action::None
+            }
+            Target::Picker | Target::Outside | Target::Nothing => Action::None,
+        }
+    }
+
+    /// A drag moves the cursor and never opens: an open on the way past would fire on
+    /// every row the pointer crossed, and one of them plays an episode. Only the column
+    /// the drag started in answers - the press that began it is what focused that column
+    /// - so a drag wandering out of its list does not start driving another one.
+    fn drag(&mut self, at: Position) {
+        if self.editing.is_some() || self.show_help {
+            return;
+        }
+        if self.picker.is_some() {
+            self.select_picker(at);
+            return;
+        }
+        if self.regions.at(at) == Target::Column(self.focus)
+            && let Some(index) = self.item_at(self.focus, at.y)
+        {
+            self.put_cursor(self.focus, index);
+        }
+    }
+
+    /// The wheel moves the cursor of the column under the pointer and leaves the
+    /// keyboard where it was: looking down a list is not the same as going to work in
+    /// it, and each column keeps a cursor of its own, so a look costs nothing.
+    fn wheel(&mut self, at: Position, delta: isize) {
+        if self.editing.is_some() || self.show_help {
+            return;
+        }
+        if self.picker.is_some() {
+            if let Target::Picker = self.regions.at(at)
+                && let Some(picker) = self.picker.as_mut()
+            {
+                picker.pane.move_by(delta);
+            }
+            return;
+        }
+        if let Target::Column(focus) = self.regions.at(at) {
+            self.pane_move(focus, delta);
+        }
+    }
+
+    /// The right button goes back, out of the column it was pressed on rather than out
+    /// of wherever the keyboard happens to be - which is the only reading that does not
+    /// depend on something invisible.
+    fn back(&mut self, at: Position) {
+        if self.editing.is_some() {
+            self.editing = None;
+            return;
+        }
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+        if self.picker.is_some() {
+            self.picker = None;
+            return;
+        }
+        if let Target::Column(focus) = self.regions.at(at) {
+            self.notice = None;
+            self.focus = focus;
+            self.ascend();
+        }
+    }
+
+    /// The locale under the pointer, while the language list is open.
+    fn picked_at(&self, at: Position) -> Option<usize> {
+        let picker = self.picker.as_ref()?;
+        let (offset, len) = picker.pane.window();
+        mouse::row_at(self.regions.picker, offset, len, at.y)
+    }
+
+    fn select_picker(&mut self, at: Position) {
+        if let Some(index) = self.picked_at(at)
+            && let Some(picker) = self.picker.as_mut()
+        {
+            picker.pane.select(index);
+        }
+    }
+
+    /// The columns' rule again: a click chooses a locale, and a click on the one already
+    /// chosen applies it.
+    fn click_picker(&mut self, at: Position) {
+        let Some(index) = self.picked_at(at) else {
+            return;
+        };
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.pane.state.selected() == Some(index))
+        {
+            self.edit_picker(Command::Open);
+        } else {
+            self.select_picker(at);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -697,5 +948,28 @@ mod tests {
         assert_eq!(pane.state.selected(), Some(0));
         pane.clear();
         assert_eq!(pane.selected(), None);
+    }
+
+    /// A click is aimed at the frame that was drawn before it, and the list may have been
+    /// answered again in between, so the row it names can be one the list no longer has.
+    #[test]
+    fn a_row_the_list_no_longer_has_moves_nothing() {
+        let mut pane = Pane::default();
+        pane.set(vec!["a", "b", "c"]);
+        assert_eq!(pane.window(), (0, 3));
+
+        pane.select(2);
+        assert_eq!(pane.state.selected(), Some(2));
+        pane.select(7);
+        assert_eq!(
+            pane.state.selected(),
+            Some(2),
+            "the cursor stayed where it was"
+        );
+
+        pane.clear();
+        pane.select(0);
+        assert_eq!(pane.state.selected(), None, "an empty pane has no row 0");
+        assert_eq!(pane.window(), (0, 0));
     }
 }

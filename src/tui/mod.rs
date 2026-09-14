@@ -1,6 +1,7 @@
 mod app;
 pub mod art;
 pub mod keys;
+mod mouse;
 pub mod theme;
 mod ui;
 mod worker;
@@ -81,6 +82,13 @@ pub fn run(
         // is given twice, so `--mpv-arg --vo=gpu` still opens a window.
         options.mpv_args.splice(0..0, args);
     }
+    // After the gallery, not before: it asks the terminal what it can draw and reads the
+    // answer straight off stdin, and a mouse report arriving in the middle of that
+    // answer is an answer lost.
+    let mouse = config.mouse.unwrap_or(true) && mouse::enable();
+    if mouse {
+        mouse::restore_on_panic();
+    }
     let app = App::new(
         Worker::spawn(client.clone()),
         options,
@@ -89,7 +97,13 @@ pub fn run(
         notices,
         gallery,
     );
-    let result = event_loop(&mut terminal, &client, app);
+    let result = event_loop(&mut terminal, &client, app, mouse);
+    // Before the terminal is given back, never after: `try_restore` turns raw mode off
+    // first, and a report landing in the moment between the two is printed on the user's
+    // shell as `^[[<0;40;12M`.
+    if mouse {
+        mouse::disable();
+    }
     // Give the terminal back whether or not the loop ended well, so an error message
     // is not printed into the alternate screen that is about to disappear.
     ratatui::try_restore().context("restore the terminal")?;
@@ -100,6 +114,7 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     client: &CrunchyrollClient,
     mut app: App,
+    mouse: bool,
 ) -> Result<()> {
     while !app.quit {
         terminal
@@ -107,24 +122,53 @@ fn event_loop(
             .context("draw the interface")?;
         app.drain();
         if event::poll(TICK).context("wait for a key")? {
-            match event::read().context("read a key")? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match app.on_key(key) {
+            // A wheel spun hard, or a pointer dragged down a column, arrives as a burst,
+            // and answering each one with a frame of its own draws the same picture a
+            // dozen times over to show one movement. So everything already waiting is
+            // taken in before the next frame. The first one that needs the terminal ends
+            // the burst: what is queued behind it was aimed at a screen mpv is about to
+            // draw over.
+            loop {
+                let action = match event::read().context("read a key")? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Event::Mouse(pointer) => app.on_mouse(pointer),
+                    // A resize leaves every box the last frame wrote down describing a
+                    // screen that is gone, so nothing may be clicked until the redraw at
+                    // the top of the loop has put them back.
+                    Event::Resize(..) => {
+                        app.forget_layout();
+                        Action::None
+                    }
+                    _ => Action::None,
+                };
+                match action {
                     Action::None => {}
-                    Action::Quit => app.quit = true,
+                    Action::Quit => {
+                        app.quit = true;
+                        break;
+                    }
                     Action::Play(episodes) => {
                         let options = app.options.clone();
-                        let outcome = suspend(terminal, || play(client, &options, &episodes));
+                        let outcome =
+                            suspend(terminal, mouse, || play(client, &options, &episodes));
                         app.art.forget();
+                        app.forget_layout();
                         report(&mut app, outcome, "Playback");
+                        break;
                     }
                     Action::Download(episodes) => {
                         let options = app.options.clone();
-                        let outcome = suspend(terminal, || download(client, &options, &episodes));
+                        let outcome =
+                            suspend(terminal, mouse, || download(client, &options, &episodes));
                         app.art.forget();
+                        app.forget_layout();
                         report(&mut app, outcome, "Download");
+                        break;
                     }
-                },
-                _ => {}
+                }
+                if !event::poll(Duration::ZERO).context("wait for a key")? {
+                    break;
+                }
             }
         }
         app.tick = app.tick.wrapping_add(1);
@@ -148,13 +192,35 @@ fn report(app: &mut App, outcome: Result<String>, what: &str) {
 /// and takes it again afterwards. Whatever had it may have cleared the artwork the
 /// terminal was holding on our behalf, so the caller drops what it had encoded.
 ///
+/// The pointer stops being reported for the whole of it, and before raw mode goes rather
+/// than after. mpv is given this terminal's stdin so that its own keys work, and an SGR
+/// report is `^[[<0;40;12M` - in which `<` and `>` are mpv's previous and next file. A
+/// mouse merely moved during playback would otherwise skip episodes. The prompt after a
+/// download reads a line off the same stdin, and would be handed escape sequences that
+/// never contain the newline it is waiting for.
+///
 /// The panic hook ratatui installs is set up once, by `try_init`, so the screen is
 /// re-entered by hand rather than by initialising a second time.
-fn suspend<T>(terminal: &mut DefaultTerminal, action: impl FnOnce() -> Result<T>) -> Result<T> {
+fn suspend<T>(
+    terminal: &mut DefaultTerminal,
+    mouse: bool,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if mouse {
+        mouse::disable();
+    }
     ratatui::try_restore().context("hand the terminal over")?;
     let result = action();
     enable_raw_mode().context("take the terminal back")?;
     execute!(stdout(), EnterAlternateScreen).context("re-enter the alternate screen")?;
+    if mouse {
+        mouse::enable();
+    }
+    // Whatever was already on its way when the terminal changed hands is still queued,
+    // and none of it was meant for the screen about to be drawn.
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        let _ = event::read();
+    }
     // Nothing on screen is ours any more, so redraw all of it rather than the diff.
     terminal.clear().context("clear the terminal")?;
     result

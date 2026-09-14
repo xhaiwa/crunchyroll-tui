@@ -112,6 +112,21 @@ struct Cli {
     #[arg(long, value_name = "WHEN", requires = "tui")]
     images: Option<tui::art::Setting>,
 
+    /// Whether the terminal interface answers the mouse, overriding the config file.
+    /// `--mouse=false` browses with the keyboard alone and leaves the terminal its own
+    /// click-and-drag text selection.
+    // Written as a flag but taking a value, the way `--in-terminal` is, so that it can
+    // turn off what the config file turned on.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        requires = "tui"
+    )]
+    mouse: Option<bool>,
+
     /// URL of the episode or series to download.
     #[arg(long, conflicts_with = "file")]
     url: Option<String>,
@@ -261,6 +276,9 @@ fn run() -> Result<()> {
         }
         if let Some(images) = cli.images {
             config.images = images;
+        }
+        if cli.mouse.is_some() {
+            config.mouse = cli.mouse;
         }
         config.defaults.in_terminal = Some(in_terminal);
         return tui::run(client, opts, config, complaints);
