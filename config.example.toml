@@ -66,6 +66,28 @@ images = "auto"
 
 
 # ============================================================================
+# The mouse
+# ============================================================================
+
+# Whether the interface answers the mouse: a click chooses, a click on what is
+# already chosen opens it, the wheel scrolls the column under the pointer, the
+# right button goes back, and the words along the top and bottom edges are
+# buttons. Nothing the pointer does is anything a key cannot do, so `?` is still
+# the whole list.
+#
+# Asking the terminal to report the pointer takes away its own click-and-drag
+# text selection. Holding shift while you drag gives it back in every terminal
+# worth naming - but if that is not how you work, turn this off and nothing
+# changes.
+#
+# `--mouse=false` turns it off for one run. In tmux, nothing reaches the pane at
+# all until tmux itself is told `set -g mouse on`.
+#
+# Top level too, so it also belongs before the first `[section]` heading.
+mouse = true
+
+
+# ============================================================================
 # What a run starts with
 # ============================================================================
 # Each setting is named after the flag that overrides it.

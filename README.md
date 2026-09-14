@@ -169,6 +169,35 @@ interface starts with.
 Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
 same with the progress bars.
 
+#### With a mouse
+
+The interface answers the mouse, and a mouse alone is enough to drive it - quitting
+included.
+
+| Gesture | What it does |
+| --- | --- |
+| Click a row | Move the cursor there, and put the keyboard on that column |
+| Click it again | Open it: the seasons, the episodes, or mpv |
+| Drag | Move the cursor down the column the drag started in |
+| Wheel | Scroll the column under the pointer, leaving the keyboard where it is |
+| Right click | Go back out of the column it was pressed on |
+| Click a word along an edge | What its key does: `open/play`, `back`, `search`, `download`, `language`, `quality`, `keys`, `quit`, and `audio`, `subs` and `video` at the top right |
+| Click the listing label | Change the browse order, or leave a search |
+| Click beside the language list | Cancel it, the way `esc` does |
+
+Opening takes a second click rather than a quick double click, so a slow hand and a slow
+link work the same as a fast one - and a first click into a column can only ever choose,
+which is what keeps mpv from starting by surprise. Two quick clicks are still two clicks
+on the same row, so a double click does what you expect.
+
+Nothing the pointer does is anything a key cannot do, so `?` remains the whole list of
+what the interface can be asked for.
+
+Asking the terminal to report the pointer takes away its own click-and-drag text
+selection. Hold shift while you drag to get it back, or turn the whole thing off with
+`--mouse=false` for one run, or `mouse = false` in the config file. Inside tmux, nothing
+reaches the interface until tmux itself is told `set -g mouse on`.
+
 ### Cover art
 
 The series poster gets a column of its own beside the lists, and the still from the
@@ -312,6 +341,10 @@ etp_rt_command = "pass show crunchyroll"
 # before the first section - that is TOML, not us.
 images = "auto"
 
+# Whether the interface answers the mouse. Turning it off gives the terminal back
+# its own click-and-drag text selection. Top level too.
+mouse = true
+
 # What a run starts with when the command line does not say. Each one is named after
 # the flag that overrides it.
 [defaults]
@@ -400,6 +433,10 @@ and the search box takes every letter literally, so `/` then `q` searches for `q
 The language list uses the same bindings: `up`/`down`/`top`/`bottom` move, `open`
 applies, `next-column` swaps between the audio and subtitle lists, and `back` or `quit`
 closes it.
+
+The mouse has nothing of its own in here. Every word it can click runs one of the
+commands above, so moving a key moves what the word beside it says and changes nothing
+else - see [With a mouse](#with-a-mouse).
 
 A command that does not exist is reported on the status line with the config file left
 unread, the way a misspelt theme key is. Taking a command's last key away for something

@@ -1,5 +1,5 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect, Size};
+use ratatui::layout::{Constraint, Layout, Margin, Rect, Size};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
@@ -9,7 +9,9 @@ use crate::util::language_name;
 
 use super::app::{App, Focus, Picker};
 use super::keys::{Bindings, Command};
+use super::mouse::{self, Regions};
 use super::theme::Theme;
+use super::worker::Listing;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -108,34 +110,106 @@ fn episode_row(theme: &Theme, episode: &SeasonEpisode) -> ListItem<'static> {
     ListItem::new(Line::from(spans))
 }
 
+/// A run of words drawn one after another, each with the command a click on it runs, or
+/// nothing where the run is only spacing. The line that is drawn and the boxes a pointer
+/// is hit against both come out of one of these, so a word cannot be printed in one
+/// place and answer in another.
+type Run = Vec<(Option<Command>, Vec<Span<'static>>)>;
+
+/// What a string is worth in columns. A label measured in bytes puts its box six columns
+/// to the left of itself the moment a language name is not written in ASCII.
+fn cells(spans: &[Span<'static>]) -> u16 {
+    let width: usize = spans.iter().map(Span::width).sum();
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+/// The words of a run, as the width each takes.
+fn widths(run: &Run) -> Vec<(Option<Command>, u16)> {
+    run.iter()
+        .map(|(command, spans)| (*command, cells(spans)))
+        .collect()
+}
+
+fn line(run: &Run) -> Line<'static> {
+    Line::from(
+        run.iter()
+            .flat_map(|(_, spans)| spans.iter().cloned())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The left of the header: what is being listed, and how much of it.
+///
+/// The label is a button, because what it says is exactly what a click on it changes -
+/// `Popular` cycles the order, and `Search: frieren` leaves the search. The count beside
+/// it is not. While the box is being typed into, none of it is: a click there closes the
+/// box, as escape does.
+fn listing(app: &App) -> Run {
+    let theme = &app.theme;
+    match &app.editing {
+        Some(query) => vec![(
+            None,
+            vec![
+                theme.accent("Search: "),
+                theme.text(query.clone()),
+                theme.accent("▏"),
+            ],
+        )],
+        None => vec![
+            (
+                Some(match app.listing {
+                    Listing::Browse(_) => Command::Order,
+                    Listing::Search(_) => Command::Back,
+                }),
+                vec![theme.strong(app.listing.label())],
+            ),
+            (
+                None,
+                vec![theme.dim(format!("   {} series", app.series.items.len()))],
+            ),
+        ],
+    }
+}
+
+/// The three labels along the top right, in the order they are drawn, each with the
+/// command a click on it runs.
+fn settings(app: &App) -> Run {
+    let theme = &app.theme;
+    vec![
+        (
+            Some(Command::AudioLanguage),
+            vec![
+                theme.dim("audio "),
+                theme.accent(language_name(&app.audio()).to_owned()),
+            ],
+        ),
+        (None, vec![theme.dim("  ")]),
+        (
+            Some(Command::SubtitleLanguage),
+            vec![
+                theme.dim("subs "),
+                theme.accent(language_name(&app.subs()).to_owned()),
+            ],
+        ),
+        (None, vec![theme.dim("  ")]),
+        (
+            Some(Command::Quality),
+            vec![
+                theme.dim("video "),
+                theme.accent(app.options.video_quality.clone()),
+            ],
+        ),
+        (None, vec![theme.text(" ")]),
+    ]
+}
+
 fn header(app: &App) -> Paragraph<'static> {
     let theme = &app.theme;
-    let left = match &app.editing {
-        Some(query) => Line::from(vec![
-            theme.accent("Search: "),
-            theme.text(query.clone()),
-            theme.accent("▏"),
-        ]),
-        None => Line::from(vec![
-            theme.strong(app.listing.label()),
-            theme.dim(format!("   {} series", app.series.items.len())),
-        ]),
-    };
-    let right = Line::from(vec![
-        theme.dim("audio "),
-        theme.accent(language_name(&app.audio()).to_owned()),
-        theme.dim("  subs "),
-        theme.accent(language_name(&app.subs()).to_owned()),
-        theme.dim("  video "),
-        theme.accent(app.options.video_quality.clone()),
-        theme.text(" "),
-    ])
-    .right_aligned();
     let block = theme
         .bordered(false)
         .title(theme.title(" Crunchyroll "))
-        .title_top(right);
-    Paragraph::new(left).block(block)
+        .title_top(line(&settings(app)).right_aligned());
+    Paragraph::new(line(&listing(app))).block(block)
 }
 
 /// The panel under the columns: everything about the item the cursor is on that does
@@ -281,6 +355,9 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 
 /// The language list: every locale the selection offers, the one in use marked, and its
 /// code beside the name for anyone who thinks in locales rather than in languages.
+///
+/// Gives back the box it drew itself in, which is what tells a click whether it landed
+/// on the list or beside it.
 fn picker_overlay(
     frame: &mut Frame,
     area: Rect,
@@ -288,7 +365,7 @@ fn picker_overlay(
     keys: &Bindings,
     picker: &mut Picker,
     current: &str,
-) {
+) -> Rect {
     let column = picker
         .pane
         .items
@@ -344,6 +421,7 @@ fn picker_overlay(
         area,
         &mut picker.pane.state,
     );
+    area
 }
 
 /// What the help popup lists, and in what order. Commands that read as one line share a
@@ -391,21 +469,29 @@ const HELP: [(&[Command], &str); 17] = [
 ];
 
 /// The reminder along the bottom edge: the handful worth a permanent line, with one key
-/// each because there is no room for two.
-const FOOTER: [(&[Command], &str); 9] = [
-    (&[Command::Up, Command::Down], "move"),
-    (&[Command::Open], "open/play"),
-    (&[Command::Back], "back"),
-    (&[Command::Search], "search"),
-    (&[Command::Download], "download"),
+/// each because there is no room for two, and what a click on the words runs.
+///
+/// The command a click runs is written down rather than taken to be the first of the
+/// keys shown, because the two are not always the same thing: `move` names two keys, and
+/// a pointer that wants to move has a wheel already.
+const FOOTER: [(&[Command], &str, Option<Command>); 9] = [
+    (&[Command::Up, Command::Down], "move", None),
+    (&[Command::Open], "open/play", Some(Command::Open)),
+    (&[Command::Back], "back", Some(Command::Back)),
+    (&[Command::Search], "search", Some(Command::Search)),
+    (&[Command::Download], "download", Some(Command::Download)),
     (
         &[Command::AudioLanguage, Command::SubtitleLanguage],
         "language",
+        Some(Command::AudioLanguage),
     ),
-    (&[Command::Quality], "quality"),
-    (&[Command::Help], "keys"),
-    (&[Command::Quit], "quit"),
+    (&[Command::Quality], "quality", Some(Command::Quality)),
+    (&[Command::Help], "keys", Some(Command::Help)),
+    (&[Command::Quit], "quit", Some(Command::Quit)),
 ];
+
+/// What the hints along the bottom edge are held apart by.
+const FOOTER_GAP: &str = "   ";
 
 /// Every key the commands answer to: `↑ k / ↓ j`. A command that has been unbound
 /// contributes nothing rather than a gap.
@@ -486,7 +572,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
+    // Every word a pointer can land on, gathered as the frame is drawn rather than
+    // worked out again afterwards.
+    let mut buttons: Vec<(Command, Rect)> = Vec::new();
+
     frame.render_widget(header(app), top);
+    // The settings are a right-aligned title, so they sit on the border row itself,
+    // inside it and hard against the right edge; the listing label is the paragraph's
+    // own line, one row below. Both are reproduced here rather than guessed at, so that
+    // a word answers exactly where it was printed.
+    let bar = Rect {
+        x: top.x.saturating_add(1),
+        y: top.y,
+        width: top.width.saturating_sub(2),
+        height: top.height.min(1),
+    };
+    let labels = widths(&settings(app));
+    let wide: u16 = labels.iter().map(|(_, width)| width).sum();
+    let start = bar.right().saturating_sub(wide).max(bar.left());
+    buttons.extend(mouse::lay_out(bar, start, &labels));
+    buttons.extend(mouse::lay_out(
+        top.inner(Margin::new(1, 1)),
+        bar.left(),
+        &widths(&listing(app)),
+    ));
 
     // The poster takes a column off the left of the body and the three lists share what
     // is left, in the proportions they had the whole width in.
@@ -642,16 +751,37 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     frame.render_widget(Paragraph::new(line), status);
 
-    let reminder = FOOTER
+    // One walk over the table: the words that are drawn and the boxes that are clicked
+    // come out of the same list, so a hint unbound by the config leaves neither a gap in
+    // the line nor a box over nothing.
+    let hints: Vec<(Option<Command>, String)> = FOOTER
         .iter()
-        .map(|(commands, what)| format!("{} {what}", one_key(&app.keys, commands, "/")))
-        .filter(|hint| !hint.starts_with(' '))
+        .map(|(commands, what, click)| {
+            (
+                *click,
+                format!("{} {what}", one_key(&app.keys, commands, "/")),
+            )
+        })
+        .filter(|(_, hint)| !hint.starts_with(' '))
+        .collect();
+    let reminder = hints
+        .iter()
+        .map(|(_, hint)| hint.as_str())
         .collect::<Vec<_>>()
-        .join("   ");
+        .join(FOOTER_GAP);
     frame.render_widget(
         Paragraph::new(Line::from(theme.dim(format!(" {reminder}")))),
         keys,
     );
+    let mut words: Vec<(Option<Command>, u16)> = Vec::new();
+    for (command, hint) in &hints {
+        if !words.is_empty() {
+            words.push((None, cells(&[Span::raw(FOOTER_GAP)])));
+        }
+        words.push((*command, cells(&[Span::raw(hint.clone())])));
+    }
+    // The line is drawn one column in, which is where the run of words starts.
+    buttons.extend(mouse::lay_out(keys, keys.x.saturating_add(1), &words));
 
     if app.show_help {
         help_overlay(frame, area, &theme, &app.keys);
@@ -665,9 +795,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.subs()
         }
     });
+    let mut picked = Rect::default();
     if let (Some(current), Some(picker)) = (current, app.picker.as_mut()) {
-        picker_overlay(frame, area, &theme, &app.keys, picker, &current);
+        picked = picker_overlay(frame, area, &theme, &app.keys, picker, &current);
     }
+
+    // Everything a pointer can land on, as the frame about to be shown laid it out.
+    // Written last, when every borrow the drawing took is over - and read by the next
+    // event, which cannot arrive before this frame is on screen, because the loop draws
+    // and only then polls.
+    app.regions = Regions {
+        area,
+        series: left,
+        seasons: middle,
+        episodes: right,
+        picker: picked,
+        buttons,
+    };
 }
 
 #[cfg(test)]
@@ -677,21 +821,24 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::layout::{Rect, Size};
     use ratatui::style::Color;
+    use ratatui::text::Span;
 
     use image::{DynamicImage, Rgb, RgbImage};
 
     use crate::download::DownloadOptions;
     use crate::model::{Artwork, CatalogItem, Images, Season, SeasonEpisode, SeriesMetadata};
-    use crate::tui::app::{App, Focus};
+    use crate::tui::app::{Action, App, Focus};
     use crate::tui::art::Gallery;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
     use crate::tui::worker::Worker;
 
-    use super::{HELP, draw, duration, poster_width, thumbnail_width};
+    use super::{HELP, cells, draw, duration, poster_width, thumbnail_width};
 
     #[test]
     fn formats_a_running_time() {
@@ -1103,27 +1250,341 @@ mod tests {
     /// details or too narrow for the help popup still has to draw rather than panic.
     #[test]
     fn survives_a_cramped_terminal() {
+        /// A box nobody can see is worse than no box: a click would land on it and the
+        /// interface would answer for a word that was never printed.
+        fn every_box_is_on_screen(app: &App, width: u16, height: u16) {
+            let screen = Rect::new(0, 0, width, height);
+            for (command, area) in &app.regions.buttons {
+                assert!(
+                    !area.is_empty() && area.intersection(screen) == *area,
+                    "{} was given a box off the edge of a {width}x{height} screen",
+                    command.name()
+                );
+            }
+        }
+
         let mut illustrated = illustrated();
         for (width, height) in [(120, 14), (40, 10), (20, 6), (8, 4), (1, 1)] {
             let screen = rendered(width, height, &mut illustrated);
             assert!(!screen.is_empty());
+            every_box_is_on_screen(&illustrated, width, height);
         }
 
         let mut app = app();
         for (width, height) in [(120, 14), (40, 10), (20, 6), (8, 4)] {
             let screen = rendered(width, height, &mut app);
             assert!(!screen.is_empty());
+            every_box_is_on_screen(&app, width, height);
         }
         app.show_help = true;
         for (width, height) in [(120, 30), (20, 6), (8, 4)] {
             let screen = rendered(width, height, &mut app);
             assert!(!screen.is_empty());
+            every_box_is_on_screen(&app, width, height);
         }
         app.show_help = false;
         press(&mut app, KeyCode::Char('a'));
         for (width, height) in [(120, 30), (20, 6), (8, 4)] {
             let screen = rendered(width, height, &mut app);
             assert!(!screen.is_empty());
+            every_box_is_on_screen(&app, width, height);
         }
+    }
+
+    /// A pointer report, as crossterm hands one over.
+    fn pointer(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click(app: &mut App, x: u16, y: u16) -> Action {
+        app.on_mouse(pointer(MouseEventKind::Down(MouseButton::Left), x, y))
+    }
+
+    fn wheel(app: &mut App, x: u16, y: u16, down: bool) {
+        let kind = if down {
+            MouseEventKind::ScrollDown
+        } else {
+            MouseEventKind::ScrollUp
+        };
+        app.on_mouse(pointer(kind, x, y));
+    }
+
+    /// Where a word along an edge was drawn, by the command it runs.
+    fn button(app: &App, command: Command) -> Rect {
+        app.regions
+            .buttons
+            .iter()
+            .find(|(named, _)| *named == command)
+            .map_or_else(
+                || panic!("{} is not a word anyone can click", command.name()),
+                |(_, area)| *area,
+            )
+    }
+
+    /// The middle of a box, which is where a pointer lands on one.
+    fn middle(area: Rect) -> (u16, u16) {
+        (area.x + area.width / 2, area.y + area.height / 2)
+    }
+
+    /// The row of a column that holds the item `index` rows down its visible part.
+    fn row(area: Rect, index: u16) -> (u16, u16) {
+        (area.x + 1, area.y + 1 + index)
+    }
+
+    fn several_series(app: &mut App, count: usize) {
+        let one = app.series.items[0].clone();
+        app.series.set(
+            (0..count)
+                .map(|index| CatalogItem {
+                    id: format!("GY{index}"),
+                    title: format!("Series {index}"),
+                    ..one.clone()
+                })
+                .collect(),
+        );
+    }
+
+    fn several_episodes(app: &mut App, count: usize) {
+        let one = app.episodes.items[0].clone();
+        app.episodes.set(
+            (0..count)
+                .map(|index| SeasonEpisode {
+                    id: format!("E{index}"),
+                    episode: (index + 1).to_string(),
+                    episode_number: index as i32 + 1,
+                    ..one.clone()
+                })
+                .collect(),
+        );
+    }
+
+    /// The one thing a pure test of the arithmetic cannot catch: a word drawn in one
+    /// place and clicked in another. Every box is read back off the screen it was
+    /// written for. `日本語` is here on purpose - three characters, six columns - so a
+    /// width measured in bytes or in characters moves the box and fails this outright.
+    #[test]
+    fn a_word_answers_where_it_was_drawn() {
+        let mut app = app();
+        let buffer = buffer(120, 30, &mut app);
+        let word = |command| {
+            let area = button(&app, command);
+            // A character two columns wide is written into the first of them and the
+            // second is left blank, so reading a box back means stepping over what a
+            // wide character took rather than counting cells.
+            let mut text = String::new();
+            let mut x = area.x;
+            while x < area.right() {
+                let symbol = buffer[(x, area.y)].symbol();
+                text.push_str(symbol);
+                x += cells(&[Span::raw(symbol.to_owned())]).max(1);
+            }
+            text
+        };
+        assert_eq!(word(Command::AudioLanguage), "audio 日本語");
+        assert_eq!(word(Command::SubtitleLanguage), "subs English");
+        assert_eq!(word(Command::Quality), "video 1080p");
+        assert_eq!(word(Command::Order), "Popular");
+        assert_eq!(word(Command::Open), "⏎ open/play");
+        assert_eq!(word(Command::Download), "d download");
+        assert_eq!(word(Command::Quit), "q quit");
+    }
+
+    /// A click chooses, and only a click on what is already chosen opens. The first half
+    /// is what makes the second safe: there is no way to land in a column and play an
+    /// episode in one go.
+    #[test]
+    fn a_first_click_chooses_and_a_second_one_opens() {
+        let mut app = app();
+        several_episodes(&mut app, 4);
+        let _ = buffer(120, 30, &mut app);
+        let episodes = app.regions.episodes;
+
+        let (x, y) = row(episodes, 2);
+        assert!(matches!(click(&mut app, x, y), Action::None));
+        assert_eq!(app.focus, Focus::Episodes, "the click went to that column");
+        assert_eq!(app.episodes.state.selected(), Some(2));
+
+        // A different row is still only a choice, however many times it is clicked on
+        // the way past.
+        let (x, y) = row(episodes, 0);
+        assert!(matches!(click(&mut app, x, y), Action::None));
+        assert_eq!(app.episodes.state.selected(), Some(0));
+
+        match click(&mut app, x, y) {
+            Action::Play(episodes) => assert_eq!(episodes.len(), 1),
+            _ => panic!("a click on the chosen episode did not play it"),
+        }
+    }
+
+    /// Landing in a column that has something chosen already must not open it - which is
+    /// the whole of what keeps mpv from starting by surprise.
+    #[test]
+    fn a_click_into_another_column_never_opens_it() {
+        let mut app = app();
+        let _ = buffer(120, 30, &mut app);
+        assert_eq!(app.focus, Focus::Series);
+        assert_eq!(
+            app.episodes.state.selected(),
+            Some(0),
+            "a list that has arrived opens on its first item"
+        );
+
+        let (x, y) = row(app.regions.episodes, 0);
+        assert!(matches!(click(&mut app, x, y), Action::None));
+        assert_eq!(app.focus, Focus::Episodes);
+    }
+
+    /// A scrolled list draws its offset first, so the row under the pointer is not the
+    /// index it would have been at the top of the list.
+    #[test]
+    fn a_scrolled_column_is_hit_where_it_was_drawn() {
+        let mut app = app();
+        several_series(&mut app, 100);
+        press(&mut app, KeyCode::End);
+        let _ = buffer(120, 30, &mut app);
+        let offset = app.series.state.offset();
+        assert!(offset > 0, "the list never scrolled");
+
+        let (x, y) = row(app.regions.series, 0);
+        click(&mut app, x, y);
+        assert_eq!(app.series.state.selected(), Some(offset));
+    }
+
+    /// Looking down a column is not the same as going to work in it, so the wheel leaves
+    /// the keyboard where it was.
+    #[test]
+    fn the_wheel_moves_the_column_under_the_pointer() {
+        let mut app = app();
+        several_episodes(&mut app, 20);
+        let _ = buffer(120, 30, &mut app);
+
+        let (x, y) = middle(app.regions.episodes);
+        wheel(&mut app, x, y, true);
+        assert_eq!(app.episodes.state.selected(), Some(3));
+        assert_eq!(app.focus, Focus::Series, "the wheel took the keyboard away");
+        wheel(&mut app, x, y, false);
+        assert_eq!(app.episodes.state.selected(), Some(0));
+    }
+
+    /// An empty column draws one row that reads as a sentence rather than as an item, so
+    /// a click on it may move the keyboard and nothing else.
+    #[test]
+    fn a_click_on_what_an_empty_column_says_chooses_nothing() {
+        let mut app = app();
+        app.seasons.clear();
+        let _ = buffer(120, 30, &mut app);
+
+        let (x, y) = row(app.regions.seasons, 0);
+        click(&mut app, x, y);
+        assert_eq!(app.focus, Focus::Seasons);
+        assert_eq!(app.seasons.state.selected(), None);
+    }
+
+    /// The right button goes back out of the column it was pressed on, wherever the
+    /// keyboard happened to be.
+    #[test]
+    fn the_right_button_goes_back() {
+        let mut app = app();
+        let _ = buffer(120, 30, &mut app);
+        let (x, y) = middle(app.regions.episodes);
+        app.on_mouse(pointer(MouseEventKind::Down(MouseButton::Right), x, y));
+        assert_eq!(app.focus, Focus::Seasons);
+    }
+
+    /// The words along the edges do what their keys do - including after a config file
+    /// has moved those keys, which is what says the boxes follow the bindings rather
+    /// than a table of their own.
+    #[test]
+    fn clicking_a_word_does_what_its_key_does() {
+        let mut app = app();
+        let _ = buffer(120, 30, &mut app);
+
+        let (x, y) = middle(button(&app, Command::Quality));
+        click(&mut app, x, y);
+        assert_eq!(app.options.video_quality, "720p");
+
+        let (x, y) = middle(button(&app, Command::AudioLanguage));
+        click(&mut app, x, y);
+        assert!(app.picker.as_ref().is_some_and(|picker| picker.audio));
+
+        let (bindings, warnings) = toml::from_str::<keys::Settings>("quit = \"ctrl-q\"\n")
+            .expect("valid config")
+            .resolve();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut remapped = themed(Theme::default(), Gallery::detached(false));
+        remapped.keys = bindings;
+        let _ = buffer(120, 30, &mut remapped);
+        let (x, y) = middle(button(&remapped, Command::Quit));
+        assert!(matches!(click(&mut remapped, x, y), Action::Quit));
+    }
+
+    /// The popup is read and dismissed, so a click anywhere closes it - even one that
+    /// landed on a word that would otherwise have answered.
+    #[test]
+    fn a_click_closes_the_help_and_does_nothing_else() {
+        let mut app = app();
+        app.show_help = true;
+        let _ = buffer(120, 30, &mut app);
+        let (x, y) = middle(button(&app, Command::Quit));
+        assert!(matches!(click(&mut app, x, y), Action::None));
+        assert!(!app.show_help);
+        assert!(!app.quit, "the word under the popup answered anyway");
+    }
+
+    /// The search box owns the pointer as it owns the keyboard: a click is the way out
+    /// of it, and nothing else.
+    #[test]
+    fn a_click_closes_the_search_box() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('f'));
+        let _ = buffer(120, 30, &mut app);
+        let (x, y) = middle(app.regions.episodes);
+        click(&mut app, x, y);
+        assert!(app.editing.is_none());
+        assert_eq!(app.focus, Focus::Series, "the click reached a column");
+    }
+
+    /// The language list follows the columns' rule, and a click that misses it is how it
+    /// is cancelled - which is the only way out of it a pointer has.
+    #[test]
+    fn the_language_list_can_be_worked_by_pointer() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('a'));
+        let _ = buffer(120, 30, &mut app);
+        let popup = app.regions.picker;
+        assert!(!popup.is_empty(), "the list wrote down no box");
+
+        // The list is sorted, opens on ja-JP, and offers en-US, fr-FR and ja-JP.
+        let (x, y) = row(popup, 0);
+        click(&mut app, x, y);
+        assert_eq!(
+            app.audio(),
+            "ja-JP",
+            "one click on a locale is a choice, not an answer"
+        );
+        click(&mut app, x, y);
+        assert!(app.picker.is_none(), "choosing closes the list");
+        assert_eq!(app.audio(), "en-US");
+
+        press(&mut app, KeyCode::Char('a'));
+        let _ = buffer(120, 30, &mut app);
+        let (x, y) = middle(app.regions.episodes);
+        click(&mut app, x, y);
+        assert!(
+            app.picker.is_none(),
+            "a click beside the list did not cancel"
+        );
+        assert_eq!(app.audio(), "en-US");
+        assert_eq!(
+            app.focus,
+            Focus::Series,
+            "the click that cancelled the list went through to a column as well"
+        );
     }
 }
