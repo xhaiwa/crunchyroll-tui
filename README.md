@@ -2,6 +2,9 @@
 
 Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll episodes and seasons and creates MKV files.
 
+> [!NOTE]
+> You have to provide your own Widevine .wvd file or client_id.bin and private_key.pem
+
 ## Features
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
