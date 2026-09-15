@@ -4,6 +4,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 
 > [!NOTE]
 > You have to provide your own Widevine .wvd file or client_id.bin and private_key.pem
+> By the way, they're easy to find on some forums, etc.
 
 ## Features
 
