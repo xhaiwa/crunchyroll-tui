@@ -93,14 +93,14 @@ pub struct Defaults {
     pub mpv_args: Option<OneOrMany>,
 }
 
-/// `$XDG_CONFIG_HOME/crunchyroll-downloader/config.toml`, falling back to
-/// `~/.config/crunchyroll-downloader/config.toml`.
+/// `$XDG_CONFIG_HOME/crunchyroll-tui/config.toml`, falling back to
+/// `~/.config/crunchyroll-tui/config.toml`.
 pub fn path() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("crunchyroll-downloader").join("config.toml"))
+    Some(base.join("crunchyroll-tui").join("config.toml"))
 }
 
 /// Reads the config, and says what went wrong rather than stopping. A config file is a

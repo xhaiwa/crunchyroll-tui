@@ -1,5 +1,5 @@
 [package]
-name = "crunchyroll-downloader"
+name = "crunchyroll-tui"
 version = "0.1.0"
 edition = "2024"
 description = "Download Crunchyroll episodes to MKV"

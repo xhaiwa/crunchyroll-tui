@@ -351,9 +351,7 @@ mod tests {
     #[test]
     fn in_terminal_is_a_flag_that_can_still_be_turned_off() {
         let parse = |args: &[&str]| {
-            Cli::try_parse_from(
-                std::iter::once("crunchyroll-downloader").chain(args.iter().copied()),
-            )
+            Cli::try_parse_from(std::iter::once("crunchyroll-tui").chain(args.iter().copied()))
         };
         assert_eq!(
             parse(&["--tui", "--in-terminal"])
