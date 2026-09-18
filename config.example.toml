@@ -1,7 +1,7 @@
-# crunchyroll-downloader
+# crunchyroll-tui
 #
-# Copy this to ~/.config/crunchyroll-downloader/config.toml, or to
-# $XDG_CONFIG_HOME/crunchyroll-downloader/config.toml when that is set.
+# Copy this to ~/.config/crunchyroll-tui/config.toml, or to
+# $XDG_CONFIG_HOME/crunchyroll-tui/config.toml when that is set.
 #
 # Every value written out below is the one the program uses anyway, so copying
 # this file as it stands changes nothing: it is a list of what you can change,

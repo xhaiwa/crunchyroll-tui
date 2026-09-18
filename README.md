@@ -1,4 +1,4 @@
-# Crunchyroll Downloader (Rust)
+# Crunchyroll TUI (Rust)
 
 Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll episodes and seasons and creates MKV files.
 
@@ -41,7 +41,7 @@ Only download content you are authorized to access and comply with Crunchyroll's
 cargo build --release
 ```
 
-The binary is written to `target/release/crunchyroll-downloader`.
+The binary is written to `target/release/crunchyroll-tui`.
 
 ## Signing in
 
@@ -78,7 +78,7 @@ name = "gruvbox"
 ```
 
 `etp_rt = "..."` puts the cookie in the file instead, which is simpler and worth a
-`chmod 600 ~/.config/crunchyroll-downloader/config.toml` - a file other users can read is
+`chmod 600 ~/.config/crunchyroll-tui/config.toml` - a file other users can read is
 reported on startup. For a single shell session, the environment does as well, and keeps
 the value out of the history that the command line lands in:
 
@@ -309,8 +309,8 @@ Everything the interface can be told lives in one file, so a setup can go in a d
 repo and follow you to the next machine:
 
 ```
-$XDG_CONFIG_HOME/crunchyroll-downloader/config.toml
-~/.config/crunchyroll-downloader/config.toml     # when $XDG_CONFIG_HOME is not set
+$XDG_CONFIG_HOME/crunchyroll-tui/config.toml
+~/.config/crunchyroll-tui/config.toml     # when $XDG_CONFIG_HOME is not set
 ```
 
 Nothing in it is required, and not having one at all is the normal case. **The command
@@ -327,8 +327,8 @@ with every value at the one the program uses anyway - so copying it changes noth
 you can delete your way down to what you actually care about:
 
 ```shell
-mkdir -p ~/.config/crunchyroll-downloader
-cp config.example.toml ~/.config/crunchyroll-downloader/config.toml
+mkdir -p ~/.config/crunchyroll-tui
+cp config.example.toml ~/.config/crunchyroll-tui/config.toml
 ```
 
 A test parses it on every run of the suite and checks each value against the built-in
@@ -507,4 +507,3 @@ cargo clippy --all-targets -- -D warnings
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
-# crunchyroll-tui

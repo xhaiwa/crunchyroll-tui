@@ -469,7 +469,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "crunchyroll-downloader"
+name = "crunchyroll-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
