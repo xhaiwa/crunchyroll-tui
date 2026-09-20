@@ -199,7 +199,18 @@ pub struct App {
     pub show_help: bool,
     pub quit: bool,
     pub tick: usize,
+    /// Which browse order to come back to. The ring carries it along as it passes each
+    /// one, so leaving a search - which is not on the ring - returns to the order that
+    /// was last in use rather than to the top of the catalogue.
     sort: usize,
+    /// Whether the opening list has already given up on the history.
+    ///
+    /// The interface opens on Continue watching and falls back to the catalogue when
+    /// that comes back empty or fails, which is the first screen settling on something
+    /// worth looking at rather than a rule about the list. Asking for the history again
+    /// afterwards is a deliberate thing to do, and it then shows what it has - which is
+    /// also what stops the fallback from being something that could fire twice.
+    gave_up_on_history: bool,
 }
 
 impl App {
@@ -221,7 +232,11 @@ impl App {
             series: Pane::default(),
             seasons: Pane::default(),
             episodes: Pane::default(),
-            listing: Listing::Browse(0),
+            // The most useful first screen a video client has is the thing that was
+            // being watched last, so that is what the interface opens on. An account
+            // with no history, or a request that fails, falls back to the catalogue
+            // when the answer arrives.
+            listing: Listing::History,
             editing: None,
             picker: None,
             notice: None,
@@ -231,6 +246,7 @@ impl App {
             quit: false,
             tick: 0,
             sort: 0,
+            gave_up_on_history: false,
         };
         app.request_catalog();
         app
@@ -324,29 +340,56 @@ impl App {
         });
     }
 
+    /// A catalogue answer, and the one decision the opening screen still has to make.
+    ///
+    /// The interface asks for Continue watching first, which is the best thing to open
+    /// on right up until the account has never watched anything, or the request fails:
+    /// an empty column, or an error where the catalogue should be, is a worse first
+    /// screen than Popular. So this is where that is noticed - the only place the answer
+    /// is known - and the catalogue is asked for instead, once, with the status line
+    /// saying so, since a column showing a different list from the one that was asked
+    /// for has no business doing it quietly.
+    ///
+    /// Split out of [`App::drain`] so a test can hand the interface an answer without a
+    /// worker behind it.
+    fn catalog_arrived(&mut self, listing: Listing, result: Result<Vec<CatalogItem>, String>) {
+        if listing != self.listing {
+            return;
+        }
+        let nothing_to_show = result.as_ref().is_ok_and(Vec::is_empty) || result.is_err();
+        if listing == Listing::History && nothing_to_show && !self.gave_up_on_history {
+            self.gave_up_on_history = true;
+            self.sort = 0;
+            self.listing = Listing::Browse(self.sort);
+            self.request_catalog();
+            let instead = self.listing.label();
+            self.say(match result {
+                Ok(_) => format!("Nothing watched yet - showing {instead}."),
+                Err(error) => format!("Continue watching failed ({error}) - showing {instead}."),
+            });
+            return;
+        }
+        match result {
+            Ok(items) => {
+                let count = items.len();
+                self.series.set(items);
+                if count == 0 {
+                    self.say("No series found.");
+                }
+            }
+            Err(error) => {
+                self.series.loading = false;
+                self.series.error = Some(error.clone());
+                self.complain(error);
+            }
+        }
+    }
+
     /// Takes in whatever the worker has finished, and whatever the client wanted to say.
     pub fn drain(&mut self) {
         while let Some(response) = self.worker.try_recv() {
             match response {
-                Response::Catalog { listing, result } => {
-                    if listing != self.listing {
-                        continue;
-                    }
-                    match result {
-                        Ok(items) => {
-                            let count = items.len();
-                            self.series.set(items);
-                            if count == 0 {
-                                self.say("No series found.");
-                            }
-                        }
-                        Err(error) => {
-                            self.series.loading = false;
-                            self.series.error = Some(error.clone());
-                            self.complain(error);
-                        }
-                    }
-                }
+                Response::Catalog { listing, result } => self.catalog_arrived(listing, result),
                 Response::Seasons { series_id, result } => {
                     if series_id != self.seasons.owner {
                         continue;
@@ -519,14 +562,29 @@ impl App {
             self.complain("Open a season first.");
             return;
         };
+        let episode_id = episode.id.clone();
+        let label = episode_label(episode);
+        let seconds = if watched {
+            whole_seconds(episode.duration_ms)
+        } else {
+            0
+        };
+        // Marking watched is putting the playhead at the end of the episode, and an
+        // episode Crunchyroll gives no running time for has no end to put it at. A
+        // playhead of zero is exactly what unwatched means, so sending one here would do
+        // the opposite of what the key says - and quietly, since the account would come
+        // back saying the episode had never been touched. Better to say there is nothing
+        // to aim at.
+        if watched && seconds == 0 {
+            self.complain(format!(
+                "Crunchyroll gives no running time for {label}, so there is no end to mark it watched at."
+            ));
+            return;
+        }
         self.worker.send(Request::Playhead {
-            episode_id: episode.id.clone(),
-            label: episode_label(episode),
-            seconds: if watched {
-                whole_seconds(episode.duration_ms)
-            } else {
-                0
-            },
+            episode_id,
+            label,
+            seconds,
         });
     }
 
@@ -666,9 +724,17 @@ impl App {
         self.say(format!("Video quality: {quality}"));
     }
 
-    fn cycle_sort(&mut self) {
-        self.sort = (self.sort + 1) % super::SORTS.len();
-        self.listing = Listing::Browse(self.sort);
+    /// Moves the catalogue column on to the next list in the ring: the browse orders,
+    /// then the account's own lists, then round again.
+    ///
+    /// The browse order is remembered as the ring goes past it, so a search left with
+    /// `back` returns to the order that was last being browsed rather than to whichever
+    /// one the interface happened to start on.
+    fn cycle_source(&mut self) {
+        self.listing = self.listing.next();
+        if let Listing::Browse(sort) = self.listing {
+            self.sort = sort;
+        }
         self.request_catalog();
     }
 
@@ -825,7 +891,7 @@ impl App {
                 let message = self.art.toggle();
                 self.say(message);
             }
-            Command::Order => self.cycle_sort(),
+            Command::Order => self.cycle_source(),
             Command::Reload => self.reload(),
         }
         Action::None
@@ -1009,7 +1075,137 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pane, SeasonEpisode, episode_label, whole_seconds};
+    use std::sync::{Arc, Mutex};
+
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    use crate::download::DownloadOptions;
+    use crate::model::CatalogItem;
+    use crate::tui::art::Gallery;
+    use crate::tui::keys::{Bindings, Command};
+    use crate::tui::theme::Theme;
+    use crate::tui::worker::{Listing, Worker};
+
+    use super::{App, Pane, SeasonEpisode, episode_label, whole_seconds};
+
+    /// An interface with nothing behind it: the worker swallows every request and never
+    /// answers one, so the only answers it sees are those a test hands it directly.
+    fn app() -> App {
+        App::new(
+            Worker::detached(),
+            DownloadOptions {
+                audio_langs: vec!["ja-JP".to_owned()],
+                subtitles_langs: vec!["en-US".to_owned()],
+                cc_langs: Vec::new(),
+                video_quality: "1080p".to_owned(),
+                audio_quality: "192k".to_owned(),
+                play: false,
+                mpv_args: Vec::new(),
+            },
+            Theme::default(),
+            Bindings::default(),
+            Arc::new(Mutex::new(Vec::new())),
+            Gallery::detached(false),
+        )
+    }
+
+    fn series(id: &str) -> CatalogItem {
+        CatalogItem {
+            id: id.to_owned(),
+            kind: "series".to_owned(),
+            ..CatalogItem::default()
+        }
+    }
+
+    /// The interface opens on what was being watched last, and an account that has
+    /// watched nothing must not be shown an empty column as its first screen - that is
+    /// worse than the catalogue, which at least has something in it.
+    #[test]
+    fn an_empty_history_opens_the_catalogue_instead() {
+        let mut app = app();
+        assert_eq!(app.listing, Listing::History);
+
+        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        assert_eq!(app.listing, Listing::Browse(0));
+        assert!(app.series.loading, "the catalogue was asked for");
+        assert!(
+            app.notice.is_some(),
+            "the column is showing a list nobody asked for and said nothing about it"
+        );
+
+        // And the answer to that request is taken as the list it is.
+        app.catalog_arrived(Listing::Browse(0), Ok(vec![series("GY8VEQ95Y")]));
+        assert_eq!(app.listing, Listing::Browse(0));
+        assert_eq!(app.series.items.len(), 1);
+        assert!(!app.series.loading);
+    }
+
+    /// A history that cannot be fetched at all - an account Crunchyroll would not name,
+    /// or a request that failed - is the same problem: an error message is no way to
+    /// open. The error is still worth saying, since it is the only sign anything went
+    /// wrong, but it belongs on the status line rather than in the column.
+    #[test]
+    fn a_failed_history_opens_the_catalogue_instead() {
+        let mut app = app();
+        app.catalog_arrived(Listing::History, Err("no account id".to_owned()));
+        assert_eq!(app.listing, Listing::Browse(0));
+        assert_eq!(app.series.error, None, "the column kept the error");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("no account id")),
+            "the status line said nothing about why"
+        );
+    }
+
+    /// The fallback asks for a list from inside the answer to another one, which is the
+    /// shape a loop has. It fires once, for the first screen, and the history asked for
+    /// on purpose afterwards shows whatever it has - including nothing.
+    #[test]
+    fn the_fallback_happens_once() {
+        let mut app = app();
+        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        assert_eq!(app.listing, Listing::Browse(0));
+
+        // An empty catalogue is not a reason to go looking for another list.
+        app.catalog_arrived(Listing::Browse(0), Ok(Vec::new()));
+        assert_eq!(app.listing, Listing::Browse(0));
+
+        // Nor is the history, once it has been chosen deliberately.
+        while app.listing != Listing::History {
+            app.run(Command::Order);
+        }
+        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        assert_eq!(
+            app.listing,
+            Listing::History,
+            "the fallback fired a second time"
+        );
+    }
+
+    /// The order key walks one ring, and the browse order it leaves off at is where a
+    /// search comes back to - a search is not on the ring, so `back` out of one has to
+    /// return to something, and the order last in use is the only answer that does not
+    /// throw away what the user chose.
+    #[test]
+    fn leaving_a_search_returns_to_the_order_last_browsed() {
+        let mut app = app();
+        app.run(Command::Order);
+        assert_eq!(app.listing, Listing::Browse(0));
+        app.run(Command::Order);
+        app.run(Command::Order);
+        assert_eq!(app.listing, Listing::Browse(2));
+
+        app.editing = Some("frieren".to_owned());
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.listing, Listing::Search("frieren".to_owned()));
+
+        app.run(Command::Back);
+        assert_eq!(app.listing, Listing::Browse(2));
+        // And the ring carries on from there rather than starting over.
+        app.run(Command::Order);
+        assert_eq!(app.listing, Listing::Watchlist);
+    }
 
     /// The playhead that marks an episode watched is its own running time, and the
     /// endpoint counts in seconds while Crunchyroll answers in milliseconds. Getting the
@@ -1022,9 +1218,9 @@ mod tests {
         // The running time rarely divides evenly, and the fraction left over is not
         // worth a request that says 1462 seconds of a 1461-second episode.
         assert_eq!(whole_seconds(1_461_999), 1461);
-        // Crunchyroll sends no running time for some episodes, which is a playhead of
-        // zero - the one place this cannot put the playhead at the end, because there is
-        // no end to put it at.
+        // Crunchyroll sends no running time for some episodes, and there is no end to
+        // put a playhead at. `mark` refuses that rather than sending the zero, which
+        // would mean unwatched.
         assert_eq!(whole_seconds(0), 0);
         // And a nonsense duration is held at the last second there is rather than
         // wrapping round to a playhead near the start.

@@ -136,6 +136,11 @@ seasons and episodes, with playback and downloading on a key.
 cargo run --release -- --tui
 ```
 
+It opens on Continue watching - the series the account was last watching, newest
+first - since that is what a video client is usually wanted for. An account that has
+watched nothing, or a history Crunchyroll will not hand over, opens on the catalogue
+instead and says so on the status line.
+
 | Key | Action | What it does |
 | --- | --- | --- |
 | `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
@@ -145,7 +150,7 @@ cargo run --release -- --tui
 | `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns |
 | `/` | `search` | Search the catalogue. An empty search goes back to browsing |
-| `o` | `order` | Change the browse order: popular, recently added, A to Z |
+| `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
 | `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
 | `w` | `watchlist` | Put the selected series on the watchlist, or take it off if it is already there |
@@ -163,12 +168,21 @@ The Action column is the name the key is written under in the config file; see
 
 Every one of these can be moved somewhere else; see [Keys](#keys) below.
 
+`o` walks one ring: the three browse orders, then the watchlist of whatever account the
+`etp_rt` cookie belongs to, then Continue watching, which is that account's own history
+and the list the interface opens on. The watchlist holds only the series on it - a film
+there has no seasons behind it and would be a row that does nothing when opened. A search
+is not on that ring; it is left with `back` rather than cycled past, and leaving one comes
+back to the browse order that was in use when it started.
+
 `w` acts on the series the catalogue column has selected, whoever has the keyboard: the
 seasons and the episodes on screen are that series' own. `m` and `M` act on the episode
 under the cursor, and what they do is move its playhead - Crunchyroll counts an episode
 watched once the playhead has reached the end, so `m` puts it there and `M` puts it back
-to the start. All three go to Crunchyroll in the background and say what became of them
-on the status line: `Added Frieren to the watchlist`, `Marked E4 watched`.
+to the start. An episode Crunchyroll gives no running time for has no end to aim at, and
+`m` says so rather than sending a playhead of zero, which is what unwatched means. All
+three go to Crunchyroll in the background and say what became of them on the status line:
+`Added Frieren to the watchlist`, `Marked E4 watched`.
 
 The languages offered by `a` and `s` are the ones the selected season lists, falling back
 to the series, then to what was asked for on the command line, then to every locale
@@ -196,7 +210,7 @@ included.
 | Wheel | Scroll the column under the pointer, leaving the keyboard where it is |
 | Right click | Go back out of the column it was pressed on |
 | Click a word along an edge | What its key does: `open/play`, `back`, `search`, `download`, `language`, `quality`, `keys`, `quit`, and `audio`, `subs` and `video` at the top right |
-| Click the listing label | Change the browse order, or leave a search |
+| Click the listing label | Move on to the next list, or leave a search |
 | Click beside the language list | Cancel it, the way `esc` does |
 
 Opening takes a second click rather than a quick double click, so a slow hand and a slow
@@ -423,7 +437,7 @@ The commands, and the keys they answer to out of the box:
 | `back` | `left` `h` `esc` | Go back a column, and leave a search |
 | `next-column` | `tab` | Cycle the columns |
 | `search` | `/` | Search the catalogue |
-| `order` | `o` | Change the browse order |
+| `order` | `o` | Change the list the catalogue shows |
 | `reload` | `r` | Reload the current column |
 | `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
 | `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
