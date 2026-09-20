@@ -319,6 +319,17 @@ impl CrunchyrollClient {
         unreachable!()
     }
 
+    /// A request carrying a small JSON document, which is the shape every endpoint that
+    /// changes something about the account takes. The answer is handed back unchecked:
+    /// what counts as success differs between them - a 200 here, a 204 there - and each
+    /// caller can say what went wrong in its own words.
+    fn send_json(&self, method: Method, url: &str, body: &serde_json::Value) -> Result<Response> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let body = serde_json::to_vec(body).context("encode the request body")?;
+        self.send_authed(method, url, &headers, Some(&body))
+    }
+
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
         self.send_authed(Method::GET, url, &HeaderMap::new(), None)?
             .error_for_status()
@@ -476,6 +487,76 @@ impl CrunchyrollClient {
             found.extend(self.get_json::<ObjectsResponse>(&url)?.data);
         }
         Ok(in_asked_order(ids, found))
+    }
+
+    /// Whether the watchlist already holds this series.
+    ///
+    /// Nothing answers that as a yes or a no. Asking the watchlist about one series
+    /// comes back with the row it keeps for it, and with an empty list when it keeps
+    /// none, so the length of the list is the answer.
+    pub fn in_watchlist(&self, series_id: &str) -> Result<bool> {
+        let account_id = self.account_id()?;
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist/{series_id}?locale=en-US"
+        );
+        /// The row itself is never looked at, only counted, so nothing is built out of
+        /// it - a shape that changes on Crunchyroll's side cannot break a question this
+        /// narrow.
+        #[derive(Deserialize)]
+        struct WatchlistRows {
+            #[serde(default)]
+            data: Vec<serde::de::IgnoredAny>,
+        }
+        Ok(!self.get_json::<WatchlistRows>(&url)?.data.is_empty())
+    }
+
+    /// Puts the series on the watchlist. One half of a toggle rather than a way of
+    /// making sure, so the caller is expected to have asked whether it is there already.
+    pub fn watchlist_add(&self, series_id: &str) -> Result<()> {
+        let account_id = self.account_id()?;
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist?locale=en-US"
+        );
+        self.send_json(
+            Method::POST,
+            &url,
+            &serde_json::json!({ "content_id": series_id }),
+        )?
+        .error_for_status()
+        .context("put the series on the watchlist")?;
+        Ok(())
+    }
+
+    /// Takes the series off the watchlist again.
+    pub fn watchlist_remove(&self, series_id: &str) -> Result<()> {
+        let account_id = self.account_id()?;
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist/{series_id}?locale=en-US"
+        );
+        self.send_authed(Method::DELETE, &url, &HeaderMap::new(), None)?
+            .error_for_status()
+            .context("take the series off the watchlist")?;
+        Ok(())
+    }
+
+    /// Moves one episode's playhead, in whole seconds from the start.
+    ///
+    /// This is also how an episode is marked watched, which the name of the endpoint
+    /// gives no hint of: Crunchyroll keeps no flag for it and counts an episode watched
+    /// once its playhead has reached the end. So marking one watched is putting the
+    /// playhead at the episode's running time, and marking it unwatched is putting the
+    /// playhead back to zero - the same request either way.
+    pub fn set_playhead(&self, content_id: &str, seconds: u32) -> Result<()> {
+        let account_id = self.account_id()?;
+        let url = format!("https://www.crunchyroll.com/content/v2/{account_id}/playheads");
+        self.send_json(
+            Method::POST,
+            &url,
+            &serde_json::json!({ "content_id": content_id, "playhead": seconds }),
+        )?
+        .error_for_status()
+        .context("move the episode's playhead")?;
+        Ok(())
     }
 
     pub fn manifest(&self, url: &str) -> Result<Vec<u8>> {
