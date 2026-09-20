@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ratatui::crossterm::event::{
@@ -7,7 +8,7 @@ use ratatui::layout::Position;
 use ratatui::widgets::ListState;
 
 use crate::download::DownloadOptions;
-use crate::model::{CatalogItem, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
@@ -186,6 +187,11 @@ pub struct App {
     pub series: Pane<CatalogItem>,
     pub seasons: Pane<Season>,
     pub episodes: Pane<SeasonEpisode>,
+    /// How far the account has got into each episode of the open season, by content id.
+    /// It arrives after the episodes do and belongs to them, so it is emptied whenever
+    /// they are: a marker held over from the last season would be painted onto whichever
+    /// episode of this one happened to share an id, which is none of them.
+    pub playheads: HashMap<String, Playhead>,
     pub listing: Listing,
     /// The search box while it is being typed into.
     pub editing: Option<String>,
@@ -232,6 +238,7 @@ impl App {
             series: Pane::default(),
             seasons: Pane::default(),
             episodes: Pane::default(),
+            playheads: HashMap::new(),
             // The most useful first screen a video client has is the thing that was
             // being watched last, so that is what the interface opens on. An account
             // with no history, or a request that fails, falls back to the catalogue
@@ -298,10 +305,16 @@ impl App {
         self.worker.sent()
     }
 
+    /// Empties the episodes column and everything drawn alongside it.
+    fn clear_episodes(&mut self) {
+        self.episodes.clear();
+        self.playheads.clear();
+    }
+
     fn request_catalog(&mut self) {
         self.series.clear();
         self.seasons.clear();
-        self.episodes.clear();
+        self.clear_episodes();
         self.series.loading = true;
         self.focus = Focus::Series;
         self.worker.send(Request::Catalog(self.listing.clone()));
@@ -313,7 +326,7 @@ impl App {
         };
         let series_id = series.id.clone();
         self.seasons.clear();
-        self.episodes.clear();
+        self.clear_episodes();
         self.seasons.loading = true;
         self.seasons.owner = series_id.clone();
         self.focus = Focus::Seasons;
@@ -329,7 +342,7 @@ impl App {
             return;
         };
         let season_id = season.id.clone();
-        self.episodes.clear();
+        self.clear_episodes();
         self.episodes.loading = true;
         self.episodes.owner = season_id.clone();
         self.focus = Focus::Episodes;
@@ -388,42 +401,7 @@ impl App {
     /// Takes in whatever the worker has finished, and whatever the client wanted to say.
     pub fn drain(&mut self) {
         while let Some(response) = self.worker.try_recv() {
-            match response {
-                Response::Catalog { listing, result } => self.catalog_arrived(listing, result),
-                Response::Seasons { series_id, result } => {
-                    if series_id != self.seasons.owner {
-                        continue;
-                    }
-                    match result {
-                        Ok(items) => self.seasons.set(items),
-                        Err(error) => {
-                            self.seasons.loading = false;
-                            self.seasons.error = Some(error.clone());
-                            self.complain(error);
-                        }
-                    }
-                }
-                Response::Episodes { season_id, result } => {
-                    if season_id != self.episodes.owner {
-                        continue;
-                    }
-                    match result {
-                        Ok(items) => self.episodes.set(items),
-                        Err(error) => {
-                            self.episodes.loading = false;
-                            self.episodes.error = Some(error.clone());
-                            self.complain(error);
-                        }
-                    }
-                }
-                // Nothing on screen is redrawn by this - the watchlist and the history
-                // are not among the three columns - so the sentence is the whole of it,
-                // and it is shown whether the cursor has moved on since or not.
-                Response::Account { result } => match result {
-                    Ok(message) => self.say(message),
-                    Err(error) => self.complain(error),
-                },
-            }
+            self.accept(response);
         }
         self.art.drain();
         let pending: Vec<String> = self
@@ -434,6 +412,74 @@ impl App {
             .collect();
         if let Some(last) = pending.into_iter().next_back() {
             self.say(last);
+        }
+    }
+
+    /// One answer from the worker, checked against what the interface is showing now.
+    ///
+    /// Split out from `drain` so that a test can hand an answer straight over: a request
+    /// that came back for a column the user has since left is the whole point of the
+    /// owner on each pane, and it is not something a detached worker can be made to
+    /// produce.
+    pub fn accept(&mut self, response: Response) {
+        match response {
+            Response::Catalog { listing, result } => self.catalog_arrived(listing, result),
+            Response::Seasons { series_id, result } => {
+                if series_id != self.seasons.owner {
+                    return;
+                }
+                match result {
+                    Ok(items) => self.seasons.set(items),
+                    Err(error) => {
+                        self.seasons.loading = false;
+                        self.seasons.error = Some(error.clone());
+                        self.complain(error);
+                    }
+                }
+            }
+            Response::Episodes { season_id, result } => {
+                if season_id != self.episodes.owner {
+                    return;
+                }
+                match result {
+                    Ok(items) => {
+                        let episode_ids = items.iter().map(|episode| episode.id.clone()).collect();
+                        self.episodes.set(items);
+                        // Now rather than when the season was asked for: these are the
+                        // ids the answer actually brought back.
+                        self.worker.send(Request::Playheads {
+                            season_id,
+                            episode_ids,
+                        });
+                    }
+                    Err(error) => {
+                        self.episodes.loading = false;
+                        self.episodes.error = Some(error.clone());
+                        self.complain(error);
+                    }
+                }
+            }
+            Response::Playheads { season_id, result } => {
+                if season_id != self.episodes.owner {
+                    return;
+                }
+                // A marker that does not arrive is a row drawn the way it was drawn
+                // before any of this, which is no reason to put an error where the user
+                // is reading episode titles.
+                if let Ok(playheads) = result {
+                    self.playheads = playheads
+                        .into_iter()
+                        .map(|playhead| (playhead.content_id.clone(), playhead))
+                        .collect();
+                }
+            }
+            // Nothing on screen is redrawn by this - the watchlist and the history are
+            // not among the three columns - so the sentence is the whole of it, and it
+            // is shown whether the cursor has moved on since or not.
+            Response::Account { result } => match result {
+                Ok(message) => self.say(message),
+                Err(error) => self.complain(error),
+            },
         }
     }
 
@@ -1101,6 +1147,8 @@ mod tests {
                 audio_quality: "192k".to_owned(),
                 play: false,
                 mpv_args: Vec::new(),
+                start_at: None,
+                playhead: None,
             },
             Theme::default(),
             Bindings::default(),

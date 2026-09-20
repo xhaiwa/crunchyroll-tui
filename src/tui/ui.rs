@@ -4,7 +4,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
-use crate::model::{CatalogItem, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
+use crate::play::resume_at;
 use crate::util::language_name;
 
 use super::app::{App, Focus, Picker};
@@ -96,14 +97,32 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
     ListItem::new(Line::from(spans))
 }
 
-fn episode_row(theme: &Theme, episode: &SeasonEpisode) -> ListItem<'static> {
+/// One episode: its number, what the account has already made of it, and its title.
+///
+/// The marker takes the running time's place rather than a column of its own. The three
+/// lists are already fighting for room on a narrow terminal, and a title pushed off the
+/// right edge is a worse loss than a running time - which for an episode left partway
+/// through is the less interesting of the two anyway, since where to pick it up says more
+/// than how long it lasts. It is the same rule playing uses, so a row showing a time is a
+/// row mpv opens at that time, and a check is an episode it would start from the top.
+fn episode_row(
+    theme: &Theme,
+    episode: &SeasonEpisode,
+    playhead: Option<&Playhead>,
+) -> ListItem<'static> {
     let number = if episode.episode.is_empty() {
         episode.episode_number.to_string()
     } else {
         episode.episode.clone()
     };
     let mut spans = vec![theme.accent(format!("E{number:<3}"))];
-    if episode.duration_ms > 0 {
+    let resume =
+        playhead.and_then(|seen| resume_at(seen.playhead, episode.duration_ms, seen.fully_watched));
+    if let Some(seconds) = resume {
+        spans.push(theme.accent(format!("{:>6}  ", duration(u64::from(seconds) * 1000))));
+    } else if playhead.is_some_and(|seen| seen.fully_watched) {
+        spans.push(theme.dim(format!("{:>6}  ", "✓")));
+    } else if episode.duration_ms > 0 {
         spans.push(theme.dim(format!("{:>6}  ", duration(episode.duration_ms))));
     }
     spans.push(theme.text(episode.title.clone()));
@@ -708,7 +727,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.episodes
             .items
             .iter()
-            .map(|episode| episode_row(&theme, episode))
+            .map(|episode| episode_row(&theme, episode, app.playheads.get(&episode.id)))
             .collect()
     };
     let focused = focus == Focus::Episodes;
@@ -839,12 +858,14 @@ mod tests {
     use image::{DynamicImage, Rgb, RgbImage};
 
     use crate::download::DownloadOptions;
-    use crate::model::{Artwork, CatalogItem, Images, Season, SeasonEpisode, SeriesMetadata};
+    use crate::model::{
+        Artwork, CatalogItem, Images, Playhead, Season, SeasonEpisode, SeriesMetadata,
+    };
     use crate::tui::app::{Action, App, Focus};
     use crate::tui::art::Gallery;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
-    use crate::tui::worker::{Listing, Request, Worker};
+    use crate::tui::worker::{Listing, Request, Response, Worker};
 
     use super::{HELP, cells, draw, duration, poster_width, thumbnail_width};
 
@@ -899,6 +920,8 @@ mod tests {
             audio_quality: "192k".to_owned(),
             play: false,
             mpv_args: Vec::new(),
+            start_at: None,
+            playhead: None,
         };
         let mut app = App::new(
             Worker::detached(),
@@ -932,20 +955,40 @@ mod tests {
             audio_locales: vec!["ja-JP".to_owned(), "en-US".to_owned(), "fr-FR".to_owned()],
             subtitle_locales: vec!["en-US".to_owned(), "fr-FR".to_owned()],
         }]);
-        app.episodes.set(vec![SeasonEpisode {
-            id: "E1".to_owned(),
-            episode: "1".to_owned(),
-            episode_number: 1,
-            season_number: 1,
-            title: "The Journey Ends".to_owned(),
-            duration_ms: 1_461_000,
-            images: Images {
-                thumbnail: artwork(STILL, 320),
-                ..Images::default()
+        app.episodes.set(vec![
+            SeasonEpisode {
+                id: "E1".to_owned(),
+                episode: "1".to_owned(),
+                episode_number: 1,
+                season_number: 1,
+                title: "The Journey Ends".to_owned(),
+                duration_ms: 1_461_000,
+                images: Images {
+                    thumbnail: artwork(STILL, 320),
+                    ..Images::default()
+                },
+                ..SeasonEpisode::default()
             },
-            ..SeasonEpisode::default()
-        }]);
+            SeasonEpisode {
+                id: "E2".to_owned(),
+                episode: "2".to_owned(),
+                episode_number: 2,
+                season_number: 1,
+                title: "The Priest's Lie".to_owned(),
+                duration_ms: 1_420_000,
+                ..SeasonEpisode::default()
+            },
+        ]);
         app
+    }
+
+    /// What the playheads endpoint has to say about one episode.
+    fn playhead(content_id: &str, seconds: u32, fully_watched: bool) -> Playhead {
+        Playhead {
+            content_id: content_id.to_owned(),
+            playhead: seconds,
+            fully_watched,
+        }
     }
 
     fn buffer(width: u16, height: u16, app: &mut App) -> Buffer {
@@ -1432,6 +1475,70 @@ mod tests {
         assert_eq!(thumbnail_width(Rect::new(1, 20, 118, 7), cell, false), 0);
         assert_eq!(thumbnail_width(Rect::new(1, 20, 60, 7), cell, true), 20);
         assert_eq!(thumbnail_width(Rect::new(1, 20, 20, 7), cell, true), 0);
+    }
+
+    /// An episode half watched on the phone is the one thing worth knowing while looking
+    /// down a season, and it has to be readable without counting columns: the time a row
+    /// shows is the time playing it would open at, and a check is an episode with nothing
+    /// left to go back to.
+    #[test]
+    fn says_where_an_episode_was_left_off() {
+        let mut app = app();
+        app.playheads = [
+            ("E1".to_owned(), playhead("E1", 842, false)),
+            ("E2".to_owned(), playhead("E2", 1_410, true)),
+        ]
+        .into_iter()
+        .collect();
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("14:02"), "the position to resume E1 from");
+        assert!(screen.contains("\u{2713}"), "E2 has been watched");
+        assert!(
+            !screen.contains("24:21"),
+            "the marker takes the running time's place rather than a column of its own"
+        );
+
+        // A position in the opening seconds is not a place to be sent back to, and the
+        // row says exactly what playing it would do: nothing.
+        app.playheads = [("E1".to_owned(), playhead("E1", 8, false))]
+            .into_iter()
+            .collect();
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("24:21"), "so the running time is back");
+    }
+
+    /// An answer is only worth painting onto the column it was asked about. The lists are
+    /// fetched one after another and a slow one comes back after the user has moved on,
+    /// so an answer for a season that is no longer open has to be dropped rather than
+    /// marking whichever rows happen to be there now.
+    #[test]
+    fn a_playhead_for_a_season_nobody_is_looking_at_is_dropped() {
+        let mut app = app();
+        app.episodes.owner = "S1".to_owned();
+        app.accept(Response::Playheads {
+            season_id: "S2".to_owned(),
+            result: Ok(vec![playhead("E1", 842, false)]),
+        });
+        assert!(
+            app.playheads.is_empty(),
+            "a season the user has left painted this one's rows"
+        );
+
+        app.accept(Response::Playheads {
+            season_id: "S1".to_owned(),
+            result: Ok(vec![playhead("E1", 842, false)]),
+        });
+        assert_eq!(app.playheads.len(), 1);
+        assert!(rendered(120, 30, &mut app).contains("14:02"));
+
+        // And an answer that never came is a column drawn the way it always was, rather
+        // than an error in front of the episode titles.
+        app.accept(Response::Playheads {
+            season_id: "S1".to_owned(),
+            result: Err("Crunchyroll said no".to_owned()),
+        });
+        assert!(app.notice.is_none());
+        assert_eq!(app.playheads.len(), 1, "and nothing was thrown away");
     }
 
     /// Every panel is optional except the columns, so a terminal too short for the

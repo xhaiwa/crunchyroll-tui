@@ -23,7 +23,7 @@ use crate::manifest::{
 };
 use crate::model::{Episode, EpisodeInfo, EpisodeMetadata, SeasonEpisode, Subtitle};
 use crate::output::{MediaTrack, merge_everything};
-use crate::play::{LivePipes, play};
+use crate::play::{LivePipes, Playback, play, resume_at};
 use crate::progress::ProgressBar;
 use crate::util::{language_name, sanitize_filename};
 
@@ -93,7 +93,7 @@ impl Drop for Permit<'_> {
 static SEGMENT_REQUESTS: Semaphore = Semaphore::new(MAX_CONCURRENT_REQUESTS);
 static SESSION_OPENS: Semaphore = Semaphore::new(MAX_CONCURRENT_SESSION_OPENS);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DownloadOptions {
     pub audio_langs: Vec<String>,
     pub subtitles_langs: Vec<String>,
@@ -103,6 +103,76 @@ pub struct DownloadOptions {
     /// Play the episode with mpv as it arrives instead of writing an MKV.
     pub play: bool,
     pub mpv_args: Vec<String>,
+    /// Seconds into the episode to open mpv at, where the account left off watching it
+    /// somewhere else. It only means anything on a run that plays: a download has no
+    /// starting point to speak of and writes the episode whole either way.
+    pub start_at: Option<u32>,
+    /// Where the position mpv is at goes while it plays, so the account stays in step
+    /// with the phone and the web player. `None` on a run with nobody to tell.
+    pub playhead: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+}
+
+/// Written out rather than derived, because a boxed callback is not something that can be
+/// printed and the most that can honestly be said of one is whether it is there at all.
+impl fmt::Debug for DownloadOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DownloadOptions")
+            .field("audio_langs", &self.audio_langs)
+            .field("subtitles_langs", &self.subtitles_langs)
+            .field("cc_langs", &self.cc_langs)
+            .field("video_quality", &self.video_quality)
+            .field("audio_quality", &self.audio_quality)
+            .field("play", &self.play)
+            .field("mpv_args", &self.mpv_args)
+            .field("start_at", &self.start_at)
+            .field("playhead", &self.playhead.as_ref().map(|_| "set"))
+            .finish()
+    }
+}
+
+/// The options one episode is played with: where to pick it up from, and who to tell
+/// about the position it reaches.
+///
+/// Built again for every episode rather than once for the run, because both halves of it
+/// are about one episode in particular. The callback carries the content id it reports
+/// under, and the starting point is read immediately before mpv opens so that it is where
+/// the account actually is rather than where a list said it was ten minutes ago.
+///
+/// A playhead that cannot be read costs the resume and nothing else. It says where an
+/// episode might start, and a login gone stale or an endpoint having a bad afternoon is
+/// no reason to refuse to play something that is otherwise ready to go.
+pub fn playing_options(
+    client: &CrunchyrollClient,
+    options: &DownloadOptions,
+    content_id: &str,
+    duration_ms: u64,
+) -> DownloadOptions {
+    let start_at = client
+        .playheads(&[content_id.to_owned()])
+        .ok()
+        .and_then(|playheads| {
+            playheads
+                .into_iter()
+                .find(|playhead| playhead.content_id == content_id)
+        })
+        .and_then(|playhead| resume_at(playhead.playhead, duration_ms, playhead.fully_watched));
+    let reporter = client.clone();
+    let reported = content_id.to_owned();
+    DownloadOptions {
+        start_at,
+        playhead: Some(Arc::new(move |seconds| {
+            // Nothing about the account is worth interrupting a video for, so a report
+            // that fails goes where the client's own commentary goes and is let go of
+            // there.
+            if let Err(error) = reporter.set_playhead(&reported, seconds) {
+                reporter.notice(&format!(
+                    "Could not report the playback position: {error:#}"
+                ));
+            }
+        })),
+        ..options.clone()
+    }
 }
 
 /// Makes an empty file in `dir` for the run to work in.
@@ -1094,7 +1164,12 @@ fn play_media(
                 .split_first()
                 .expect("the video always occupies the first slot");
             println!("Buffering, mpv will open shortly...");
-            if let Err(error) = play(&pipes, video, audio, subtitles, info, &options.mpv_args) {
+            let playback = Playback {
+                mpv_args: &options.mpv_args,
+                start_at: options.start_at,
+                playhead: options.playhead.as_deref(),
+            };
+            if let Err(error) = play(&pipes, video, audio, subtitles, info, &playback) {
                 first_error = Some(error);
             }
         }
@@ -1367,7 +1442,18 @@ pub fn download_season(
     );
     for episode in episodes {
         let info = episode_info(episode);
-        if let Err(error) = download_episode(client, &episode.id, &info, options) {
+        // Resuming and reporting are both about one episode, so a run that plays builds
+        // its options again for each of them. A run that writes MKVs wants neither and
+        // asks Crunchyroll about neither.
+        let episode_options = options
+            .play
+            .then(|| playing_options(client, options, &episode.id, episode.duration_ms));
+        if let Err(error) = download_episode(
+            client,
+            &episode.id,
+            &info,
+            episode_options.as_ref().unwrap_or(options),
+        ) {
             eprintln!(
                 "Failed to download episode {}: {error:#}",
                 episode.episode_number

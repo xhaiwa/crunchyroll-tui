@@ -14,6 +14,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Playback with mpv while the stream downloads, instead of writing a file
+- Resume where you left off, and the position written back to your account while you watch, so this client, the phone and the web player stay in step
 - `--in-terminal`: the video drawn in the terminal itself, protocol and mpv options worked out for you
 - Selectable video and audio quality
 - Widevine support with either a `.wvd` file or `client_id.bin` plus `private_key.pem`
@@ -197,6 +198,12 @@ interface starts with.
 Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
 same with the progress bars.
 
+The Episodes column says what your account has already made of each one: a check for an
+episode you have finished, and the time to pick it up from for one you left partway
+through - which is where playing it opens. The marker takes the running time's place
+rather than a column of its own, so the titles stay where they are on a narrow terminal.
+See [Picking up where you left off](#picking-up-where-you-left-off).
+
 #### With a mouse
 
 The interface answers the mouse, and a mouse alone is enough to drive it - quitting
@@ -274,6 +281,26 @@ cargo run --release -- --url EPISODE_URL --play \
 ```
 
 A series or `--file` URL plays its episodes one after another: quitting mpv moves on to the next.
+
+#### Picking up where you left off
+
+Before an episode plays, Crunchyroll is asked where the account left off in it, and mpv
+opens there. While it plays the position goes back every fifteen seconds, and once more
+when mpv quits, so the phone and the web player carry on from where you stopped - and so
+does this, next time around. Both ends of an episode are exceptions: one you are less than
+thirty seconds into starts at the beginning, one you are within thirty seconds of the end
+of has nothing left to resume, and one Crunchyroll has marked as watched is left alone
+whatever its position says.
+
+Resuming is not instant. The stream is a named pipe and cannot be seeked, so `--start=` is
+a forward seek mpv serves by reading through its demuxer cache. It lands in the right
+place, but a long jump has the whole of the episode up to that point to read through
+first, at the speed the segments come down. Dropping those segments at the source is what
+would make it instant, and that is a larger change than this one - it reaches into the
+DASH segment loop and the decryption path either side of it.
+
+A position that cannot be read costs the resume and nothing else, and one that cannot be
+reported is not worth interrupting a video for: either way the episode plays.
 
 Notes:
 
