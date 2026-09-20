@@ -47,6 +47,11 @@ const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// Which account the token was issued for. Every endpoint that knows anything about
+    /// the person logged in - the watchlist, the history, the playheads - is addressed
+    /// by it rather than by the token alone.
+    #[serde(default)]
+    account_id: String,
 }
 
 #[derive(Clone)]
@@ -56,6 +61,10 @@ pub struct CrunchyrollClient {
     device_id: String,
     etp_rt: Secret,
     access_token: Arc<RwLock<String>>,
+    /// Refreshed alongside the token, because it comes with it and because a token
+    /// re-issued for another account would otherwise leave this one pointing at the
+    /// wrong watchlist.
+    account_id: Arc<RwLock<String>>,
     refresh_lock: Arc<Mutex<()>>,
     /// Where the running commentary goes. It is printed by default, but the TUI owns
     /// the terminal and needs to collect it instead of having it drawn over the frame.
@@ -87,6 +96,32 @@ fn build_media_client(stall: Duration) -> Result<Client> {
         .context("build media HTTP client")
 }
 
+/// The account named in an access token's claims.
+///
+/// The token is a JWT: three base64url segments separated by dots, the middle one a JSON
+/// object. Nothing here verifies the signature, and nothing should - the token was just
+/// handed over by the server that signed it, over TLS, and is about to be handed
+/// straight back. This only reads a value out of something already trusted, so a token
+/// in any shape other than the expected one is `None` rather than an error.
+fn account_id_from_jwt(token: &str) -> Option<String> {
+    use base64::Engine;
+
+    let claims = token.split('.').nth(1)?;
+    // JWT segments are base64url with the padding stripped, but a `=` or two on the end
+    // is common enough in the wild that it costs nothing to accept them.
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    // `account_id` where the token carries one, and `sub` otherwise: the subject of a
+    // token issued against an etp_rt cookie is the account it was issued for.
+    ["account_id", "sub"]
+        .into_iter()
+        .filter_map(|claim| claims.get(claim)?.as_str())
+        .find(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 impl CrunchyrollClient {
     pub fn new(etp_rt: Secret, debug: bool) -> Result<Self> {
         let client = Self {
@@ -95,6 +130,7 @@ impl CrunchyrollClient {
             device_id: Uuid::new_v4().to_string(),
             etp_rt,
             access_token: Arc::new(RwLock::new(String::new())),
+            account_id: Arc::new(RwLock::new(String::new())),
             refresh_lock: Arc::new(Mutex::new(())),
             notice: Arc::new(|message| println!("{message}")),
             debug,
@@ -151,8 +187,40 @@ impl CrunchyrollClient {
         if token.access_token.is_empty() {
             bail!("Crunchyroll returned an empty access token");
         }
+        // The field is not always there - the shape of this response has changed before
+        // and may again - but the token itself is a JWT that names the account in its
+        // claims, so there is a second place to look before giving up on it.
+        let account_id = if token.account_id.is_empty() {
+            account_id_from_jwt(&token.access_token).unwrap_or_default()
+        } else {
+            token.account_id
+        };
         *self.access_token.write().expect("token lock poisoned") = token.access_token;
+        *self.account_id.write().expect("account lock poisoned") = account_id;
         Ok(())
+    }
+
+    /// Which account this client is logged in as.
+    ///
+    /// An error rather than an empty string: the endpoints that need it put it in the
+    /// path, and one built around an empty id asks about an account that does not exist
+    /// and comes back with a 404 that says nothing about why.
+    // Nothing calls this yet. It is the piece every account endpoint is addressed by,
+    // and it lands first so the watchlist, the history and the playheads each arrive as
+    // the feature they are rather than dragging their own copy of the login with them.
+    #[allow(dead_code)]
+    pub fn account_id(&self) -> Result<String> {
+        let account_id = self
+            .account_id
+            .read()
+            .expect("account lock poisoned")
+            .clone();
+        if account_id.is_empty() {
+            bail!(
+                "Crunchyroll did not say which account this token belongs to, so the watchlist, the history and the playheads cannot be asked for."
+            );
+        }
+        Ok(account_id)
     }
 
     fn send_authed(
@@ -378,7 +446,56 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use super::{Duration, build_media_client};
+    use super::{Duration, account_id_from_jwt, build_media_client};
+
+    /// A JWT with `claims` as its payload, signed by nobody: the segments are what is
+    /// read here, and a signature this code never checks is not worth faking.
+    fn jwt(claims: &str) -> String {
+        use base64::Engine;
+        format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims)
+        )
+    }
+
+    /// The token response is meant to name the account, but the shape of it has changed
+    /// before, and the token itself says the same thing in its claims.
+    #[test]
+    fn reads_the_account_out_of_a_token() {
+        assert_eq!(
+            account_id_from_jwt(&jwt(r#"{"sub":"a1b2c3"}"#)).as_deref(),
+            Some("a1b2c3")
+        );
+        assert_eq!(
+            account_id_from_jwt(&jwt(r#"{"account_id":"a1b2c3","sub":"benefit-user"}"#)).as_deref(),
+            Some("a1b2c3"),
+            "the account the token names beats the subject it was issued to"
+        );
+        // Padding is not part of a JWT segment, but a `=` on the end is common enough
+        // in the wild to be worth taking.
+        let padded = format!("header.{}.signature", {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(r#"{"sub":"padded"}"#)
+        });
+        assert_eq!(account_id_from_jwt(&padded).as_deref(), Some("padded"));
+    }
+
+    /// Nothing here is an error: a token in an unexpected shape means the account has to
+    /// be found elsewhere or given up on, not that the session is broken.
+    #[test]
+    fn a_token_that_names_no_account_is_not_a_failure() {
+        for token in [
+            "",
+            "not-a-jwt",
+            "header.!!!not-base64!!!.signature",
+            &jwt("not json"),
+            &jwt(r#"{"aud":"crunchyroll"}"#),
+            &jwt(r#"{"sub":""}"#),
+            &jwt(r#"{"sub":42}"#),
+        ] {
+            assert_eq!(account_id_from_jwt(token), None, "{token}");
+        }
+    }
 
     /// Serves one request: the headers for a `promised`-byte body, then `sent` of those
     /// bytes handed over one at a time `gap` apart, and silence afterwards.
