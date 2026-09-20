@@ -14,6 +14,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
+- Downloads a later run can pick up: the finished name appears only once the episode is whole, and what a killed run did fetch is kept for the next one
 - Playback with mpv while the stream downloads, instead of writing a file
 - Resume where you left off, and the position written back to your account while you watch, so this client, the phone and the web player stay in step
 - `--in-terminal`: the video drawn in the terminal itself, protocol and mpv options worked out for you
@@ -128,6 +129,60 @@ Use `all` to request every available audio, subtitle or closed-caption locale:
 cargo run --release -- --url EPISODE_URL \
   --audio-lang all --subs-lang all --cc-lang all
 ```
+
+### Picking a download up again
+
+Episodes land in a directory named after the series, as
+`Series S01E01 - Title [1080p].mkv`. That name belongs to finished episodes only: while
+the download runs, ffmpeg writes to `Series S01E01 - Title [1080p].mkv.part`, and the
+file is renamed onto the real name the moment ffmpeg says it is happy. So an MKV you can
+see is an MKV you can watch, and the "already downloaded, skipping" check can never be
+fooled by half of one.
+
+Beside it, `Series S01E01 - Title [1080p].mkv.part.json` records what has already been
+fetched. Each audio, video and subtitle track is buffered to a hidden `.crdl-` file in
+the same directory, and a run that does not finish leaves those files where they are
+instead of deleting them. Run the same command again and it fetches what is missing:
+
+- A track that came out whole last time is muxed as it is, and its playback session is
+  never opened - so a season interrupted eight episodes in costs eight episodes and not
+  the ninth's audio as well.
+- A video or audio track that was still arriving is carried on from the byte it stopped
+  at, when the episode's manifest is the single-file on-demand kind. Those arrive as one
+  long ranged response, so the length of the buffer says exactly which byte to ask for
+  next.
+- A track from a segmented manifest starts again. Its buffer ends somewhere inside a
+  segment rather than between two of them, and there is no honest way to tell where from
+  a byte count, so the partial buffer is swept up rather than guessed at.
+- Subtitles, which are small, are kept and reused the same way.
+
+What is on disk is only reused when it is certainly the right thing. A run asking for a
+different video or audio quality, for different audio, subtitle or caption locales, or
+even for the same audio locales in a different order - the first is the default track in
+the MKV - throws the lot away and starts again, as does a track file whose size has
+changed since it was written, and a buffer that does not begin with exactly the
+initialization segment this run just fetched. Every one of those refusals costs a
+download; letting one through would cost an MKV that looks finished and is not the
+episode you asked for.
+
+A download that finishes deletes its `.part`, its `.part.json` and every buffer they
+name. One you abandon keeps them, which is the point. To throw one away by hand, delete
+both files under the episode's name:
+
+```shell
+rm "Some Series/Some Series S01E01 - Title [1080p].mkv.part"*
+```
+
+That leaves the hidden `.crdl-` buffers it named, since nothing points at them any more;
+when no other download is running, `rm "Some Series"/.crdl-*` clears those too.
+
+None of this cares where the download came from. An episode queued in the interface is
+written by the same code as one asked for on the command line, so quitting mid-download -
+which the interface warns you about - leaves that episode's work where the next run will
+find it. See [The download queue](#the-download-queue).
+
+`--play` has none of this. It writes no file and keeps nothing, so there is nothing to
+come back to.
 
 ### Browsing the catalogue
 
@@ -296,6 +351,10 @@ Anything but the episode that is currently downloading can go: that one is insid
 hour of segments on a thread of its own and there is no calling it back, so it says so
 and stays. Quitting while a download is running asks a second time for the same reason,
 since leaving ends the thread with everything else. `ctrl-c` never argues.
+
+What that episode had already fetched is not thrown away when you go, and the next run
+carries on rather than starting it over: see
+[Picking a download up again](#picking-a-download-up-again).
 
 ### Playing instead of downloading
 

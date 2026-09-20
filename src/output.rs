@@ -107,9 +107,16 @@ pub fn build_mux_command(
     command
 }
 
-/// Muxes the tracks into the MKV, and says nothing about having done it: the caller
-/// knows whether anyone is watching the terminal, and the interface has a download
-/// thread whose lines would land in the middle of the catalogue.
+/// Muxes the tracks into `output_file`, which is neither the name the episode ends up
+/// under nor a place to announce anything from.
+///
+/// The caller hands this a `.part` and renames it once this has returned successfully,
+/// so what ffmpeg has written here is an MKV but not yet a downloaded episode - it
+/// becomes one when it is wearing the name the rest of the program looks for. Saying so
+/// is the caller's business for a second reason too: only the caller knows whether
+/// anyone is watching the terminal, and the interface has a download thread whose lines
+/// would land in the middle of the catalogue. A failed mux takes its own half-written
+/// output with it, since there is no picking up where ffmpeg left off.
 pub fn merge_everything(
     video: &MediaTrack,
     audio_tracks: &[MediaTrack],
