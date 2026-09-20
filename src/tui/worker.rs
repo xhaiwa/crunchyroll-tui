@@ -12,6 +12,8 @@ pub enum Listing {
     /// An index into [`SORTS`].
     Browse(usize),
     Search(String),
+    /// The account's own list, which is why it needs no parameter: there is one of it.
+    Watchlist,
 }
 
 impl Listing {
@@ -19,7 +21,27 @@ impl Listing {
         match self {
             Self::Browse(sort) => SORTS[*sort].1.to_owned(),
             Self::Search(query) => format!("Search: {query}"),
+            Self::Watchlist => "Watchlist".to_owned(),
         }
+    }
+
+    /// Every list the catalogue column cycles through, in order: the browse orders
+    /// first, and the account's own lists after them.
+    pub fn sources() -> Vec<Listing> {
+        let mut sources: Vec<Listing> = (0..SORTS.len()).map(Listing::Browse).collect();
+        sources.push(Listing::Watchlist);
+        sources
+    }
+
+    /// The list after this one. A search is not in the ring - it is left by going back
+    /// rather than by cycling past it - so cycling from one starts the ring over.
+    pub fn next(&self) -> Listing {
+        let sources = Self::sources();
+        let next = sources
+            .iter()
+            .position(|source| source == self)
+            .map_or(0, |index| (index + 1) % sources.len());
+        sources[next].clone()
     }
 }
 
@@ -78,6 +100,7 @@ impl Worker {
                         let result = match &listing {
                             Listing::Browse(sort) => client.browse(SORTS[*sort].0, CATALOG_PAGE, 0),
                             Listing::Search(query) => client.search(query, CATALOG_PAGE),
+                            Listing::Watchlist => client.watchlist(CATALOG_PAGE),
                         };
                         Response::Catalog {
                             listing,
@@ -136,5 +159,61 @@ impl Worker {
 
     pub fn try_recv(&self) -> Option<Response> {
         self.responses.try_recv().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Listing, SORTS};
+
+    /// What `o` walks through, and the one thing that makes holding it down safe: the
+    /// ring closes. Every browse order comes first and the account's own lists after
+    /// them, and the last of them leads back to the first rather than to nowhere.
+    #[test]
+    fn the_catalogue_lists_cycle_in_a_ring() {
+        let sources = Listing::sources();
+        assert_eq!(sources.len(), SORTS.len() + 1);
+        assert_eq!(sources[0], Listing::Browse(0));
+        assert_eq!(sources[SORTS.len() - 1], Listing::Browse(SORTS.len() - 1));
+        assert_eq!(sources.last(), Some(&Listing::Watchlist));
+        for pair in sources.windows(2) {
+            assert_eq!(
+                pair[0].next(),
+                pair[1],
+                "{:?} leads nowhere useful",
+                pair[0]
+            );
+        }
+        assert_eq!(
+            Listing::Watchlist.next(),
+            Listing::Browse(0),
+            "the last list has to lead back to the first"
+        );
+    }
+
+    /// A search is a detour rather than a stop on the ring, so there is no list after it
+    /// to find. Cycling out of one has to land somewhere definite all the same, and the
+    /// start of the ring is the only answer that does not depend on where the search was
+    /// begun.
+    #[test]
+    fn cycling_out_of_a_search_starts_the_ring_over() {
+        assert_eq!(
+            Listing::Search("frieren".to_owned()).next(),
+            Listing::Browse(0)
+        );
+    }
+
+    /// The label is what the header draws and what a click on the header is aimed at, so
+    /// every list needs one, and a search has to show back what was typed into it.
+    #[test]
+    fn every_list_says_what_it_is() {
+        assert_eq!(Listing::Browse(0).label(), "Popular");
+        assert_eq!(Listing::Browse(1).label(), "Recently added");
+        assert_eq!(Listing::Browse(2).label(), "A to Z");
+        assert_eq!(Listing::Watchlist.label(), "Watchlist");
+        assert_eq!(
+            Listing::Search("frieren".to_owned()).label(),
+            "Search: frieren"
+        );
     }
 }

@@ -174,6 +174,9 @@ pub struct App {
     pub show_help: bool,
     pub quit: bool,
     pub tick: usize,
+    /// Which browse order to come back to. The ring moves it along as it passes each
+    /// one, so leaving a search - which is not on the ring - returns to the order that
+    /// was last in use rather than to the top of the catalogue.
     sort: usize,
 }
 
@@ -584,9 +587,14 @@ impl App {
         self.say(format!("Video quality: {quality}"));
     }
 
-    fn cycle_sort(&mut self) {
-        self.sort = (self.sort + 1) % super::SORTS.len();
-        self.listing = Listing::Browse(self.sort);
+    /// Moves the catalogue column on to the next list in the ring: the browse orders,
+    /// then the account's own. `self.sort` follows every browse order that goes past,
+    /// because a search left behind comes back to that rather than to the ring.
+    fn cycle_source(&mut self) {
+        self.listing = self.listing.next();
+        if let Listing::Browse(sort) = self.listing {
+            self.sort = sort;
+        }
         self.request_catalog();
     }
 
@@ -740,7 +748,7 @@ impl App {
                 let message = self.art.toggle();
                 self.say(message);
             }
-            Command::Order => self.cycle_sort(),
+            Command::Order => self.cycle_source(),
             Command::Reload => self.reload(),
         }
         Action::None

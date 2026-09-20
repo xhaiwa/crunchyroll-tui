@@ -236,7 +236,7 @@ back = ["left", "h", "esc"]
 next-column = "tab"
 
 # The catalogue. An empty search goes back to browsing, and `order` cycles
-# popular, recently added and A to Z.
+# popular, recently added, A to Z and the account's own watchlist.
 search = "/"
 order = "o"
 reload = "r"

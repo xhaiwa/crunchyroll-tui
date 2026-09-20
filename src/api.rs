@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::credentials::Secret;
 use crate::model::{
     BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, SearchResponse,
-    Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse,
+    Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse, WatchlistEntry,
+    WatchlistResponse,
 };
 
 const USER_AGENT_VALUE: &str =
@@ -122,6 +123,23 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The series among a watchlist's rows.
+///
+/// The watchlist takes no `type` filter the way browse and search do, so the sifting has
+/// to happen here, and it is the same sifting `search` does for the same reason: a movie
+/// has no seasons endpoint and no episodes endpoint, so one in this column is a dead end
+/// for anyone who selects it.
+///
+/// Split out from the request so the part that does not need an account or a network can
+/// be tested against the two shapes the rows arrive in.
+fn watchlist_series(entries: Vec<WatchlistEntry>) -> Vec<CatalogItem> {
+    entries
+        .into_iter()
+        .map(WatchlistEntry::into_item)
+        .filter(|item| item.kind == "series")
+        .collect()
+}
+
 impl CrunchyrollClient {
     pub fn new(etp_rt: Secret, debug: bool) -> Result<Self> {
         let client = Self {
@@ -205,10 +223,6 @@ impl CrunchyrollClient {
     /// An error rather than an empty string: the endpoints that need it put it in the
     /// path, and one built around an empty id asks about an account that does not exist
     /// and comes back with a 404 that says nothing about why.
-    // Nothing calls this yet. It is the piece every account endpoint is addressed by,
-    // and it lands first so the watchlist, the history and the playheads each arrive as
-    // the feature they are rather than dragging their own copy of the login with them.
-    #[allow(dead_code)]
     pub fn account_id(&self) -> Result<String> {
         let account_id = self
             .account_id
@@ -362,6 +376,27 @@ impl CrunchyrollClient {
             .collect())
     }
 
+    /// The series on the account's watchlist, most recently added first.
+    ///
+    /// Addressed by account rather than by token, so a session that never learned which
+    /// account it belongs to says so here rather than asking about an account that does
+    /// not exist and passing on the 404.
+    pub fn watchlist(&self, count: usize) -> Result<Vec<CatalogItem>> {
+        let account_id = self.account_id()?;
+        let mut url = reqwest::Url::parse(&format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist"
+        ))
+        .context("build the watchlist URL")?;
+        url.query_pairs_mut()
+            .append_pair("n", &count.to_string())
+            .append_pair("order", "desc")
+            .append_pair("locale", "en-US")
+            .append_pair("ratings", "true");
+        Ok(watchlist_series(
+            self.get_json::<WatchlistResponse>(url.as_str())?.data,
+        ))
+    }
+
     pub fn manifest(&self, url: &str) -> Result<Vec<u8>> {
         let body = self
             .send_authed(Method::GET, url, &HeaderMap::new(), None)?
@@ -446,7 +481,8 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use super::{Duration, account_id_from_jwt, build_media_client};
+    use super::{Duration, account_id_from_jwt, build_media_client, watchlist_series};
+    use crate::model::WatchlistResponse;
 
     /// A JWT with `claims` as its payload, signed by nobody: the segments are what is
     /// read here, and a signature this code never checks is not worth faking.
@@ -495,6 +531,25 @@ mod tests {
         ] {
             assert_eq!(account_id_from_jwt(token), None, "{token}");
         }
+    }
+
+    /// A watchlist holds whatever the account put on it, and that includes films. One in
+    /// this column would be a dead end - there is no seasons endpoint behind it - so it
+    /// is dropped here the way `search` drops one, rather than being drawn as a row that
+    /// does nothing when it is opened.
+    #[test]
+    fn a_film_on_the_watchlist_is_not_offered() {
+        let json = r#"{"total":3,"data":[
+            {"id":"GY8VEQ95Y","panel":{"id":"GY8VEQ95Y","type":"series","title":"Frieren"}},
+            {"id":"GM5V7XW1Q","panel":{"id":"GM5V7XW1Q","type":"movie_listing","title":"Suzume"}},
+            {"id":"G9DUEG5MB","type":"series","title":"Dandadan"}
+        ]}"#;
+        let response: WatchlistResponse = serde_json::from_str(json).expect("a watchlist");
+        let titles: Vec<String> = watchlist_series(response.data)
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["Frieren", "Dandadan"]);
     }
 
     /// Serves one request: the headers for a `promised`-byte body, then `sent` of those
