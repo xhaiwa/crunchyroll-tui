@@ -1072,10 +1072,9 @@ mod tests {
         assert_eq!(app.listing, Listing::Browse(0));
 
         // Nor is the history, once it has been chosen deliberately.
-        app.run(Command::Order);
-        app.run(Command::Order);
-        app.run(Command::Order);
-        assert_eq!(app.listing, Listing::History);
+        while app.listing != Listing::History {
+            app.run(Command::Order);
+        }
         app.catalog_arrived(Listing::History, Ok(Vec::new()));
         assert_eq!(
             app.listing,
@@ -1105,7 +1104,7 @@ mod tests {
         assert_eq!(app.listing, Listing::Browse(2));
         // And the ring carries on from there rather than starting over.
         app.run(Command::Order);
-        assert_eq!(app.listing, Listing::History);
+        assert_eq!(app.listing, Listing::Watchlist);
     }
 
     #[test]

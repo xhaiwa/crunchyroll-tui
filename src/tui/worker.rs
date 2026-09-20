@@ -12,8 +12,9 @@ pub enum Listing {
     /// An index into [`SORTS`].
     Browse(usize),
     Search(String),
-    /// What the account was last watching. It carries nothing because there is only ever
-    /// one of it.
+    /// The account's own list, which is why it needs no parameter: there is one of it.
+    Watchlist,
+    /// What the account was last watching. It carries nothing for the same reason.
     History,
 }
 
@@ -22,6 +23,7 @@ impl Listing {
         match self {
             Self::Browse(sort) => SORTS[*sort].1.to_owned(),
             Self::Search(query) => format!("Search: {query}"),
+            Self::Watchlist => "Watchlist".to_owned(),
             Self::History => "Continue watching".to_owned(),
         }
     }
@@ -30,6 +32,7 @@ impl Listing {
     /// first, and the account's own lists after them.
     pub fn sources() -> Vec<Listing> {
         let mut sources: Vec<Listing> = (0..SORTS.len()).map(Listing::Browse).collect();
+        sources.push(Listing::Watchlist);
         sources.push(Listing::History);
         sources
     }
@@ -101,6 +104,7 @@ impl Worker {
                         let result = match &listing {
                             Listing::Browse(sort) => client.browse(SORTS[*sort].0, CATALOG_PAGE, 0),
                             Listing::Search(query) => client.search(query, CATALOG_PAGE),
+                            Listing::Watchlist => client.watchlist(CATALOG_PAGE),
                             Listing::History => client.history(CATALOG_PAGE),
                         };
                         Response::Catalog {
@@ -173,10 +177,11 @@ mod tests {
     #[test]
     fn the_lists_cycle_in_a_closed_ring() {
         let sources = Listing::sources();
-        assert_eq!(sources.len(), SORTS.len() + 1);
+        assert_eq!(sources.len(), SORTS.len() + 2);
         for (index, source) in sources.iter().take(SORTS.len()).enumerate() {
             assert_eq!(*source, Listing::Browse(index));
         }
+        assert_eq!(sources[SORTS.len()], Listing::Watchlist);
         assert_eq!(sources.last(), Some(&Listing::History));
         for pair in sources.windows(2) {
             assert_eq!(pair[0].next(), pair[1], "{:?} leads somewhere odd", pair[0]);
@@ -205,6 +210,9 @@ mod tests {
     #[test]
     fn every_list_says_which_one_it_is() {
         assert_eq!(Listing::Browse(0).label(), "Popular");
+        assert_eq!(Listing::Browse(1).label(), "Recently added");
+        assert_eq!(Listing::Browse(2).label(), "A to Z");
+        assert_eq!(Listing::Watchlist.label(), "Watchlist");
         assert_eq!(Listing::History.label(), "Continue watching");
         assert_eq!(
             Listing::Search("frieren".to_owned()).label(),

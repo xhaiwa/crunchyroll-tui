@@ -149,7 +149,7 @@ instead and says so on the status line.
 | `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns |
 | `/` | `search` | Search the catalogue. An empty search goes back to browsing |
-| `o` | `order` | Change the list: popular, recently added, A to Z, then Continue watching |
+| `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
 | `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
 | `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
@@ -164,6 +164,12 @@ The Action column is the name the key is written under in the config file; see
 [Keys](#keys) for moving any of them. `ctrl-c` quits whatever the config says.
 
 Every one of these can be moved somewhere else; see [Keys](#keys) below.
+
+`o` walks one ring: the three browse orders, and then the watchlist of whatever account
+the `etp_rt` cookie belongs to, which holds only the series on it - a film there has no
+seasons behind it and would be a row that does nothing when opened. A search is not on
+that ring; it is left with `back` rather than cycled past, and leaving one comes back to
+the browse order that was in use when it started.
 
 The languages offered by `a` and `s` are the ones the selected season lists, falling back
 to the series, then to what was asked for on the command line, then to every locale
@@ -191,7 +197,7 @@ included.
 | Wheel | Scroll the column under the pointer, leaving the keyboard where it is |
 | Right click | Go back out of the column it was pressed on |
 | Click a word along an edge | What its key does: `open/play`, `back`, `search`, `download`, `language`, `quality`, `keys`, `quit`, and `audio`, `subs` and `video` at the top right |
-| Click the listing label | Change the list, or leave a search |
+| Click the listing label | Move on to the next list, or leave a search |
 | Click beside the language list | Cancel it, the way `esc` does |
 
 Opening takes a second click rather than a quick double click, so a slow hand and a slow

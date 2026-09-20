@@ -236,9 +236,9 @@ back = ["left", "h", "esc"]
 next-column = "tab"
 
 # The catalogue. An empty search goes back to browsing, and `order` cycles the
-# lists the column can show: popular, recently added, A to Z, and then
-# Continue watching, which is the account's own history and what the interface
-# opens on.
+# lists the column can show: popular, recently added, A to Z, the account's own
+# watchlist, and then Continue watching, which is its history and what the
+# interface opens on.
 search = "/"
 order = "o"
 reload = "r"

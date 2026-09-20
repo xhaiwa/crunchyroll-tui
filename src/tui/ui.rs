@@ -141,9 +141,9 @@ fn line(run: &Run) -> Line<'static> {
 /// The left of the header: what is being listed, and how much of it.
 ///
 /// The label is a button, because what it says is exactly what a click on it changes -
-/// `Popular` and `Continue watching` alike move on to the next list, and `Search: frieren`
-/// leaves the search. The count beside it is not. While the box is being typed into, none
-/// of it is: a click there closes the box, as escape does.
+/// `Popular`, `Watchlist` and `Continue watching` alike move on to the next list, and
+/// `Search: frieren` leaves the search. The count beside it is not. While the box is
+/// being typed into, none of it is: a click there closes the box, as escape does.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
@@ -158,7 +158,7 @@ fn listing(app: &App) -> Run {
         None => vec![
             (
                 Some(match app.listing {
-                    Listing::Browse(_) | Listing::History => Command::Order,
+                    Listing::Browse(_) | Listing::Watchlist | Listing::History => Command::Order,
                     Listing::Search(_) => Command::Back,
                 }),
                 vec![theme.strong(app.listing.label())],
@@ -836,7 +836,7 @@ mod tests {
     use crate::tui::art::Gallery;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
-    use crate::tui::worker::Worker;
+    use crate::tui::worker::{Listing, Worker};
 
     use super::{HELP, cells, draw, duration, poster_width, thumbnail_width};
 
@@ -1105,6 +1105,55 @@ mod tests {
         assert_eq!(app.episodes.state.selected(), Some(0), "j is not bound");
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.episodes.state.selected(), Some(1));
+    }
+
+    /// The catalogue label is a button and what it does is move on to the next list, so
+    /// a pointer has to be able to walk the whole ring - the account's own lists
+    /// included - and come back round to where it started. A list that is drawn but not
+    /// clickable would be one the mouse could enter and never leave. The walk starts
+    /// wherever the interface opens, which is the point: every stop has to lead on.
+    #[test]
+    fn the_listing_label_walks_the_whole_ring() {
+        let mut app = app();
+        let mut labels = Vec::new();
+        for _ in 0..Listing::sources().len() + 1 {
+            labels.push(app.listing.label());
+            let _ = buffer(120, 30, &mut app);
+            let (x, y) = middle(button(&app, Command::Order));
+            click(&mut app, x, y);
+        }
+        assert_eq!(
+            labels,
+            [
+                "Continue watching",
+                "Popular",
+                "Recently added",
+                "A to Z",
+                "Watchlist",
+                "Continue watching"
+            ]
+        );
+    }
+
+    /// A search is a detour off the ring, and leaving one has to come back to the order
+    /// that was in use when it began rather than to the top of the catalogue: someone
+    /// who went looking from A to Z did not ask to be put back on Popular.
+    #[test]
+    fn leaving_a_search_comes_back_to_the_order_in_use() {
+        let mut app = app();
+        // Off the opening list and one step along the browse orders, so that coming back
+        // to the top of the catalogue would be visibly the wrong answer.
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.listing.label(), "Recently added");
+        press(&mut app, KeyCode::Char('/'));
+        for letter in "frieren".chars() {
+            press(&mut app, KeyCode::Char(letter));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.listing.label(), "Search: frieren");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.listing.label(), "Recently added");
     }
 
     /// The language list is the way a locale gets changed, so it has to offer what the
