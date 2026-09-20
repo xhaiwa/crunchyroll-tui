@@ -3,9 +3,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::api::CrunchyrollClient;
+use crate::api::{CrunchyrollClient, Page};
 use crate::download::{DownloadOptions, Progress, download_episode, episode_info};
-use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
+use crate::model::{Playhead, Season, SeasonEpisode};
 
 use super::SORTS;
 
@@ -82,7 +82,12 @@ impl Eq for Queued {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
-    Catalog(Listing),
+    /// One page of the catalogue column's list. `start` is the offset to ask the
+    /// endpoint for, counted in the rows the endpoint counts rather than in the rows
+    /// that reached the column, and it travels with the answer so that a page arriving
+    /// after the user has moved on - or a second copy of one already appended - can be
+    /// told from the page the column is waiting for.
+    Catalog { listing: Listing, start: usize },
     Seasons {
         series_id: String,
         audio: String,
@@ -128,9 +133,13 @@ pub enum Request {
 /// Answers carry back what was asked for, so an answer to a question the user has
 /// already moved on from can be recognised and dropped.
 pub enum Response {
+    /// One page of a catalogue list, with the list and the offset it was asked for so
+    /// that the interface can tell whether it is still wanted. The page itself says how
+    /// long the whole list is and where the next one begins; see [`Page`].
     Catalog {
         listing: Listing,
-        result: Result<Vec<CatalogItem>, String>,
+        start: usize,
+        result: Result<Page, String>,
     },
     Seasons {
         series_id: String,
@@ -322,15 +331,22 @@ impl Worker {
         thread::spawn(move || {
             for request in inbox {
                 let response = match request {
-                    Request::Catalog(listing) => {
+                    Request::Catalog { listing, start } => {
                         let result = match &listing {
-                            Listing::Browse(sort) => client.browse(SORTS[*sort].0, CATALOG_PAGE, 0),
-                            Listing::Search(query) => client.search(query, CATALOG_PAGE),
-                            Listing::Watchlist => client.watchlist(CATALOG_PAGE),
+                            Listing::Browse(sort) => {
+                                client.browse(SORTS[*sort].0, CATALOG_PAGE, start)
+                            }
+                            Listing::Search(query) => client.search(query, CATALOG_PAGE, start),
+                            Listing::Watchlist => client.watchlist(CATALOG_PAGE, start),
+                            // Which takes no offset: the history is asked for whole, for
+                            // the reason `CrunchyrollClient::history` sets out, and it
+                            // answers with no next page - so `start` here is only ever
+                            // the zero the first request carried.
                             Listing::History => client.history(CATALOG_PAGE),
                         };
                         Response::Catalog {
                             listing,
+                            start,
                             result: result.map_err(|error| format!("{error:#}")),
                         }
                     }

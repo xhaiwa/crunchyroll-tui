@@ -221,6 +221,45 @@ fn playhead_urls(account_id: &str, content_ids: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// One page of a catalogue listing: the series it brought back, how long the whole list
+/// is where that is known, and where to carry on from.
+///
+/// The catalogue column asks for a hundred series at a time and appends what comes back,
+/// so every listing has to be able to say two things about itself that a bare list of
+/// items cannot. `next` is the offset the column asks for when the cursor reaches the
+/// bottom, and `None` is the end of the list - it is worked out here, beside the request,
+/// because only this side knows how many rows came off the wire before the sifting each
+/// endpoint does below.
+pub struct Page {
+    pub items: Vec<CatalogItem>,
+    /// How many entries the list holds in all, or `None` where nothing here counts the
+    /// same things the column shows. A total is for the header to print against what is
+    /// loaded, and a number the column can never reach would be worse than no number:
+    /// `100 of 1203 series` has to mean there are 1103 more of them to walk to.
+    pub total: Option<usize>,
+    /// Where the next page starts, or `None` when this one was the last.
+    pub next: Option<usize>,
+}
+
+/// Where the next page of a listing begins, or `None` when the one in hand was the end
+/// of it.
+///
+/// Two separate things finish a list, and both are here because neither is reliable
+/// alone. A page that came back shorter than it was asked for is the endpoint saying it
+/// had nothing else to fill it with, which is the only answer a list with no published
+/// total ever gives; and a page that reaches the total is the end by arithmetic, which
+/// catches an endpoint that would rather hand back an empty page than stop.
+///
+/// The rows counted are the ones that came off the wire, not the ones that survived the
+/// sifting each caller does afterwards: a film dropped out of a watchlist page still
+/// holds its place in the list the offsets count through, and counting what was kept
+/// would ask for the same rows over again a page later.
+fn next_page(start: usize, asked: usize, returned: usize, total: Option<usize>) -> Option<usize> {
+    let next = start + returned;
+    let ended = returned < asked || total.is_some_and(|total| next >= total);
+    (!ended).then_some(next)
+}
+
 impl CrunchyrollClient {
     pub fn new(etp_rt: Secret, debug: bool) -> Result<Self> {
         let client = Self {
@@ -460,7 +499,12 @@ impl CrunchyrollClient {
     ///
     /// Only series are asked for. A movie listing has no seasons and no episodes
     /// endpoint, so one in the list would be a dead end for anyone who selected it.
-    pub fn browse(&self, sort_by: &str, count: usize, start: usize) -> Result<Vec<CatalogItem>> {
+    ///
+    /// This is the one listing whose total is worth passing on. `type=series` is part of
+    /// the question, so the count that comes back is a count of the rows this column can
+    /// actually show, and nothing is dropped from the page afterwards - the offsets, the
+    /// total and the rows on screen all count the same things.
+    pub fn browse(&self, sort_by: &str, count: usize, start: usize) -> Result<Page> {
         let mut url = reqwest::Url::parse("https://www.crunchyroll.com/content/v2/discover/browse")
             .expect("valid browse URL");
         url.query_pairs_mut()
@@ -470,28 +514,46 @@ impl CrunchyrollClient {
             .append_pair("start", &start.to_string())
             .append_pair("ratings", "true")
             .append_pair("locale", "en-US");
-        Ok(self.get_json::<BrowseResponse>(url.as_str())?.data)
+        let answered = self.get_json::<BrowseResponse>(url.as_str())?;
+        let total = usize::try_from(answered.total).ok();
+        Ok(Page {
+            next: next_page(start, count, answered.data.len(), total),
+            items: answered.data,
+            total,
+        })
     }
 
-    pub fn search(&self, query: &str, count: usize) -> Result<Vec<CatalogItem>> {
+    /// The series a search turns up, most like the query first.
+    ///
+    /// No total. Search answers in groups and what is counted is the group as the
+    /// endpoint filled it, before the sifting below throws away anything that is not a
+    /// series; printing that beside a column holding fewer rows than it promises would
+    /// be a header that never adds up. The end of the list is recognised the other way
+    /// instead, by a page that comes back short.
+    pub fn search(&self, query: &str, count: usize, start: usize) -> Result<Page> {
         let mut url = reqwest::Url::parse("https://www.crunchyroll.com/content/v2/discover/search")
             .expect("valid search URL");
         url.query_pairs_mut()
             .append_pair("q", query)
             .append_pair("type", "series")
             .append_pair("n", &count.to_string())
+            .append_pair("start", &start.to_string())
             .append_pair("ratings", "true")
             .append_pair("locale", "en-US");
         // Search answers with one group per requested type, so a single `type=series`
         // still arrives wrapped in a group. `top_results` mixes types in regardless of
         // what was asked for, and anything that is not a series is a dead end here.
-        Ok(self
-            .get_json::<SearchResponse>(url.as_str())?
-            .data
-            .into_iter()
-            .flat_map(|group| group.items)
-            .filter(|item| item.kind == "series")
-            .collect())
+        let groups = self.get_json::<SearchResponse>(url.as_str())?.data;
+        let returned: usize = groups.iter().map(|group| group.items.len()).sum();
+        Ok(Page {
+            items: groups
+                .into_iter()
+                .flat_map(|group| group.items)
+                .filter(|item| item.kind == "series")
+                .collect(),
+            total: None,
+            next: next_page(start, count, returned, None),
+        })
     }
 
     /// The series on the account's watchlist, most recently added first.
@@ -499,7 +561,12 @@ impl CrunchyrollClient {
     /// Addressed by account rather than by token, so a session that never learned which
     /// account it belongs to says so here rather than asking about an account that does
     /// not exist and passing on the 404.
-    pub fn watchlist(&self, count: usize) -> Result<Vec<CatalogItem>> {
+    ///
+    /// The total this endpoint publishes is a count of the rows on the watchlist, films
+    /// among them, and `watchlist_series` drops the films - so it is not passed on. The
+    /// offsets still count every row, which is exactly why the arithmetic uses what came
+    /// off the wire rather than what came out of the sifting.
+    pub fn watchlist(&self, count: usize, start: usize) -> Result<Page> {
         let account_id = self.account_id()?;
         let mut url = reqwest::Url::parse(&format!(
             "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist"
@@ -507,12 +574,17 @@ impl CrunchyrollClient {
         .context("build the watchlist URL")?;
         url.query_pairs_mut()
             .append_pair("n", &count.to_string())
+            .append_pair("start", &start.to_string())
             .append_pair("order", "desc")
             .append_pair("locale", "en-US")
             .append_pair("ratings", "true");
-        Ok(watchlist_series(
-            self.get_json::<WatchlistResponse>(url.as_str())?.data,
-        ))
+        let rows = self.get_json::<WatchlistResponse>(url.as_str())?.data;
+        let returned = rows.len();
+        Ok(Page {
+            items: watchlist_series(rows),
+            total: None,
+            next: next_page(start, count, returned, None),
+        })
     }
 
     /// The series the account was last watching, newest first.
@@ -522,7 +594,22 @@ impl CrunchyrollClient {
     /// column shows series and drills into seasons, so the episodes are boiled down to
     /// the series behind them and then fetched in full: a title on its own would make
     /// this the one list in the column with no poster and nothing to say about itself.
-    pub fn history(&self, count: usize) -> Result<Vec<CatalogItem>> {
+    ///
+    /// This is the one listing that is not paged, and that boiling down is why. The
+    /// endpoint counts and offsets episodes while the column holds series, so a page
+    /// asked for at an offset of a hundred would begin a hundred episodes in and bring
+    /// back however many series that happened to be - usually a handful, sometimes none
+    /// at all, and overlapping whatever is already on screen, since a series watched
+    /// yesterday and again this morning has episodes on both sides of the boundary.
+    /// Nothing here can turn that into an offset of rows without paging through the
+    /// whole history to find out. The alternatives were both worse: asking for one more
+    /// page per keypress at the bottom would be a column that sometimes grows by nothing
+    /// and sometimes repeats itself, and deduplicating across pages would make the
+    /// column's length depend on how long the user had been scrolling. So the history is
+    /// what one page of episodes says it is, and says so by reporting no next page - a
+    /// hundred episodes is a long way back through anyone's watching, and the series
+    /// worth continuing are at the top of it.
+    pub fn history(&self, count: usize) -> Result<Page> {
         let account = self.account_id()?;
         let mut url = reqwest::Url::parse(&format!(
             "https://www.crunchyroll.com/content/v2/discover/{account}/history"
@@ -533,7 +620,11 @@ impl CrunchyrollClient {
             .append_pair("locale", "en-US")
             .append_pair("ratings", "true");
         let watched = self.get_json::<HistoryResponse>(url.as_str())?.data;
-        self.objects(&series_watched(&watched))
+        Ok(Page {
+            items: self.objects(&series_watched(&watched))?,
+            total: None,
+            next: None,
+        })
     }
 
     /// The catalogue entries for a set of ids, in the order they were asked for.
@@ -711,7 +802,7 @@ mod tests {
 
     use super::{
         Duration, OBJECTS_PER_REQUEST, account_id_from_jwt, build_media_client, in_asked_order,
-        object_batches, playhead_urls, series_watched, watchlist_series,
+        next_page, object_batches, playhead_urls, series_watched, watchlist_series,
     };
 
     /// A JWT with `claims` as its payload, signed by nobody: the segments are what is
@@ -780,6 +871,41 @@ mod tests {
             .map(|item| item.title)
             .collect();
         assert_eq!(titles, ["Frieren", "Dandadan"]);
+    }
+
+    /// Where the catalogue column is told to carry on from, and when it is told there is
+    /// nothing to carry on to. Getting this wrong is not a cosmetic matter: an offset
+    /// that stands still asks for the same hundred series over and over, and one that
+    /// runs past the end leaves a hole in the middle of the list.
+    ///
+    /// What is counted is what the endpoint sent, which is the callers' side of the
+    /// bargain: a watchlist page of a hundred rows with five films among it is still a
+    /// hundred rows of somebody's list, and carrying on from the ninety-five that were
+    /// kept would fetch those five again at the head of the next page.
+    #[test]
+    fn a_page_that_came_back_short_is_the_end_of_the_list() {
+        assert_eq!(next_page(0, 100, 100, None), Some(100));
+        assert_eq!(next_page(100, 100, 100, None), Some(200));
+        assert_eq!(
+            next_page(100, 100, 40, None),
+            None,
+            "a page the endpoint could not fill is the last one it has"
+        );
+        assert_eq!(
+            next_page(0, 100, 0, None),
+            None,
+            "an empty page is the end of the list, not a reason to ask again"
+        );
+
+        // A published total ends the list by arithmetic, without an empty page having to
+        // be fetched to find that out.
+        assert_eq!(next_page(0, 100, 100, Some(250)), Some(100));
+        assert_eq!(next_page(100, 100, 100, Some(200)), None);
+        assert_eq!(
+            next_page(100, 100, 100, Some(150)),
+            None,
+            "a page that has already run past the total is the end of the list"
+        );
     }
 
     /// A catalogue entry that is nothing but its id, which is all the ordering cares

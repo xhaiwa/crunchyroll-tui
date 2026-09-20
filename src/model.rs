@@ -276,8 +276,12 @@ pub struct CatalogItem {
 pub struct BrowseResponse {
     #[serde(default)]
     pub data: Vec<CatalogItem>,
+    /// How many series the whole listing holds. Browse is asked for series and nothing
+    /// is dropped from its pages afterwards, so this counts the rows the catalogue
+    /// column shows - which is what makes it worth printing in the header and worth
+    /// believing about when there is nothing more to ask for. The same field on the
+    /// watchlist and the history counts something else; see `api::Page`.
     #[serde(default)]
-    #[allow(dead_code)]
     pub total: i64,
 }
 

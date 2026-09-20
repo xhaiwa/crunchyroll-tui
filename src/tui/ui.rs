@@ -247,6 +247,26 @@ fn line(run: &Run) -> Line<'static> {
     )
 }
 
+/// How much of the list the catalogue column is holding, for the header.
+///
+/// The column loads a page at a time, so the count on its own would be the one number in
+/// the interface that quietly means something different from what it says: `100 series`
+/// where there are twelve hundred of them reads as the end of the catalogue rather than
+/// as the first hundredth of it. Against the total it says both things at once - how far
+/// the list has been read, and that there is more of it to walk to.
+///
+/// Where the total is unknown it is left out rather than guessed at. The watchlist, the
+/// history and a search have no figure that counts the same things this column shows -
+/// see [`crate::api::Page`] - and `100 of 100 series` for a list that goes on would be a
+/// worse answer than saying nothing about the length at all.
+fn tally(app: &App) -> String {
+    let loaded = app.series.items.len();
+    match app.paging.total {
+        Some(total) => format!("   {loaded} of {total} series"),
+        None => format!("   {loaded} series"),
+    }
+}
+
 /// The left of the header: what is being listed, and how much of it.
 ///
 /// The label is a button, because what it says is exactly what a click on it changes -
@@ -272,10 +292,7 @@ fn listing(app: &App) -> Run {
                 }),
                 vec![theme.strong(app.listing.label())],
             ),
-            (
-                None,
-                vec![theme.dim(format!("   {} series", app.series.items.len()))],
-            ),
+            (None, vec![theme.dim(tally(app))]),
         ],
     }
 }
@@ -1081,6 +1098,7 @@ mod tests {
 
     use image::{DynamicImage, Rgb, RgbImage};
 
+    use crate::api::Page;
     use crate::download::{DownloadOptions, OnDisk};
     use crate::model::{
         Artwork, CatalogItem, Images, Playhead, Season, SeasonEpisode, SeriesMetadata,
@@ -1975,6 +1993,32 @@ mod tests {
         (area.x + 1, area.y + 1 + index)
     }
 
+    /// A catalogue column part-way through a long list, as the worker fills one: a
+    /// browse order - the history the interface opens on is not paged - with its first
+    /// page in and the rest of the list behind it.
+    fn a_first_page(app: &mut App, loaded: usize, total: Option<usize>) {
+        press(app, KeyCode::Char('o'));
+        let items = (0..loaded)
+            .map(|index| CatalogItem {
+                id: format!("GY{index}"),
+                kind: "series".to_owned(),
+                title: format!("Series {index}"),
+                ..CatalogItem::default()
+            })
+            .collect();
+        let listing = app.listing.clone();
+        app.accept(Response::Catalog {
+            listing,
+            start: 0,
+            result: Ok(Page {
+                items,
+                total,
+                next: Some(loaded),
+            }),
+        });
+        app.sent();
+    }
+
     fn several_series(app: &mut App, count: usize) {
         let one = app.series.items[0].clone();
         app.series.set(
@@ -2092,6 +2136,75 @@ mod tests {
         let (x, y) = row(app.regions.series, 0);
         click(&mut app, x, y);
         assert_eq!(app.series.state.selected(), Some(offset));
+    }
+
+    /// The header counts what is loaded against what the list holds, because the column
+    /// now shows a page of a list rather than the list. `100 series` under a catalogue
+    /// twelve hundred long reads as the end of it, which is exactly the impression this
+    /// whole feature exists to correct - and the count is the only place the interface
+    /// can say otherwise.
+    ///
+    /// Where no total is known the count stands alone rather than being made up: a list
+    /// whose length nothing counts in the units of this column would otherwise print
+    /// `100 of 100` and stop meaning anything.
+    #[test]
+    fn the_header_says_how_much_of_the_list_is_loaded() {
+        let mut app = app();
+        a_first_page(&mut app, 100, Some(1203));
+        assert!(
+            rendered(120, 30, &mut app).contains("100 of 1203 series"),
+            "the header kept the count to itself"
+        );
+
+        app.paging.total = None;
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("100 series"));
+        assert!(
+            !screen.contains(" of "),
+            "the header invented a total for a list that has none"
+        );
+    }
+
+    /// The label beside that count is still the button it always was: it says which list
+    /// is showing and a click on it moves to the next one. The count is not - it is a
+    /// fact about the list rather than something to press - and growing it must not have
+    /// turned it into one, or a click meant for the order would land on a number.
+    #[test]
+    fn the_list_is_still_named_by_a_button_beside_the_count() {
+        let mut app = app();
+        a_first_page(&mut app, 100, Some(1203));
+        let _ = buffer(120, 30, &mut app);
+
+        let label = button(&app, Command::Order);
+        assert_eq!(label.width, cells(&[Span::raw("Popular".to_owned())]));
+        let (x, y) = middle(label);
+        click(&mut app, x, y);
+        assert_eq!(app.listing, Listing::Browse(1));
+    }
+
+    /// The wheel is one of the ways to the bottom of a column, and the bottom of the
+    /// column is what asks for more of the list. It goes through the cursor helper the
+    /// keys go through, so this is the whole pointer path - the box the column was drawn
+    /// in, the row the pointer was over, the cursor, the request - end to end.
+    #[test]
+    fn the_wheel_can_reach_the_end_of_the_list_and_ask_for_more() {
+        let mut app = app();
+        a_first_page(&mut app, 12, Some(40));
+        let _ = buffer(120, 30, &mut app);
+
+        let (x, y) = middle(app.regions.series);
+        for _ in 0..8 {
+            wheel(&mut app, x, y, true);
+        }
+        assert_eq!(app.series.state.selected(), Some(11));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 12,
+            }],
+            "the wheel reached the end of the list and asked for nothing"
+        );
     }
 
     /// Looking down a column is not the same as going to work in it, so the wheel leaves

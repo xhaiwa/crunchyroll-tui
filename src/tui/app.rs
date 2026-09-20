@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Position;
 use ratatui::widgets::ListState;
 
+use crate::api::Page;
 use crate::download::{DownloadOptions, OnDisk, episode_info, on_disk};
 use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 use crate::util::{LANGUAGES, language_name};
@@ -254,12 +255,63 @@ impl<T> Pane<T> {
         }
     }
 
+    /// Adds to what the column is already showing, for a list that arrives a page at a
+    /// time.
+    ///
+    /// The cursor is left alone rather than put back at the top: the user is standing at
+    /// the bottom of the list, which is what asked for these rows in the first place, and
+    /// a column that jumped home every time a page landed would be unusable. A column
+    /// that was empty until now gets a cursor, since a list with rows in it and nothing
+    /// selected cannot be walked.
+    pub fn append(&mut self, items: Vec<T>) {
+        self.items.extend(items);
+        self.loading = false;
+        if self.state.selected().is_none() && !self.items.is_empty() {
+            self.state.select(Some(0));
+        }
+    }
+
     /// The first row the list drew and how many items it holds - everything the pointer
     /// needs to turn a row of the screen into an index. The offset is what the list
     /// widget wrote back as it drew, so it is where the list actually was rather than
     /// where it was asked to be.
     pub fn window(&self) -> (usize, usize) {
         (self.state.offset(), self.items.len())
+    }
+}
+
+/// How far through its list the catalogue column has read, and how much further there is
+/// to go.
+///
+/// The offsets are kept here rather than counted off the rows on screen, because the two
+/// do not always agree: a watchlist page of a hundred rows is a hundred offsets whether
+/// or not five of them were films the column drops. Asking for the next page at
+/// `items.len()` would hand back rows already on screen a page later.
+pub struct Paging {
+    /// Where the next page begins, or `None` once the list has been read to the end -
+    /// which a listing that is not paged at all says of its very first page.
+    pub next: Option<usize>,
+    /// The offset of the page asked for and not yet answered, if there is one. It is
+    /// both the flag that keeps a second request from going out while the first is in
+    /// flight and the name the answer is recognised by: a page whose offset is not this
+    /// one belongs to a list the user has left or to a page already appended, and is
+    /// dropped the way [`Pane::owner`] drops an answer about the wrong series.
+    pub asked: Option<usize>,
+    /// How many series the whole list holds, where the endpoint counts the same things
+    /// the column shows. The header prints it against what is loaded; see
+    /// [`crate::api::Page`] for why most of the lists have nothing to put here.
+    pub total: Option<usize>,
+}
+
+impl Paging {
+    /// A list about to be read from the top. Nothing is known about its length yet, and
+    /// the first page is the one at offset zero.
+    fn first() -> Self {
+        Self {
+            next: Some(0),
+            asked: None,
+            total: None,
+        }
     }
 }
 
@@ -328,6 +380,8 @@ pub struct App {
     /// give back.
     pub marked: HashSet<String>,
     pub listing: Listing,
+    /// Where the catalogue column has got to in that listing.
+    pub paging: Paging,
     /// The search box while it is being typed into.
     pub editing: Option<String>,
     /// The language list while it is open.
@@ -386,6 +440,7 @@ impl App {
             // with no history, or a request that fails, falls back to the catalogue
             // when the answer arrives.
             listing: Listing::History,
+            paging: Paging::first(),
             editing: None,
             picker: None,
             notice: None,
@@ -486,13 +541,71 @@ impl App {
             .collect();
     }
 
+    /// Starts the catalogue column over on the list it is showing.
+    ///
+    /// Every caller of this is a new list or the same list from scratch - the first
+    /// screen, the fallback out of an empty history, a reload, a change of order, a
+    /// search and the way back out of one - and all of them mean the first page. An
+    /// offset carried over from the list being put away would open the next one halfway
+    /// down, and its total would have the header counting against somebody else's list.
     fn request_catalog(&mut self) {
         self.series.clear();
         self.seasons.clear();
         self.clear_episodes();
-        self.series.loading = true;
+        self.paging = Paging::first();
         self.focus = Focus::Series;
-        self.worker.send(Request::Catalog(self.listing.clone()));
+        self.request_catalog_page(0);
+    }
+
+    /// Asks for one page of the list the column is showing, and writes down which one is
+    /// being waited for.
+    fn request_catalog_page(&mut self, start: usize) {
+        self.series.loading = true;
+        self.paging.asked = Some(start);
+        self.worker.send(Request::Catalog {
+            listing: self.listing.clone(),
+            start,
+        });
+    }
+
+    /// Asks for the page after the rows the column already holds.
+    ///
+    /// Nothing happens while an answer is outstanding, so holding `down` against the
+    /// bottom of the list asks once rather than once per repeat; and nothing happens once
+    /// the list has been read to the end, which is what a listing that cannot be paged
+    /// says of its first page. A page that failed leaves `next` where it was, so the
+    /// next time the cursor comes to rest on the last row it is asked for again - the
+    /// user's own retry, rather than a loop that would hammer an endpoint that is down.
+    fn request_next_catalog_page(&mut self) {
+        if self.paging.asked.is_some() {
+            return;
+        }
+        let Some(start) = self.paging.next else {
+            return;
+        };
+        self.request_catalog_page(start);
+    }
+
+    /// Asks for the next page once the cursor has come to rest on the last row the
+    /// catalogue column holds.
+    ///
+    /// Every way of moving a cursor ends up here rather than a key of its own: `down`
+    /// clamped against the bottom, a `page-down` that overshot, `bottom`, the wheel and a
+    /// drag all put the cursor somewhere through [`App::pane_move`], [`App::put_cursor`]
+    /// or [`App::focused_pane_edge`], and the list growing when you reach the end of it
+    /// is not a thing anyone should have to ask for by name. Only the catalogue: the
+    /// seasons and the episodes of one season arrive whole, and the queue is this run's
+    /// own doing.
+    fn catalog_page_if_at_the_end(&mut self, focus: Focus) {
+        if focus != Focus::Series {
+            return;
+        }
+        let Some(cursor) = self.series.state.selected() else {
+            return;
+        };
+        if cursor + 1 >= self.series.items.len() {
+            self.request_next_catalog_page();
+        }
     }
 
     fn request_seasons(&mut self) {
@@ -547,7 +660,8 @@ impl App {
         self.marked = marks;
     }
 
-    /// A catalogue answer, and the one decision the opening screen still has to make.
+    /// A page of the catalogue, and the one decision the opening screen still has to
+    /// make.
     ///
     /// The interface asks for Continue watching first, which is the best thing to open
     /// on right up until the account has never watched anything, or the request fails:
@@ -557,13 +671,28 @@ impl App {
     /// saying so, since a column showing a different list from the one that was asked
     /// for has no business doing it quietly.
     ///
+    /// The page is checked against the list on screen and against the offset the column
+    /// is waiting for, which are two different questions. The first is the pane owner's
+    /// job done for a list rather than a series: an answer for a list the user has since
+    /// cycled past has nothing to do with what is drawn now. The second is what keeps a
+    /// page from being appended twice - a request that was still in flight when the list
+    /// was started over comes back looking like page one of a list that is indeed the
+    /// one on screen, and appending it would show the first hundred series twice.
+    ///
     /// Split out of [`App::drain`] so a test can hand the interface an answer without a
     /// worker behind it.
-    fn catalog_arrived(&mut self, listing: Listing, result: Result<Vec<CatalogItem>, String>) {
-        if listing != self.listing {
+    fn catalog_arrived(&mut self, listing: Listing, start: usize, result: Result<Page, String>) {
+        if listing != self.listing || self.paging.asked != Some(start) {
             return;
         }
-        let nothing_to_show = result.as_ref().is_ok_and(Vec::is_empty) || result.is_err();
+        self.paging.asked = None;
+        // The first page replaces what the column held and every page after it is added
+        // to the end, which is also why only the first one restores a cursor and only
+        // the first one can send the interface looking for another list: a later page is
+        // an addition to a column that already has something worth reading in it.
+        let first = start == 0;
+        let nothing_to_show =
+            first && (result.as_ref().is_ok_and(|page| page.items.is_empty()) || result.is_err());
         if listing == Listing::History && nothing_to_show && !self.gave_up_on_history {
             self.gave_up_on_history = true;
             self.sort = 0;
@@ -577,17 +706,33 @@ impl App {
             return;
         }
         match result {
-            Ok(items) => {
-                let count = items.len();
-                self.series.set(items);
-                if count == 0 {
-                    self.say("No series found.");
+            Ok(page) => {
+                self.paging.total = page.total;
+                self.paging.next = page.next;
+                let count = page.items.len();
+                if first {
+                    self.series.set(page.items);
+                    if count == 0 {
+                        self.say("No series found.");
+                    }
+                } else {
+                    self.series.append(page.items);
                 }
             }
             Err(error) => {
                 self.series.loading = false;
-                self.series.error = Some(error.clone());
-                self.complain(error);
+                if first {
+                    self.series.error = Some(error.clone());
+                    self.complain(error);
+                } else {
+                    // The rows already loaded are still perfectly good, and throwing
+                    // away a hundred series the user has been walking through because
+                    // the hundred-and-first could not be fetched would be a strange way
+                    // to report it. So the column is left as it is and the status line
+                    // carries the news, which is where everything else that fails
+                    // quietly in the background says so.
+                    self.complain(format!("Could not load more series ({error})"));
+                }
             }
         }
     }
@@ -617,7 +762,11 @@ impl App {
     /// produce.
     pub fn accept(&mut self, response: Response) {
         match response {
-            Response::Catalog { listing, result } => self.catalog_arrived(listing, result),
+            Response::Catalog {
+                listing,
+                start,
+                result,
+            } => self.catalog_arrived(listing, start, result),
             Response::Seasons { series_id, result } => {
                 if series_id != self.seasons.owner {
                     return;
@@ -745,6 +894,7 @@ impl App {
             Focus::Episodes => self.episodes.move_by(delta),
             Focus::Downloads => self.downloads.move_by(delta),
         }
+        self.catalog_page_if_at_the_end(focus);
     }
 
     fn focused_pane_move(&mut self, delta: isize) {
@@ -778,6 +928,7 @@ impl App {
             Focus::Episodes => self.episodes.select(index),
             Focus::Downloads => self.downloads.select(index),
         }
+        self.catalog_page_if_at_the_end(focus);
     }
 
     /// The item on `row` of a column, if the pointer is on one rather than on a border,
@@ -794,6 +945,7 @@ impl App {
             Focus::Episodes => self.episodes.select_edge(last),
             Focus::Downloads => self.downloads.select_edge(last),
         }
+        self.catalog_page_if_at_the_end(self.focus);
     }
 
     fn descend(&mut self) -> Action {
@@ -1557,7 +1709,7 @@ mod tests {
     use crate::tui::worker::{Listing, Request, Response, Update, Worker};
 
     use super::{
-        Action, App, Focus, OnDisk, Pane, SeasonEpisode, State, episode_label, whole_seconds,
+        Action, App, Focus, OnDisk, Page, Pane, SeasonEpisode, State, episode_label, whole_seconds,
     };
 
     /// An interface with nothing behind it: the worker swallows every request and never
@@ -1590,6 +1742,46 @@ mod tests {
             kind: "series".to_owned(),
             ..CatalogItem::default()
         }
+    }
+
+    /// One page of a catalogue list as the worker hands it over: `count` series starting
+    /// at `start`, with what the endpoint said about the length of the list and about
+    /// where the next page begins. The ids carry the offset they came from, so a page
+    /// appended in the wrong place or appended twice shows up as an id in the wrong row
+    /// rather than only as a count.
+    fn page(
+        start: usize,
+        count: usize,
+        total: Option<usize>,
+        next: Option<usize>,
+    ) -> Result<Page, String> {
+        Ok(Page {
+            items: (start..start + count)
+                .map(|index| series(&format!("G{index}")))
+                .collect(),
+            total,
+            next,
+        })
+    }
+
+    /// Hands the interface a catalogue answer the way the worker does, naming the list
+    /// and the offset it was asked for - which is what the interface checks it against.
+    fn catalog(app: &mut App, listing: Listing, start: usize, result: Result<Page, String>) {
+        app.accept(Response::Catalog {
+            listing,
+            start,
+            result,
+        });
+    }
+
+    /// A catalogue column part-way through a long list: `loaded` series in it, `total` in
+    /// the list, and a page waiting behind them. The order is changed first because the
+    /// interface opens on the history, which is the one list that is not paged.
+    fn with_catalogue(app: &mut App, loaded: usize, total: usize) {
+        app.run(Command::Order);
+        let listing = app.listing.clone();
+        catalog(app, listing, 0, page(0, loaded, Some(total), Some(loaded)));
+        app.sent();
     }
 
     /// An open season, so that the download keys have something to act on, with the
@@ -1923,7 +2115,7 @@ mod tests {
         let mut app = app();
         assert_eq!(app.listing, Listing::History);
 
-        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        catalog(&mut app, Listing::History, 0, page(0, 0, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
         assert!(app.series.loading, "the catalogue was asked for");
         assert!(
@@ -1932,7 +2124,7 @@ mod tests {
         );
 
         // And the answer to that request is taken as the list it is.
-        app.catalog_arrived(Listing::Browse(0), Ok(vec![series("GY8VEQ95Y")]));
+        catalog(&mut app, Listing::Browse(0), 0, page(0, 1, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
         assert_eq!(app.series.items.len(), 1);
         assert!(!app.series.loading);
@@ -1945,7 +2137,12 @@ mod tests {
     #[test]
     fn a_failed_history_opens_the_catalogue_instead() {
         let mut app = app();
-        app.catalog_arrived(Listing::History, Err("no account id".to_owned()));
+        catalog(
+            &mut app,
+            Listing::History,
+            0,
+            Err("no account id".to_owned()),
+        );
         assert_eq!(app.listing, Listing::Browse(0));
         assert_eq!(app.series.error, None, "the column kept the error");
         assert!(
@@ -1962,18 +2159,18 @@ mod tests {
     #[test]
     fn the_fallback_happens_once() {
         let mut app = app();
-        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        catalog(&mut app, Listing::History, 0, page(0, 0, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
 
         // An empty catalogue is not a reason to go looking for another list.
-        app.catalog_arrived(Listing::Browse(0), Ok(Vec::new()));
+        catalog(&mut app, Listing::Browse(0), 0, page(0, 0, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
 
         // Nor is the history, once it has been chosen deliberately.
         while app.listing != Listing::History {
             app.run(Command::Order);
         }
-        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        catalog(&mut app, Listing::History, 0, page(0, 0, None, None));
         assert_eq!(
             app.listing,
             Listing::History,
@@ -2003,6 +2200,311 @@ mod tests {
         // And the ring carries on from there rather than starting over.
         app.run(Command::Order);
         assert_eq!(app.listing, Listing::Watchlist);
+    }
+
+    /// The whole point of the feature: the catalogue used to be the first hundred series
+    /// and nothing else, and walking to the end of it now asks for the next hundred and
+    /// puts them after the ones already there. Appending rather than replacing is what
+    /// makes the list one list - a page that replaced what was on screen would leave the
+    /// user at the top of a column they had just walked to the bottom of.
+    #[test]
+    fn reaching_the_bottom_of_the_catalogue_asks_for_the_next_page() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        assert_eq!(app.paging.total, Some(250));
+
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 100,
+            }],
+            "the end of the loaded list asked for nothing"
+        );
+
+        let cursor = app.series.state.selected();
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        assert_eq!(app.series.items.len(), 200);
+        assert_eq!(
+            app.series.items[0].id, "G0",
+            "the first page was thrown away"
+        );
+        assert_eq!(app.series.items[100].id, "G100");
+        assert_eq!(
+            app.series.state.selected(),
+            cursor,
+            "the cursor was moved off the row the user was standing on"
+        );
+        assert_eq!(app.paging.next, Some(200));
+    }
+
+    /// One request in flight at a time. Holding `down` against the bottom of the list is
+    /// several keypresses at the last row, and each of them asks the same question: a
+    /// column that sent one request per repeat would fetch the same page a dozen times
+    /// and append every copy of it.
+    #[test]
+    fn only_one_page_is_asked_for_at_a_time() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+
+        app.run(Command::Bottom);
+        app.run(Command::Down);
+        app.run(Command::Down);
+        app.run(Command::PageDown);
+        assert_eq!(
+            app.sent().len(),
+            1,
+            "the same page was asked for repeatedly"
+        );
+
+        // And once it has arrived, the one after it can be asked for.
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 200,
+            }]
+        );
+    }
+
+    /// A list that has been read to the end is not asked about again, however long the
+    /// user stands at the bottom of it. Without that the last row of every finished list
+    /// would be a request per keypress, into a list that has nothing left to give.
+    #[test]
+    fn a_list_read_to_its_end_is_not_asked_for_again() {
+        let mut app = app();
+        app.run(Command::Order);
+        let listing = app.listing.clone();
+        catalog(&mut app, listing, 0, page(0, 40, Some(40), None));
+        app.sent();
+        app.run(Command::Bottom);
+        assert!(
+            app.sent().is_empty(),
+            "a list with nothing behind it was asked for more"
+        );
+    }
+
+    /// The history is the one list in the ring that is not paged, and it says so by
+    /// answering with no page after its first: it is a page of episodes boiled down to
+    /// the series behind them, so an offset into it means nothing to the rows the column
+    /// shows - `api::CrunchyrollClient::history` sets out why. The interface needs no
+    /// rule of its own about which lists page; it asks for what the last answer said was
+    /// there, and the history says there is nothing.
+    #[test]
+    fn the_history_is_shown_whole_and_not_paged() {
+        let mut app = app();
+        assert_eq!(app.listing, Listing::History);
+        catalog(&mut app, Listing::History, 0, page(0, 20, None, None));
+        app.sent();
+
+        app.run(Command::Bottom);
+        assert!(
+            app.sent().is_empty(),
+            "the history was asked for a second page of series it cannot offer"
+        );
+        assert_eq!(
+            app.paging.total, None,
+            "the header would be counting episodes against series"
+        );
+    }
+
+    /// Two ways a page can arrive that must not be drawn, and they are different
+    /// questions. A page of a list the user has cycled past belongs to a column that is
+    /// no longer on screen - the pane owner's argument, made about a list rather than a
+    /// series. A second copy of a page already appended belongs to the list on screen,
+    /// and appending it would show the same hundred series twice.
+    #[test]
+    fn a_page_nobody_is_waiting_for_is_dropped() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        app.run(Command::Order);
+        app.sent();
+
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        assert!(
+            app.series.items.is_empty(),
+            "a page of the list the user left was drawn into the one they went to"
+        );
+
+        let listing = app.listing.clone();
+        catalog(
+            &mut app,
+            listing.clone(),
+            0,
+            page(0, 100, Some(250), Some(100)),
+        );
+        assert_eq!(app.series.items.len(), 100);
+        catalog(&mut app, listing, 0, page(0, 100, Some(250), Some(100)));
+        assert_eq!(
+            app.series.items.len(),
+            100,
+            "the same page was appended a second time"
+        );
+    }
+
+    /// A page that fails is a page that fails, not a catalogue that fails. The hundred
+    /// series already loaded are still perfectly good and the user is standing among
+    /// them, so they stay where they are and the status line carries the news - the same
+    /// place everything else that goes wrong in the background says so. Asking again is
+    /// the user's own move: the cursor is still on the last row, so the next press at the
+    /// bottom retries.
+    #[test]
+    fn a_page_that_fails_leaves_the_column_alone() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        app.sent();
+
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            Err("503 Service Unavailable".to_owned()),
+        );
+        assert_eq!(app.series.items.len(), 100, "the column was emptied");
+        assert_eq!(
+            app.series.error, None,
+            "the column put an error where its rows were"
+        );
+        assert!(
+            said(&app).contains("503 Service Unavailable"),
+            "{}",
+            said(&app)
+        );
+        assert!(app.notice.as_ref().is_some_and(|notice| notice.error));
+
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 100,
+            }],
+            "a page that failed could not be asked for again"
+        );
+    }
+
+    /// One way of getting to the bottom of a column, under the name to put in the
+    /// failure if it does not.
+    type Way = (&'static str, fn(&mut App));
+
+    /// Whichever way the user gets to the last row is the way that asks for more. `down`
+    /// clamped against the bottom, a `page-down` that overshoots, `bottom`, and the
+    /// pointer - the wheel moves a column's cursor and a drag puts it on a row, both
+    /// through the same two helpers the keys use. A trigger hung off one key would leave
+    /// the list refusing to grow for anyone who scrolls with the wheel.
+    #[test]
+    fn every_way_to_the_last_row_asks_for_the_next_page() {
+        let ways: [Way; 5] = [
+            ("down", |app| {
+                for _ in 0..12 {
+                    app.run(Command::Down);
+                }
+            }),
+            ("page-down", |app| {
+                app.run(Command::PageDown);
+                app.run(Command::PageDown);
+            }),
+            ("bottom", |app| {
+                app.run(Command::Bottom);
+            }),
+            ("the wheel", |app| app.pane_move(Focus::Series, 12)),
+            ("a drag", |app| app.put_cursor(Focus::Series, 11)),
+        ];
+        for (how, reach_the_end) in ways {
+            let mut app = app();
+            with_catalogue(&mut app, 12, 40);
+            reach_the_end(&mut app);
+            assert_eq!(app.series.state.selected(), Some(11), "{how} stopped short");
+            assert_eq!(
+                app.sent(),
+                vec![Request::Catalog {
+                    listing: Listing::Browse(0),
+                    start: 12,
+                }],
+                "{how} reached the end of the list and asked for nothing"
+            );
+        }
+    }
+
+    /// Every way of starting a list over reads it from the top again. The offsets belong
+    /// to the list that was open, so one carried into a reload, a change of order, a
+    /// search or the way out of one would open the new list a hundred series in - and
+    /// leave the header counting against a total that was somebody else's.
+    #[test]
+    fn a_list_started_over_asks_for_its_first_page() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        assert_eq!(app.series.items.len(), 200);
+        app.sent();
+
+        app.run(Command::Reload);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 0,
+            }]
+        );
+        assert_eq!(app.paging.next, Some(0));
+        assert_eq!(
+            app.paging.total, None,
+            "the length of the list before the reload outlived it"
+        );
+
+        app.run(Command::Order);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(1),
+                start: 0,
+            }]
+        );
+
+        app.editing = Some("frieren".to_owned());
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Search("frieren".to_owned()),
+                start: 0,
+            }]
+        );
+
+        app.run(Command::Back);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(1),
+                start: 0,
+            }]
+        );
     }
 
     /// The playhead that marks an episode watched is its own running time, and the

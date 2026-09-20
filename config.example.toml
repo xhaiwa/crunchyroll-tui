@@ -221,7 +221,9 @@ mpv-args = []
 
 [keys]
 
-# Moving around a column.
+# Moving around a column. Any of these that ends on the last row of the Series
+# column asks Crunchyroll for the next hundred series and adds them to the end,
+# so the catalogue is walked rather than paged by hand.
 up = ["up", "k"]
 down = ["down", "j"]
 page-up = "pgup"

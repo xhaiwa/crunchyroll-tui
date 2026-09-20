@@ -235,6 +235,25 @@ there has no seasons behind it and would be a row that does nothing when opened.
 is not on that ring; it is left with `back` rather than cycled past, and leaving one comes
 back to the browse order that was in use when it started.
 
+The catalogue arrives a hundred series at a time, and walking to the last row of the
+Series column asks for the next hundred and adds them to the end - with `down`,
+`page-down`, `bottom`, the wheel or a drag, whichever way you got there. The header counts
+what is loaded against what the list holds, `100 of 1203 series`, so the column reads as
+one long list rather than as a first page you cannot get past. One page is fetched at a
+time, however long you stand at the bottom; a page Crunchyroll will not hand over leaves
+the series already loaded exactly where they are and says so on the status line, and the
+next press at the bottom tries again. Reloading with `r`, changing the order with `o`,
+searching, and leaving a search all start the list again from its first page.
+
+Continue watching is the one list that is shown whole. It is a page of the episodes you
+last played, boiled down to the series behind them, so an offset into it counts episodes
+while the column counts series - a second page of it would bring back a handful of rows,
+most of them already on screen. A hundred episodes is a long way back through anyone's
+watching, and its header says how many series that came to. The watchlist and a search do
+page, but neither publishes a count of the same things this column shows - the watchlist
+counts the films on it, which this column drops - so their headers say what is loaded and
+leave it there.
+
 `w` acts on the series the catalogue column has selected, whoever has the keyboard: the
 seasons and the episodes on screen are that series' own. `m` and `M` act on the episode
 under the cursor, and what they do is move its playhead - Crunchyroll counts an episode
