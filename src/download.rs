@@ -2073,6 +2073,11 @@ mod tests {
         written(&output);
         assert_eq!(on_disk_in(base, &info, "1080p"), OnDisk::Complete);
 
+        // The quality is part of the name, so what is here answers for the quality it was
+        // downloaded at and for no other. That is what makes cycling the quality in the
+        // interface a different question rather than the same one asked again.
+        assert_eq!(on_disk_in(base, &info, "720p"), OnDisk::Missing);
+
         // And asking about an episode nothing has touched leaves the disk as it found
         // it, since the episodes column asks about every row it draws.
         let untouched = episode("Some Series", 1, 4, "Another");

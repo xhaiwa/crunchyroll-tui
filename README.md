@@ -11,6 +11,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
 - Downloads that run in the background: a queue in a panel of its own, with the catalogue still usable while a season comes down
 - The watchlist and the history kept up to date from the interface: a series added or removed, an episode marked watched or unwatched
+- The episodes you already have marked in the column, so a season you have downloaded says so without being downloaded again
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
@@ -259,6 +260,24 @@ episode you have finished, and the time to pick it up from for one you left part
 through - which is where playing it opens. The marker takes the running time's place
 rather than a column of its own, so the titles stay where they are on a narrow terminal.
 See [Picking up where you left off](#picking-up-where-you-left-off).
+
+It also says what is already on this disk, in two cells of its own ahead of that: a
+filled circle `●` for an episode whose MKV is here, a half-filled `◐` for one that has
+been started and not finished - a download running now, or the `.part` and `.part.json`
+a run that stopped left behind, which is exactly what the next run would pick up. What
+you have and what you have watched are different things - an episode can be downloaded
+and never watched, or watched on the phone and never downloaded - so they are drawn side
+by side rather than sharing a slot.
+
+The files are looked for where downloading would write them, under the directory you
+started the program in. The disk is asked when a season is opened, when `v` changes the
+quality - the quality is part of the file name, so it is a different file - and at the
+moments a queued download changes what is there, so an episode you queue turns half-filled
+once it is properly under way and filled as it lands, without the column being reloaded.
+It is not asked once per frame:
+that would be a couple of hundred questions a second about files that change twice an
+hour. An episode downloaded outside the program, or by a run that was going while this
+one sat open, shows up the next time the season is opened or reloaded with `r`.
 
 #### With a mouse
 

@@ -4,6 +4,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
+use crate::download::OnDisk;
 use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 use crate::play::resume_at;
 use crate::util::language_name;
@@ -97,7 +98,8 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
     ListItem::new(Line::from(spans))
 }
 
-/// One episode: its number, what the account has already made of it, and its title.
+/// One episode: its number, what this machine already has of it, what the account has
+/// already made of it, and its title.
 ///
 /// The marker takes the running time's place rather than a column of its own. The three
 /// lists are already fighting for room on a narrow terminal, and a title pushed off the
@@ -105,10 +107,20 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
 /// through is the less interesting of the two anyway, since where to pick it up says more
 /// than how long it lasts. It is the same rule playing uses, so a row showing a time is a
 /// row mpv opens at that time, and a check is an episode it would start from the top.
+///
+/// What is on this disk cannot share that slot, because it is a different fact: an
+/// episode can be downloaded and never watched, or watched on the phone and never
+/// downloaded, and a row has to be able to say both at once. It gets two cells ahead of
+/// the time - a filled circle for the whole episode, a half-filled one for an episode
+/// that has been started and not finished, whether it is being written now or was left
+/// that way by a run that stopped - and the two cells are spent whether there is a file
+/// or not, since a marker that appeared only when it had something to report would shift
+/// every title in the column as the eye ran down it.
 fn episode_row(
     theme: &Theme,
     episode: &SeasonEpisode,
     playhead: Option<&Playhead>,
+    held: OnDisk,
 ) -> ListItem<'static> {
     let number = if episode.episode.is_empty() {
         episode.episode_number.to_string()
@@ -116,6 +128,11 @@ fn episode_row(
         episode.episode.clone()
     };
     let mut spans = vec![theme.accent(format!("E{number:<3}"))];
+    spans.push(match held {
+        OnDisk::Complete => theme.accent("● "),
+        OnDisk::Partial => theme.dim("◐ "),
+        OnDisk::Missing => theme.dim("  "),
+    });
     let resume =
         playhead.and_then(|seen| resume_at(seen.playhead, episode.duration_ms, seen.fully_watched));
     if let Some(seconds) = resume {
@@ -850,7 +867,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.episodes
             .items
             .iter()
-            .map(|episode| episode_row(&theme, episode, app.playheads.get(&episode.id)))
+            .map(|episode| {
+                let held = app
+                    .downloaded
+                    .get(&episode.id)
+                    .copied()
+                    .unwrap_or(OnDisk::Missing);
+                episode_row(&theme, episode, app.playheads.get(&episode.id), held)
+            })
             .collect()
     };
     let focused = focus == Focus::Episodes;
@@ -1013,7 +1037,7 @@ mod tests {
 
     use image::{DynamicImage, Rgb, RgbImage};
 
-    use crate::download::DownloadOptions;
+    use crate::download::{DownloadOptions, OnDisk};
     use crate::model::{
         Artwork, CatalogItem, Images, Playhead, Season, SeasonEpisode, SeriesMetadata,
     };
@@ -1676,6 +1700,48 @@ mod tests {
             .collect();
         let screen = rendered(120, 30, &mut app);
         assert!(screen.contains("24:21"), "so the running time is back");
+    }
+
+    /// A season already sitting on the disk looked exactly like one that was not, and
+    /// starting the download again was the only way to find out which was which. The
+    /// marker says it in the column, beside what the account has watched rather than
+    /// instead of it: an episode can be downloaded and never watched, or watched on the
+    /// phone and never downloaded, and a row has to be able to say both at once.
+    #[test]
+    fn says_which_episodes_are_already_on_the_disk() {
+        let mut app = app();
+        app.downloaded = [
+            ("E1".to_owned(), OnDisk::Complete),
+            ("E2".to_owned(), OnDisk::Partial),
+        ]
+        .into_iter()
+        .collect();
+        app.playheads = [("E1".to_owned(), playhead("E1", 842, false))]
+            .into_iter()
+            .collect();
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("E1  \u{25cf}"), "E1 is here in full");
+        assert!(
+            screen.contains("E2  \u{25d0}"),
+            "and a cut-off download left half of E2"
+        );
+        assert!(
+            screen.contains("14:02"),
+            "the download marker was drawn in the playhead's slot instead of its own"
+        );
+
+        // An episode with no file spends the same two cells on nothing, so a column with
+        // one downloaded episode in it does not have its titles stepping in and out.
+        app.downloaded.clear();
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            !screen.contains('\u{25cf}') && !screen.contains('\u{25d0}'),
+            "a marker was drawn for an episode that is not here"
+        );
+        assert!(
+            screen.contains("E1     14:02"),
+            "the columns moved when the marker went"
+        );
     }
 
     /// An answer is only worth painting onto the column it was asked about. The lists are
