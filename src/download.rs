@@ -211,6 +211,12 @@ fn encrypted_path(output: &Path) -> PathBuf {
     PathBuf::from(format!("{}.enc", output.display()))
 }
 
+/// Where a download that was interrupted left what it had got: beside the finished name,
+/// so that looking for it is the same question as looking for the MKV.
+fn part_path(output: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.part", output.display()))
+}
+
 /// True once the player has let go of its end of a pipe, which is how a normal quit
 /// reaches the threads that are still feeding it.
 fn is_broken_pipe(error: &anyhow::Error) -> bool {
@@ -1241,25 +1247,83 @@ fn filter_available(
         .collect()
 }
 
+/// Where one episode's MKV goes: `Frieren/Frieren S01E01 - The Journey Ends [1080p].mkv`,
+/// under the directory the process was started in, as every other path a download writes
+/// is.
+///
+/// The downloader is no longer the only caller. The episodes column wants to say which
+/// episodes are already here, and it cannot ask without knowing what the file would be
+/// called, so the name is built once and `download_episode` asks for it like anybody
+/// else. The alternative was a second copy of the format string over in the interface,
+/// and the two would say different things the first time either side gained a field -
+/// which shows up as a column insisting a season has not been downloaded while the files
+/// sit beside it.
+pub fn output_path(info: &EpisodeInfo, video_quality: &str) -> PathBuf {
+    output_path_in(Path::new(""), info, video_quality)
+}
+
+/// The same name, under `library` rather than under the working directory.
+///
+/// Only the tests pass anything but the empty path. They run several at a time in one
+/// process, and `set_current_dir` is a setting of the process rather than of the thread,
+/// so a test that moved into a temporary directory of its own would be deciding where
+/// every other test's relative paths pointed for as long as it ran. A directory passed
+/// in is what lets each of them have one to itself.
+fn output_path_in(library: &Path, info: &EpisodeInfo, video_quality: &str) -> PathBuf {
+    let series_title = sanitize_filename(&info.episode_metadata.series_title);
+    let episode_title = sanitize_filename(&info.title);
+    library.join(&series_title).join(format!(
+        "{series_title} S{:02}E{:02} - {episode_title} [{video_quality}].mkv",
+        info.episode_metadata.season_number, info.episode_metadata.episode_number,
+    ))
+}
+
+/// How much of one episode this machine already holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OnDisk {
+    #[default]
+    Missing,
+    /// A `.part` beside the finished name, which is where a download that was cut off
+    /// leaves what it had got. Nothing writes one yet - resuming is being built
+    /// elsewhere - but half an episode is a different answer from no episode, and the
+    /// variant costs nothing to carry until something produces it.
+    Partial,
+    Complete,
+}
+
+/// Whether the episode is already here, without asking Crunchyroll anything.
+///
+/// Looking is all this does. `download_episode` is what creates the series directory,
+/// and a column being drawn must not leave an empty directory behind every season that
+/// was scrolled past.
+pub fn on_disk(info: &EpisodeInfo, video_quality: &str) -> OnDisk {
+    on_disk_in(Path::new(""), info, video_quality)
+}
+
+fn on_disk_in(library: &Path, info: &EpisodeInfo, video_quality: &str) -> OnDisk {
+    let output = output_path_in(library, info, video_quality);
+    if output.exists() {
+        OnDisk::Complete
+    } else if part_path(&output).exists() {
+        OnDisk::Partial
+    } else {
+        OnDisk::Missing
+    }
+}
+
 pub fn download_episode(
     client: &CrunchyrollClient,
     base_content_id: &str,
     info: &EpisodeInfo,
     options: &DownloadOptions,
 ) -> Result<()> {
-    let series_title = sanitize_filename(&info.episode_metadata.series_title);
     let output_file = if options.play {
         None
     } else {
-        let episode_title = sanitize_filename(&info.title);
+        let series_title = sanitize_filename(&info.episode_metadata.series_title);
         fs::create_dir_all(&series_title)
             .with_context(|| format!("create output directory {series_title}"))?;
-        Some(Path::new(&series_title).join(format!(
-            "{series_title} S{:02}E{:02} - {episode_title} [{}].mkv",
-            info.episode_metadata.season_number,
-            info.episode_metadata.episode_number,
-            options.video_quality
-        )))
+        Some(output_path(info, &options.video_quality))
     };
     if output_file.as_ref().is_some_and(|file| file.exists()) {
         println!(
@@ -1482,6 +1546,65 @@ mod tests {
             scratch_dir(Some(Path::new("episode.mkv"))),
             std::env::temp_dir()
         );
+    }
+
+    /// One episode of a season listing, as the downloader and the interface both see it.
+    fn frieren() -> EpisodeInfo {
+        EpisodeInfo {
+            episode_metadata: EpisodeMetadata {
+                series_title: "Frieren".to_owned(),
+                season_number: 1,
+                episode_number: 1,
+                ..EpisodeMetadata::default()
+            },
+            title: "The Journey Ends".to_owned(),
+        }
+    }
+
+    /// The name is now read as well as written - the episodes column asks for it to find
+    /// out what is already here - so it is worth pinning down letter by letter rather
+    /// than by rebuilding it the way the code under test does. Everything in it matters
+    /// to somebody: the series directory, the two-digit season and episode, and the
+    /// quality in brackets, which is what makes `v` point at a different file rather than
+    /// at the same one.
+    #[test]
+    fn an_episode_is_filed_the_way_the_downloader_files_it() {
+        assert_eq!(
+            output_path(&frieren(), "1080p").display().to_string(),
+            "Frieren/Frieren S01E01 - The Journey Ends [1080p].mkv"
+        );
+        assert_eq!(
+            output_path(&frieren(), "720p").display().to_string(),
+            "Frieren/Frieren S01E01 - The Journey Ends [720p].mkv"
+        );
+    }
+
+    /// What the marker in the episodes column is drawn from. A finished MKV and a `.part`
+    /// left by a download that was cut off are different things to tell somebody, and an
+    /// episode downloaded at another quality is a file this one knows nothing about.
+    ///
+    /// Looking has to be free of consequences as well: the column asks about every row of
+    /// every season that is opened, and a question that created the series directory
+    /// would leave one behind for each of them.
+    #[test]
+    fn an_episode_is_missing_until_its_own_file_is_there() {
+        let library = tempfile::tempdir().expect("a temporary library");
+        let info = frieren();
+        assert_eq!(on_disk_in(library.path(), &info, "1080p"), OnDisk::Missing);
+        assert!(
+            !library.path().join("Frieren").exists(),
+            "merely looking created the series directory"
+        );
+
+        let output = output_path_in(library.path(), &info, "1080p");
+        fs::create_dir_all(output.parent().expect("the series directory"))
+            .expect("create the series directory");
+        fs::write(part_path(&output), b"half an episode").expect("write the part file");
+        assert_eq!(on_disk_in(library.path(), &info, "1080p"), OnDisk::Partial);
+
+        fs::write(&output, b"a whole episode").expect("write the episode");
+        assert_eq!(on_disk_in(library.path(), &info, "1080p"), OnDisk::Complete);
+        assert_eq!(on_disk_in(library.path(), &info, "720p"), OnDisk::Missing);
     }
 
     fn status_error(status: u16) -> anyhow::Error {

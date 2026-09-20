@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Position;
 use ratatui::widgets::ListState;
 
-use crate::download::DownloadOptions;
+use crate::download::{DownloadOptions, OnDisk, episode_info, on_disk};
 use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 use crate::util::{LANGUAGES, language_name};
 
@@ -192,6 +192,12 @@ pub struct App {
     /// they are: a marker held over from the last season would be painted onto whichever
     /// episode of this one happened to share an id, which is none of them.
     pub playheads: HashMap<String, Playhead>,
+    /// Which episodes of the open season are already on this disk, by content id. Only
+    /// the ones that are: a row with no entry here is a row with no file. Emptied with
+    /// the episodes for the same reason the playheads are, and looked up again whenever
+    /// the answer could have changed - which includes a change of quality, since the
+    /// quality is part of the file name.
+    pub downloaded: HashMap<String, OnDisk>,
     pub listing: Listing,
     /// The search box while it is being typed into.
     pub editing: Option<String>,
@@ -239,6 +245,7 @@ impl App {
             seasons: Pane::default(),
             episodes: Pane::default(),
             playheads: HashMap::new(),
+            downloaded: HashMap::new(),
             // The most useful first screen a video client has is the thing that was
             // being watched last, so that is what the interface opens on. An account
             // with no history, or a request that fails, falls back to the catalogue
@@ -309,6 +316,28 @@ impl App {
     fn clear_episodes(&mut self) {
         self.episodes.clear();
         self.playheads.clear();
+        self.downloaded.clear();
+    }
+
+    /// Asks the disk which of the episodes now in the column are already here.
+    ///
+    /// Once per list rather than once per row per frame. The answer is a `stat` for each
+    /// episode, the interface redraws ten times a second, and a row that asked as it was
+    /// drawn would put a few hundred of them a second between the user and a screen that
+    /// says the same thing every time. It is asked again whenever the question changes
+    /// instead: a new season, and a change of quality, since the quality is written into
+    /// the file name and a 720p copy is not the 1080p one the downloader would write.
+    fn look_on_disk(&mut self) {
+        let quality = &self.options.video_quality;
+        self.downloaded = self
+            .episodes
+            .items
+            .iter()
+            .filter_map(|episode| {
+                let held = on_disk(&episode_info(episode), quality);
+                (held != OnDisk::Missing).then(|| (episode.id.clone(), held))
+            })
+            .collect();
     }
 
     fn request_catalog(&mut self) {
@@ -445,6 +474,7 @@ impl App {
                     Ok(items) => {
                         let episode_ids = items.iter().map(|episode| episode.id.clone()).collect();
                         self.episodes.set(items);
+                        self.look_on_disk();
                         // Now rather than when the season was asked for: these are the
                         // ids the answer actually brought back.
                         self.worker.send(Request::Playheads {
@@ -767,6 +797,11 @@ impl App {
             .map_or(0, |index| (index + 1) % QUALITIES.len());
         self.options.video_quality = QUALITIES[next].to_owned();
         let quality = self.options.video_quality.clone();
+        // The quality names the file, so the column was until this moment answering for
+        // a file the downloader would no longer write. Nothing has to be fetched again -
+        // Crunchyroll picks the quality when the stream is asked for, not when the
+        // season is listed - so only this one question is put afresh.
+        self.look_on_disk();
         self.say(format!("Video quality: {quality}"));
     }
 
@@ -1132,7 +1167,7 @@ mod tests {
     use crate::tui::theme::Theme;
     use crate::tui::worker::{Listing, Worker};
 
-    use super::{App, Pane, SeasonEpisode, episode_label, whole_seconds};
+    use super::{App, OnDisk, Pane, SeasonEpisode, episode_label, whole_seconds};
 
     /// An interface with nothing behind it: the worker swallows every request and never
     /// answers one, so the only answers it sees are those a test hands it directly.
@@ -1341,5 +1376,32 @@ mod tests {
         pane.select(0);
         assert_eq!(pane.state.selected(), None, "an empty pane has no row 0");
         assert_eq!(pane.window(), (0, 0));
+    }
+
+    /// The quality is part of the file name, so `v` changes which file each row is
+    /// asking about. A marker left over from the quality before it would be describing a
+    /// file the downloader would no longer write: the row would be saying the episode is
+    /// here while pressing download started it from nothing.
+    #[test]
+    fn a_change_of_quality_asks_the_disk_again() {
+        let mut app = app();
+        app.episodes.set(vec![SeasonEpisode {
+            id: "E1".to_owned(),
+            series_title: "Frieren".to_owned(),
+            season_number: 1,
+            episode_number: 1,
+            title: "The Journey Ends".to_owned(),
+            ..SeasonEpisode::default()
+        }]);
+        // Nothing of this series is anywhere near the directory the tests run in, so
+        // whatever the column was told before, the answer now is that there is no file.
+        app.downloaded.insert("E1".to_owned(), OnDisk::Complete);
+
+        app.run(Command::Quality);
+        assert_eq!(app.options.video_quality, "720p");
+        assert!(
+            app.downloaded.is_empty(),
+            "the marker outlived the quality it was looked up for"
+        );
     }
 }
