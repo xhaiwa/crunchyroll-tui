@@ -5,15 +5,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
 use crate::download::OnDisk;
-use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode, single_name};
 use crate::play::resume_at;
 use crate::util::language_name;
 
-use super::app::{App, Download, Focus, Picker, State};
+use super::app::{App, Download, Editing, Focus, Pane, Picker, State, season_title};
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions};
 use super::theme::Theme;
-use super::worker::Listing;
+use super::worker::{Choice, FilterKind, Listing};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -33,6 +33,54 @@ fn duration(milliseconds: u64) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// What a column is called, wherever it has to be named. One spelling, so that the box
+/// asking which rows to keep names the column the way the column names itself.
+///
+/// The middle column is named after what it is holding rather than after what it usually
+/// holds: a film's one row is not a season, and a header still calling it one would be the
+/// last thing on screen saying so. Which also means `f` in that column says `Filter Film:`
+/// - the box and the title cannot drift apart, because they ask the same function.
+fn column_name(app: &App, focus: Focus) -> &'static str {
+    match focus {
+        Focus::Series => "Series",
+        Focus::Seasons => app
+            .seasons
+            .items
+            .first()
+            .and_then(|season| single_name(&season.kind))
+            .unwrap_or("Seasons"),
+        Focus::Episodes => "Episodes",
+        Focus::Downloads => "Downloads",
+    }
+}
+
+/// A column's name, carrying what it has been narrowed to while it is narrowed:
+/// `Episodes "journ" 2/24`.
+///
+/// A narrowing is invisible otherwise, since the rows it hid are simply not there, and
+/// a column quietly showing two of a season's twenty-four episodes is the sort of thing
+/// somebody comes back to after a cup of tea and reads as a client that has mislaid
+/// half the season. The count is both numbers rather than the one, because how much is
+/// missing is the part that cannot be seen.
+fn pane_title<T>(name: &str, pane: &Pane<T>) -> String {
+    match pane.query() {
+        Some(query) => format!("{name} \"{query}\" {}/{}", pane.rows(), pane.items.len()),
+        None => name.to_owned(),
+    }
+}
+
+/// What a column with no rows in it has to say for itself. A column with nothing in it
+/// and a column narrowed until nothing is left are different problems, and the second
+/// one is the user's own doing and a keystroke to undo, so it says so and quotes what
+/// it was looking for. An empty box under a title reading `Episodes "xyz" 0/24` would
+/// be the interface knowing the answer and keeping it to itself.
+fn nothing_shown<T>(pane: &Pane<T>, idle: &str) -> String {
+    match pane.query() {
+        Some(query) if !pane.items.is_empty() => format!("Nothing matches \"{query}\"."),
+        _ => idle.to_owned(),
     }
 }
 
@@ -69,11 +117,18 @@ fn placeholder(
 
 fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
     let metadata = &series.series_metadata;
+    let film = &series.movie_listing_metadata;
     let mut tags = Vec::new();
-    if metadata.season_count > 1 {
+    // What it is, where it is not a series. `2 seasons` is a thing to say about a series
+    // and nothing to say about a film, and the catalogue now mixes the two: a row that
+    // said neither would leave the column looking like a list of series with some odd
+    // short ones in it.
+    if let Some(word) = single_name(&series.kind) {
+        tags.push(word.to_lowercase());
+    } else if metadata.season_count > 1 {
         tags.push(format!("{} seasons", metadata.season_count));
     }
-    if metadata.is_dubbed {
+    if metadata.is_dubbed || film.is_dubbed {
         tags.push("dub".to_owned());
     }
     let mut spans = vec![theme.text(series.title.clone())];
@@ -85,13 +140,8 @@ fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
 
 fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'static> {
     // A season usually carries the title of the series, which the column to the left
-    // is already showing.
-    let title = if season.title.is_empty() || season.title == series_title {
-        format!("Season {}", season.season_number)
-    } else {
-        season.title.clone()
-    };
-    let mut spans = vec![theme.text(title)];
+    // is already showing - see [`season_title`], which the narrowing reads a row with.
+    let mut spans = vec![theme.text(season_title(season, series_title))];
     if season.number_of_episodes > 0 {
         spans.push(theme.dim(format!("  {} ep", season.number_of_episodes)));
     }
@@ -150,7 +200,13 @@ fn episode_row(
     if let Some(marked) = mark {
         spans.push(theme.accent(if marked { MARK } else { " " }));
     }
-    spans.push(theme.accent(format!("E{number:<3}")));
+    // `E1` is a number an episode has and a film has not, so a row that is a whole thing
+    // in itself is called what the rest of the interface calls it. The word is spent in
+    // the four cells the number slot already takes, so nothing below it moves.
+    spans.push(match single_name(&episode.kind) {
+        Some(word) => theme.accent(format!("{word:<4}")),
+        None => theme.accent(format!("E{number:<3}")),
+    });
     spans.push(match held {
         OnDisk::Complete => theme.accent("● "),
         OnDisk::Partial => theme.dim("◐ "),
@@ -247,36 +303,95 @@ fn line(run: &Run) -> Line<'static> {
     )
 }
 
-/// The left of the header: what is being listed, and how much of it.
+/// How much of the list the catalogue column is holding, for the header.
+///
+/// The column loads a page at a time, so the count on its own would be the one number in
+/// the interface that quietly means something different from what it says: `100 series`
+/// where there are twelve hundred of them reads as the end of the catalogue rather than
+/// as the first hundredth of it. Against the total it says both things at once - how far
+/// the list has been read, and that there is more of it to walk to.
+///
+/// Where the total is unknown it is left out rather than guessed at. The watchlist, the
+/// history and a search have no figure that counts the same things this column shows -
+/// see [`crate::api::Page`] - and a page the simulcast filter has sieved has thrown away
+/// rows the total still counts, so it arrives without one. `100 of 100 series` for a list
+/// that goes on would be a worse answer than saying nothing about the length at all.
+fn tally(app: &App) -> String {
+    let loaded = app.series.items.len();
+    match app.paging.total {
+        Some(total) => format!("   {loaded} of {total} series"),
+        None => format!("   {loaded} series"),
+    }
+}
+
+/// The left of the header: what is being listed, how much of it, and what it is narrowed
+/// by.
 ///
 /// The label is a button, because what it says is exactly what a click on it changes -
 /// `Popular`, `Watchlist` and `Continue watching` alike move on to the next list, and
-/// `Search: frieren` leaves the search. The count beside it is not. While the box is
-/// being typed into, none of it is: a click there closes the box, as escape does.
+/// `Search: frieren` leaves the search. The count beside it is not. The filters that
+/// follow are buttons too, each opening the list it was chosen from, which is where it
+/// is cleared as well as where it is set.
+///
+/// They are drawn only while a browse listing is on screen. The other three lists are
+/// not narrowed by them - see [`Filters`](super::worker::Filters) - and a header is a
+/// description of what is under it, not of what the interface is holding. Leaving the
+/// catalogue with a filter on says so on the status line, so the words do not simply
+/// vanish.
+///
+/// While the box is being typed into, none of it is a button: a click there closes the
+/// box, as escape does.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
-        Some(query) => vec![(
+        // The two boxes are told apart by the word in front of them, because they are
+        // the two things a box of typing could be doing and only one of them is about
+        // to go to Crunchyroll: `Search:` replaces this column with an answer, and
+        // `Filter Episodes:` leaves a column alone but for the rows it is hiding.
+        Some(editing) => vec![(
             None,
             vec![
-                theme.accent("Search: "),
-                theme.text(query.clone()),
+                theme.accent(match editing {
+                    Editing::Search(_) => "Search: ".to_owned(),
+                    Editing::Narrow { focus, .. } => {
+                        format!("Filter {}: ", column_name(app, *focus))
+                    }
+                }),
+                theme.text(editing.query().to_owned()),
                 theme.accent("▏"),
             ],
         )],
-        None => vec![
-            (
-                Some(match app.listing {
-                    Listing::Browse(_) | Listing::Watchlist | Listing::History => Command::Order,
-                    Listing::Search(_) => Command::Back,
-                }),
-                vec![theme.strong(app.listing.label())],
-            ),
-            (
-                None,
-                vec![theme.dim(format!("   {} series", app.series.items.len()))],
-            ),
-        ],
+        None => {
+            let mut run = vec![
+                (
+                    Some(match app.listing {
+                        Listing::Browse(_) | Listing::Watchlist | Listing::History => {
+                            Command::Order
+                        }
+                        Listing::Search(_) => Command::Back,
+                    }),
+                    vec![theme.strong(app.listing.label())],
+                ),
+                (None, vec![theme.dim(tally(app))]),
+            ];
+            if matches!(app.listing, Listing::Browse(_)) {
+                let filters = [
+                    (Command::Genre, app.filters.word(FilterKind::Genre)),
+                    (Command::AnimeSeason, app.filters.word(FilterKind::Season)),
+                    (
+                        Command::Simulcast,
+                        app.filters.simulcast.then(|| "Simulcast".to_owned()),
+                    ),
+                ];
+                for (command, word) in filters {
+                    if let Some(word) = word {
+                        run.push((None, vec![theme.dim("   ")]));
+                        run.push((Some(command), vec![theme.accent(word)]));
+                    }
+                }
+            }
+            run
+        }
     }
 }
 
@@ -332,21 +447,51 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 return lines;
             };
             let metadata = &series.series_metadata;
+            // A film keeps the same facts under a name of its own and leaves
+            // `series_metadata` empty, so both are read and whichever has something to
+            // say fills the line. Nothing has both.
+            let film = &series.movie_listing_metadata;
             lines.push(Line::from(theme.strong(series.title.clone())));
             let mut facts = Vec::new();
-            if metadata.series_launch_year > 0 {
-                facts.push(metadata.series_launch_year.to_string());
+            // What it is comes first where it is not a series, because everything after
+            // it reads differently for a film - a running time rather than a count of
+            // episodes - and this is the one place with room to say which is being
+            // described.
+            if let Some(word) = single_name(&series.kind) {
+                facts.push(word.to_owned());
+            }
+            let year = if metadata.series_launch_year > 0 {
+                metadata.series_launch_year
+            } else {
+                film.movie_release_year
+            };
+            if year > 0 {
+                facts.push(year.to_string());
             }
             if metadata.episode_count > 0 {
                 facts.push(format!("{} episodes", metadata.episode_count));
             }
+            if film.duration_ms > 0 {
+                facts.push(duration(film.duration_ms));
+            }
             if !metadata.audio_locales.is_empty() {
                 facts.push(format!("{} audio tracks", metadata.audio_locales.len()));
             }
-            if !metadata.subtitle_locales.is_empty() {
-                facts.push(format!("{} subtitles", metadata.subtitle_locales.len()));
+            let subtitles = if metadata.subtitle_locales.is_empty() {
+                &film.subtitle_locales
+            } else {
+                &metadata.subtitle_locales
+            };
+            if !subtitles.is_empty() {
+                facts.push(format!("{} subtitles", subtitles.len()));
             }
-            facts.extend(metadata.maturity_ratings.iter().cloned());
+            facts.extend(
+                metadata
+                    .maturity_ratings
+                    .iter()
+                    .chain(film.maturity_ratings.iter())
+                    .cloned(),
+            );
             if metadata.is_simulcast {
                 facts.push("simulcast".to_owned());
             }
@@ -358,14 +503,19 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 return lines;
             };
             lines.push(Line::from(theme.strong(episode.title.clone())));
-            let mut facts = vec![format!(
-                "S{}E{}",
-                episode.season_number,
-                if episode.episode.is_empty() {
-                    episode.episode_number.to_string()
-                } else {
-                    episode.episode.clone()
-                }
+            let mut facts = vec![single_name(&episode.kind).map_or_else(
+                || {
+                    format!(
+                        "S{}E{}",
+                        episode.season_number,
+                        if episode.episode.is_empty() {
+                            episode.episode_number.to_string()
+                        } else {
+                            episode.episode.clone()
+                        }
+                    )
+                },
+                str::to_owned,
             )];
             if episode.duration_ms > 0 {
                 facts.push(duration(episode.duration_ms));
@@ -515,8 +665,14 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// The language list: every locale the selection offers, the one in use marked, and its
-/// code beside the name for anyone who thinks in locales rather than in languages.
+/// One of the lists that open over the interface: every row it offers, the one in force
+/// marked, and each row's value beside its words - for anyone who thinks in locales
+/// rather than in languages, or who wants to see that `Slice of Life` is the
+/// `slice-of-life` a URL would carry.
+///
+/// A list whose rows have not arrived yet says so in the hint along the bottom edge
+/// rather than in a row of its own, because a row there would be one the cursor could
+/// land on and apply.
 ///
 /// Gives back the box it drew itself in, which is what tells a click whether it landed
 /// on the list or beside it.
@@ -527,36 +683,31 @@ fn picker_overlay(
     keys: &Bindings,
     picker: &mut Picker,
     current: &str,
+    tick: usize,
 ) -> Rect {
-    let column = picker
-        .pane
-        .items
-        .iter()
-        .map(|locale| Span::raw(language_name(locale)).width())
-        .max()
-        .unwrap_or(0);
+    let width = |row: &Choice| Span::raw(row.label.as_str()).width();
+    let column = picker.pane.items.iter().map(width).max().unwrap_or(0);
     let items: Vec<ListItem> = picker
         .pane
         .items
         .iter()
-        .map(|locale| {
-            let name = language_name(locale);
-            let padding = " ".repeat(column - Span::raw(name).width() + 2);
+        .map(|row| {
+            let padding = " ".repeat(column - width(row) + 2);
             ListItem::new(Line::from(vec![
-                theme.text(if locale == current { "● " } else { "  " }),
-                theme.text(format!("{name}{padding}")),
-                theme.dim(locale.clone()),
+                theme.text(if row.value == current { "● " } else { "  " }),
+                theme.text(format!("{}{padding}", row.label)),
+                theme.dim(row.value.clone()),
             ]))
         })
         .collect();
-    // Wide enough for the longest language name, and never so narrow that the hint
-    // along the bottom edge is cut in half.
+    // Wide enough for the longest name, and never so narrow that the hint along the
+    // bottom edge is cut in half.
     let area = popup(
         area,
         (column as u16 + 20).max(42),
         picker.pane.items.len() as u16 + 2,
     );
-    let hint = [
+    let mut hint = [
         (Command::Open, "apply"),
         (Command::NextColumn, "other list"),
         (Command::Back, "cancel"),
@@ -568,6 +719,9 @@ fn picker_overlay(
     })
     .collect::<Vec<_>>()
     .join(" · ");
+    if picker.pane.loading {
+        hint = format!("{} {hint}", SPINNER[tick % SPINNER.len()]);
+    }
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(
         List::new(items)
@@ -589,7 +743,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 20] = [
+const HELP: [(&[Command], &str); 23] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -606,7 +760,19 @@ const HELP: [(&[Command], &str); 20] = [
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
+    (
+        &[Command::Filter],
+        "narrow this column to the rows that match, as you type",
+    ),
     (&[Command::Order], "change the list the catalogue shows"),
+    (
+        &[Command::Genre, Command::AnimeSeason],
+        "narrow the catalogue by genre / anime season",
+    ),
+    (
+        &[Command::Simulcast],
+        "show only what is simulcasting, or stop",
+    ),
     (
         &[Command::Play, Command::PlayRest],
         "play the episode / the rest of the season",
@@ -787,7 +953,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // against it, so the strip runs the whole width - it is a list of episodes from
     // wherever they were queued, not a thing about the series in the poster - and the
     // poster is shaped to the height the columns are actually left with.
-    let queue = downloads_height(body, app.downloads.items.len(), focus == Focus::Downloads);
+    // As tall as the queue is showing, and never shorter than one row while there is a
+    // queue at all: a narrowing that matched nothing needs somewhere to say so, and a
+    // strip that vanished as its last row was hidden would read as a queue that had
+    // emptied itself.
+    let queued = if app.downloads.items.is_empty() {
+        0
+    } else {
+        app.downloads.rows().max(1)
+    };
+    let queue = downloads_height(body, queued, focus == Focus::Downloads);
     let [body, queue_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(queue)]).areas(body);
 
@@ -826,25 +1001,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(body);
 
-    let items: Vec<ListItem> = if app.series.items.is_empty() {
+    let shown = app.series.shown();
+    let items: Vec<ListItem> = if shown.is_empty() {
         placeholder(
             &theme,
             app.series.loading,
             app.series.error.as_ref(),
-            "Nothing here.",
+            &nothing_shown(&app.series, "Nothing here."),
             tick,
         )
     } else {
-        app.series
-            .items
+        shown
             .iter()
             .map(|series| series_row(&theme, series))
             .collect()
     };
+    let title = pane_title(column_name(app, Focus::Series), &app.series);
     let focused = focus == Focus::Series;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block(&theme, "Series", focused))
+            .block(pane_block(&theme, &title, focused))
             .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
@@ -852,12 +1028,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         &mut app.series.state,
     );
 
-    let items: Vec<ListItem> = if app.seasons.items.is_empty() {
+    let shown = app.seasons.shown();
+    let items: Vec<ListItem> = if shown.is_empty() {
         placeholder(
             &theme,
             app.seasons.loading,
             app.seasons.error.as_ref(),
-            "Pick a series.",
+            &nothing_shown(&app.seasons, "Pick a series."),
             tick,
         )
     } else {
@@ -865,16 +1042,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .series
             .selected()
             .map_or("", |series| series.title.as_str());
-        app.seasons
-            .items
+        shown
             .iter()
             .map(|season| season_row(&theme, season, series_title))
             .collect()
     };
+    let title = pane_title(column_name(app, Focus::Seasons), &app.seasons);
     let focused = focus == Focus::Seasons;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block(&theme, "Seasons", focused))
+            .block(pane_block(&theme, &title, focused))
             .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
@@ -882,27 +1059,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         &mut app.seasons.state,
     );
 
-    let items: Vec<ListItem> = if app.episodes.items.is_empty() {
+    let shown = app.episodes.shown();
+    let items: Vec<ListItem> = if shown.is_empty() {
         placeholder(
             &theme,
             app.episodes.loading,
             app.episodes.error.as_ref(),
-            "Pick a season.",
+            &nothing_shown(&app.episodes, "Pick a season."),
             tick,
         )
     } else {
-        let marked: Vec<bool> = app
-            .episodes
-            .items
+        let marked: Vec<bool> = shown
             .iter()
             .map(|episode| app.marked.contains(&episode.id))
             .collect();
-        // Read off the open list rather than off the set, so a mark carried across a
-        // list that came back without its episode does not open a gutter for a row that
-        // is not there - see [`episode_row`].
+        // Read off the rows that are drawn rather than off the set, so a mark carried
+        // across a list that came back without its episode - or one on a row a
+        // narrowing is hiding - does not open a gutter for a row that is not there. See
+        // [`episode_row`].
         let gutter = marked.contains(&true);
-        app.episodes
-            .items
+        shown
             .iter()
             .zip(marked)
             .map(|(episode, marked)| {
@@ -921,10 +1097,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             })
             .collect()
     };
+    let title = pane_title(column_name(app, Focus::Episodes), &app.episodes);
     let focused = focus == Focus::Episodes;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block(&theme, "Episodes", focused))
+            .block(pane_block(&theme, &title, focused))
             .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
@@ -938,24 +1115,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // Wide enough for the longest title in the queue, and never so wide that the
         // bars are pushed off a narrow terminal - a title cut short is a smaller loss
         // than the state of the download it belongs to.
-        let column = app
-            .downloads
-            .items
+        let shown = app.downloads.shown();
+        let column = shown
             .iter()
             .map(|download| Span::raw(download.title.clone()).width())
             .max()
             .unwrap_or(0)
             .min(usize::from(queue_area.width / 3));
-        let items: Vec<ListItem> = app
-            .downloads
-            .items
-            .iter()
-            .map(|download| download_row(&theme, download, column))
-            .collect();
+        let items: Vec<ListItem> = if shown.is_empty() {
+            placeholder(
+                &theme,
+                false,
+                None,
+                &nothing_shown(&app.downloads, "Nothing queued."),
+                tick,
+            )
+        } else {
+            shown
+                .iter()
+                .map(|download| download_row(&theme, download, column))
+                .collect()
+        };
+        let title = pane_title(column_name(app, Focus::Downloads), &app.downloads);
         let focused = focus == Focus::Downloads;
         frame.render_stateful_widget(
             List::new(items)
-                .block(pane_block(&theme, "Downloads", focused))
+                .block(pane_block(&theme, &title, focused))
                 .highlight_style(theme.highlight(focused))
                 .highlight_symbol("› ")
                 .highlight_spacing(HighlightSpacing::Always),
@@ -1038,16 +1223,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Read what is in use before the list borrows the app to draw itself.
-    let current = app.picker.as_ref().map(|picker| {
-        if picker.audio {
-            app.audio()
-        } else {
-            app.subs()
-        }
-    });
+    let current = app.picker.as_ref().map(|picker| app.chosen(picker.kind));
     let mut picked = Rect::default();
     if let (Some(current), Some(picker)) = (current, app.picker.as_mut()) {
-        picked = picker_overlay(frame, area, &theme, &app.keys, picker, &current);
+        picked = picker_overlay(frame, area, &theme, &app.keys, picker, &current, tick);
     }
 
     // Everything a pointer can land on, as the frame about to be shown laid it out.
@@ -1081,18 +1260,21 @@ mod tests {
 
     use image::{DynamicImage, Rgb, RgbImage};
 
+    use crate::api::Page;
     use crate::download::{DownloadOptions, OnDisk};
     use crate::model::{
-        Artwork, CatalogItem, Images, Playhead, Season, SeasonEpisode, SeriesMetadata,
+        Artwork, CatalogItem, Images, MovieListingMetadata, Playhead, Season, SeasonEpisode,
+        SeriesMetadata,
     };
-    use crate::tui::app::{Action, App, Focus};
+    use crate::tui::app::{Action, App, Focus, Picking};
     use crate::tui::art::Gallery;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
-    use crate::tui::worker::{Listing, Request, Response, Worker};
+    use crate::tui::worker::{Choice, FilterKind, Filters, Listing, Request, Response, Worker};
 
     use super::{
-        HELP, MARK, cells, downloads_height, draw, duration, meter, poster_width, thumbnail_width,
+        HELP, MARK, SPINNER, cells, downloads_height, draw, duration, meter, poster_width,
+        thumbnail_width,
     };
     use crate::tui::app::State;
     use crate::tui::worker::Update;
@@ -1175,6 +1357,7 @@ mod tests {
                 poster_tall: artwork(POSTER, 360),
                 ..Images::default()
             },
+            ..CatalogItem::default()
         }]);
         app.seasons.set(vec![Season {
             id: "S1".to_owned(),
@@ -1183,6 +1366,7 @@ mod tests {
             number_of_episodes: 28,
             audio_locales: vec!["ja-JP".to_owned(), "en-US".to_owned(), "fr-FR".to_owned()],
             subtitle_locales: vec!["en-US".to_owned(), "fr-FR".to_owned()],
+            ..Season::default()
         }]);
         app.episodes.set(vec![
             SeasonEpisode {
@@ -1264,6 +1448,69 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
+    }
+
+    /// A film keeps the three columns and changes the words in them. Four places would
+    /// otherwise be saying series things about it: the catalogue row, where `2 seasons`
+    /// becomes what the thing is; the middle column's title and its one row, which is not
+    /// a season and must not be numbered as one; the number slot in the episodes column,
+    /// where `E1` is a number nobody gave the film; and the panel, which has a running
+    /// time to show where a series has a count of episodes.
+    #[test]
+    fn a_film_reads_as_a_film_in_every_column() {
+        let mut app = app();
+        app.series.set(vec![CatalogItem {
+            id: "GM5V7XW1Q".to_owned(),
+            kind: "movie_listing".to_owned(),
+            title: "Suzume".to_owned(),
+            description: "A door opens.".to_owned(),
+            movie_listing_metadata: MovieListingMetadata {
+                movie_release_year: 2022,
+                duration_ms: 7_212_000,
+                maturity_ratings: vec!["PG-13".to_owned()],
+                ..MovieListingMetadata::default()
+            },
+            ..CatalogItem::default()
+        }]);
+        app.seasons.set(vec![Season {
+            id: "GM5V7XW1Q".to_owned(),
+            kind: "movie_listing".to_owned(),
+            title: "Suzume".to_owned(),
+            ..Season::default()
+        }]);
+        app.episodes.set(vec![SeasonEpisode {
+            id: "GY8DVXWZ1".to_owned(),
+            kind: "movie".to_owned(),
+            season_number: 1,
+            episode_number: 1,
+            series_title: "Suzume".to_owned(),
+            title: "Suzume".to_owned(),
+            duration_ms: 7_212_000,
+            ..SeasonEpisode::default()
+        }]);
+
+        let screen = rendered(120, 30, &mut app);
+        for expected in [
+            "Suzume  film",
+            " Film ",
+            "Film · 2022 · 2:00:12 · PG-13",
+            "A door opens.",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+        assert!(
+            !screen.contains("Season 0"),
+            "the middle column numbered a film as a season"
+        );
+
+        // And the panel, which prints the number of whatever the cursor is on, says what
+        // the row is instead of giving the film a season and an episode.
+        app.focus = Focus::Episodes;
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Film · 2:00:12"),
+            "the panel numbered the film"
+        );
     }
 
     /// Nothing is worth less to someone with a colourscheme than an app that ignores it,
@@ -1599,7 +1846,11 @@ mod tests {
         // Tab looks at the other list without going back out, and esc changes nothing.
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Tab);
-        assert!(app.picker.as_ref().is_some_and(|picker| picker.audio));
+        assert!(
+            app.picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == Picking::Audio)
+        );
         press(&mut app, KeyCode::Esc);
         assert!(app.picker.is_none(), "esc closes the list");
         assert_eq!(app.audio(), "fr-FR");
@@ -1616,6 +1867,280 @@ mod tests {
         assert!(screen.contains("Deutsch"));
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.audio(), "de-DE", "the list opens on what is in use");
+    }
+
+    /// The rows Crunchyroll answers a request for the categories with, once the worker
+    /// has turned them into something a list can show.
+    fn genres() -> Vec<Choice> {
+        [("action", "Action"), ("comedy", "Comedy")]
+            .iter()
+            .map(|(value, label)| Choice {
+                value: (*value).to_owned(),
+                label: (*label).to_owned(),
+            })
+            .collect()
+    }
+
+    /// Every catalogue page the interface has asked for since it was last asked, and what
+    /// it wanted each one narrowed to.
+    fn catalogue_asked(app: &App) -> Vec<(Listing, Filters)> {
+        app.sent()
+            .into_iter()
+            .filter_map(|request| match request {
+                Request::Catalog {
+                    listing, filters, ..
+                } => Some((listing, filters)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The genres are Crunchyroll's to name, so the list is fetched rather than written
+    /// down here - and the popup is up the moment the key is pressed, holding the one row
+    /// that is ours, rather than the key doing nothing visible while a request is out.
+    /// The answer is then kept for the run: the categories change a few times a year,
+    /// which is not between two presses of a key.
+    #[test]
+    fn the_genre_list_comes_off_the_network_and_is_asked_for_once() {
+        let mut app = app();
+        // The catalogue the interface asks for as it opens is not what is being asked
+        // about here.
+        app.sent();
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.sent(), vec![Request::FilterValues(FilterKind::Genre)]);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Genre"),
+            "the popup is up before the answer is"
+        );
+        assert!(screen.contains("All"));
+        assert!(
+            screen.contains(SPINNER[0]),
+            "a list still waiting for its rows says so along its bottom edge"
+        );
+
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        let screen = rendered(120, 30, &mut app);
+        for expected in ["All", "Action", "action", "Comedy"] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none(), "esc closes the list");
+        app.sent();
+        press(&mut app, KeyCode::Char('c'));
+        assert!(
+            app.sent().is_empty(),
+            "the list was asked for a second time"
+        );
+        assert!(rendered(120, 30, &mut app).contains("Action"));
+    }
+
+    /// Choosing a genre is a different catalogue rather than the same one with rows
+    /// hidden, so the list is asked for again from the start - narrowed - and the status
+    /// line says what is now on screen, since the column changing under the cursor
+    /// without a word would read as a glitch.
+    #[test]
+    fn choosing_a_genre_asks_the_catalogue_again_and_says_what_is_showing() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.listing, Listing::Browse(0));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        app.sent();
+
+        // All is the row the list opens on while nothing is chosen, so one step down is
+        // the first genre.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none(), "choosing closes the list");
+        let asked = catalogue_asked(&app);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].0, Listing::Browse(0));
+        assert_eq!(
+            asked[0]
+                .1
+                .chosen(FilterKind::Genre)
+                .map(|genre| genre.value.as_str()),
+            Some("action"),
+            "the catalogue was asked for again without the genre"
+        );
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Showing Popular · Genre: Action."));
+    }
+
+    /// Taking a filter off has to be as easy as putting one on, and there is no second
+    /// key for it: All sits at the top of the same list, where the eye lands. The list
+    /// opens on what is in force, so a filter that is set is not one All is a keypress
+    /// away from by accident.
+    #[test]
+    fn all_at_the_top_of_the_list_takes_the_filter_off_again() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.filters.genre.is_some());
+        app.sent();
+
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(
+            app.picker
+                .as_ref()
+                .and_then(|picker| picker.pane.state.selected()),
+            Some(1),
+            "the list opens on the genre in force rather than at the top"
+        );
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.filters.genre.is_none(), "All did not clear the genre");
+        assert!(!app.filters.any());
+        assert_eq!(
+            catalogue_asked(&app),
+            vec![(Listing::Browse(0), Filters::default())]
+        );
+        assert!(rendered(120, 30, &mut app).contains("Showing Popular."));
+    }
+
+    /// A filter narrows the browse listings and nothing else, so one set while the
+    /// watchlist or the history is up would otherwise be a word in the header about a
+    /// list it has nothing to do with. The column goes back to the catalogue instead and
+    /// the status line says why - the one thing it must not do is take the key and look
+    /// as though nothing happened.
+    #[test]
+    fn a_filter_set_on_a_list_it_cannot_narrow_brings_the_catalogue_back() {
+        let mut app = app();
+        assert_eq!(app.listing, Listing::History, "the interface opens on this");
+        app.sent();
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.filters.simulcast);
+        assert_eq!(app.listing, Listing::Browse(0));
+        let asked = catalogue_asked(&app);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].0, Listing::Browse(0));
+        assert!(asked[0].1.simulcast);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Showing Popular · Simulcast - the filters narrow the catalogue only."),
+            "the column moved without saying so"
+        );
+
+        // And the same key again takes it off, with the column already where it belongs.
+        press(&mut app, KeyCode::Char('u'));
+        assert!(!app.filters.simulcast);
+        assert!(rendered(120, 30, &mut app).contains("Showing Popular."));
+    }
+
+    /// The header describes what is under it, so the filters show there while a browse
+    /// listing is on screen and not while one of the account's own lists is. Each word
+    /// runs the list it was chosen from, which is where it is cleared as well as where it
+    /// was set - and a filter out of force is out of force rather than forgotten, which
+    /// is what the status line says on the way off the catalogue.
+    #[test]
+    fn the_header_names_the_filters_that_are_on_and_they_answer_to_a_click() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('u'));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Genre: Action"));
+        assert!(screen.contains("Simulcast"));
+
+        let (x, y) = middle(button(&app, Command::Genre));
+        click(&mut app, x, y);
+        assert!(
+            app.picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == Picking::Filter(FilterKind::Genre)),
+            "the word in the header opens the list it came from"
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // Round the ring to the watchlist, which no filter can narrow.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('o'));
+        }
+        assert_eq!(app.listing, Listing::Watchlist);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            !screen.contains("Genre: Action"),
+            "the header is describing a list the filters do not touch"
+        );
+        assert!(screen.contains("Watchlist - the filters narrow the catalogue only."));
+        assert!(app.filters.any(), "out of force is not forgotten");
+
+        // And on again to the catalogue, where they are in force and shown once more.
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.listing, Listing::Browse(0));
+        assert!(rendered(120, 30, &mut app).contains("Genre: Action"));
+    }
+
+    /// The filters are half of what was asked for, so they are half of what makes an
+    /// answer stale: a page of the whole catalogue that was already on its way when the
+    /// genre was chosen is the answer to a question nobody is asking any more, and
+    /// letting it into the column would leave the header describing a narrowed catalogue
+    /// over a hundred series that are not.
+    #[test]
+    fn a_page_asked_for_before_the_filter_changed_is_dropped() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+
+        let page = vec![CatalogItem {
+            id: "GY8VEQ95Y".to_owned(),
+            kind: "series".to_owned(),
+            title: "Dandadan".to_owned(),
+            ..CatalogItem::default()
+        }];
+        app.accept(Response::Catalog {
+            listing: Listing::Browse(0),
+            start: 0,
+            filters: Filters::default(),
+            result: Ok(Page {
+                items: page.clone(),
+                total: None,
+                next: None,
+            }),
+        });
+        assert!(
+            app.series.items.is_empty(),
+            "the unfiltered page landed in a filtered column"
+        );
+
+        app.accept(Response::Catalog {
+            listing: Listing::Browse(0),
+            start: 0,
+            filters: app.filters.clone(),
+            result: Ok(Page {
+                items: page,
+                total: None,
+                next: None,
+            }),
+        });
+        assert_eq!(app.series.items.len(), 1, "and the right answer is taken");
     }
 
     /// How many cells in `rows` are part of a picture. Half-blocks are what the fallback
@@ -1975,6 +2500,34 @@ mod tests {
         (area.x + 1, area.y + 1 + index)
     }
 
+    /// A catalogue column part-way through a long list, as the worker fills one: a
+    /// browse order - the history the interface opens on is not paged - with its first
+    /// page in and the rest of the list behind it.
+    fn a_first_page(app: &mut App, loaded: usize, total: Option<usize>) {
+        press(app, KeyCode::Char('o'));
+        let items = (0..loaded)
+            .map(|index| CatalogItem {
+                id: format!("GY{index}"),
+                kind: "series".to_owned(),
+                title: format!("Series {index}"),
+                ..CatalogItem::default()
+            })
+            .collect();
+        let listing = app.listing.clone();
+        let filters = app.filters.clone();
+        app.accept(Response::Catalog {
+            listing,
+            start: 0,
+            filters,
+            result: Ok(Page {
+                items,
+                total,
+                next: Some(loaded),
+            }),
+        });
+        app.sent();
+    }
+
     fn several_series(app: &mut App, count: usize) {
         let one = app.series.items[0].clone();
         app.series.set(
@@ -2094,6 +2647,76 @@ mod tests {
         assert_eq!(app.series.state.selected(), Some(offset));
     }
 
+    /// The header counts what is loaded against what the list holds, because the column
+    /// now shows a page of a list rather than the list. `100 series` under a catalogue
+    /// twelve hundred long reads as the end of it, which is exactly the impression this
+    /// whole feature exists to correct - and the count is the only place the interface
+    /// can say otherwise.
+    ///
+    /// Where no total is known the count stands alone rather than being made up: a list
+    /// whose length nothing counts in the units of this column would otherwise print
+    /// `100 of 100` and stop meaning anything.
+    #[test]
+    fn the_header_says_how_much_of_the_list_is_loaded() {
+        let mut app = app();
+        a_first_page(&mut app, 100, Some(1203));
+        assert!(
+            rendered(120, 30, &mut app).contains("100 of 1203 series"),
+            "the header kept the count to itself"
+        );
+
+        app.paging.total = None;
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("100 series"));
+        assert!(
+            !screen.contains(" of "),
+            "the header invented a total for a list that has none"
+        );
+    }
+
+    /// The label beside that count is still the button it always was: it says which list
+    /// is showing and a click on it moves to the next one. The count is not - it is a
+    /// fact about the list rather than something to press - and growing it must not have
+    /// turned it into one, or a click meant for the order would land on a number.
+    #[test]
+    fn the_list_is_still_named_by_a_button_beside_the_count() {
+        let mut app = app();
+        a_first_page(&mut app, 100, Some(1203));
+        let _ = buffer(120, 30, &mut app);
+
+        let label = button(&app, Command::Order);
+        assert_eq!(label.width, cells(&[Span::raw("Popular".to_owned())]));
+        let (x, y) = middle(label);
+        click(&mut app, x, y);
+        assert_eq!(app.listing, Listing::Browse(1));
+    }
+
+    /// The wheel is one of the ways to the bottom of a column, and the bottom of the
+    /// column is what asks for more of the list. It goes through the cursor helper the
+    /// keys go through, so this is the whole pointer path - the box the column was drawn
+    /// in, the row the pointer was over, the cursor, the request - end to end.
+    #[test]
+    fn the_wheel_can_reach_the_end_of_the_list_and_ask_for_more() {
+        let mut app = app();
+        a_first_page(&mut app, 12, Some(40));
+        let _ = buffer(120, 30, &mut app);
+
+        let (x, y) = middle(app.regions.series);
+        for _ in 0..8 {
+            wheel(&mut app, x, y, true);
+        }
+        assert_eq!(app.series.state.selected(), Some(11));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 12,
+                filters: Filters::default(),
+            }],
+            "the wheel reached the end of the list and asked for nothing"
+        );
+    }
+
     /// Looking down a column is not the same as going to work in it, so the wheel leaves
     /// the keyboard where it was.
     #[test]
@@ -2149,7 +2772,11 @@ mod tests {
 
         let (x, y) = middle(button(&app, Command::AudioLanguage));
         click(&mut app, x, y);
-        assert!(app.picker.as_ref().is_some_and(|picker| picker.audio));
+        assert!(
+            app.picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == Picking::Audio)
+        );
 
         let (bindings, warnings) = toml::from_str::<keys::Settings>("quit = \"ctrl-q\"\n")
             .expect("valid config")
@@ -2189,12 +2816,147 @@ mod tests {
         assert_eq!(app.focus, Focus::Series, "the click reached a column");
     }
 
+    /// Types a narrowing into the column the keyboard is in, the way a user does it.
+    fn narrow(app: &mut App, query: &str) {
+        press(app, KeyCode::Char('f'));
+        for letter in query.chars() {
+            press(app, KeyCode::Char(letter));
+        }
+    }
+
+    /// A narrowing has to be visible, because the rows it hides are simply not there:
+    /// the box says which column it is narrowing while it is open, and the column's own
+    /// title says what it was narrowed to and how much of it is left once the box has
+    /// gone. A column quietly showing one episode of two is otherwise indistinguishable
+    /// from a client that has lost the season.
+    #[test]
+    fn a_narrowed_column_says_so_in_its_title() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        narrow(&mut app, "journ");
+
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Filter Episodes: journ"),
+            "the box did not say what it was narrowing, or what with"
+        );
+        assert!(
+            !screen.contains("The Priest's Lie"),
+            "a row the narrowing hid was drawn anyway"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Episodes \"journ\" 1/2"),
+            "the column's title said nothing about being narrowed"
+        );
+        assert!(screen.contains("The Journey Ends"));
+        assert!(!screen.contains("Filter"), "the box outlived the return");
+
+        // And the way out of it is in the one sentence the status line gets.
+        assert!(
+            screen.contains("f then esc puts the list back"),
+            "nothing said how to get the rest of the season back"
+        );
+    }
+
+    /// An empty column that has been narrowed to nothing has something to say for
+    /// itself, and it is not the sentence an empty column says. A blank box under a
+    /// title reading `Episodes "zzz" 0/2` would be the interface knowing the answer and
+    /// keeping it.
+    #[test]
+    fn a_column_narrowed_to_nothing_says_what_it_was_looking_for() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        narrow(&mut app, "zzz");
+
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Nothing matches \"zzz\"."));
+        assert!(screen.contains("Episodes \"zzz\" 0/2"));
+        assert!(
+            !screen.contains("Pick a season."),
+            "a season is open, so that is not the problem"
+        );
+        assert!(
+            !screen.contains("The Journey Ends"),
+            "an episode was drawn, or left in the panel under the columns"
+        );
+    }
+
+    /// The other half of the invariant, and the half a pure test of the arithmetic
+    /// cannot reach: a click on the third row of a narrowed column selects the episode
+    /// the third row is showing, and the row the pointer was over is the row the
+    /// keyboard is now on. The list widget is handed the rows the narrowing left and
+    /// writes its offset back in them, so there is one index space on the screen and
+    /// both the pointer and the cursor count in it.
+    #[test]
+    fn a_click_lands_on_the_row_the_narrowing_left() {
+        let mut app = app();
+        several_episodes(&mut app, 20);
+        app.focus = Focus::Episodes;
+        narrow(&mut app, "1");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.episodes.rows(),
+            11,
+            "E1 and E10 to E19 are the episodes with a 1 in the number"
+        );
+
+        let buffer = buffer(120, 30, &mut app);
+        let episodes = app.regions.episodes;
+        let (x, y) = row(episodes, 2);
+        let line: String = (episodes.x..episodes.right())
+            .map(|column| buffer[(column, y)].symbol())
+            .collect();
+        assert!(line.contains("E11"), "the third row reads {line:?}");
+
+        click(&mut app, x, y);
+        assert_eq!(app.episodes.state.selected(), Some(2));
+        assert_eq!(
+            app.episodes.selected().map(|episode| episode.id.clone()),
+            Some("E10".to_owned()),
+            "the click chose an episode other than the one it was drawn on"
+        );
+    }
+
     /// A queue with something in it, put there the way the key puts it there.
     fn with_downloads(app: &mut App, count: usize) {
         app.focus = Focus::Episodes;
         several_episodes(app, count);
         press(app, KeyCode::Char('D'));
         app.focus = Focus::Series;
+    }
+
+    /// The queue narrows like any other column, and the strip keeps a row to say so
+    /// with: one that vanished as its last row was hidden would read as a queue that had
+    /// emptied itself, which is the one thing the panel has to be trusted about. The
+    /// query here carries a capital, which is smart case saying it means it.
+    #[test]
+    fn the_queue_narrows_and_keeps_a_row_to_say_so() {
+        let mut app = app();
+        with_downloads(&mut app, 2);
+        app.focus = Focus::Downloads;
+        narrow(&mut app, "E2");
+        press(&mut app, KeyCode::Enter);
+
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Downloads \"E2\" 1/2"),
+            "the panel said nothing about being narrowed"
+        );
+        assert!(screen.contains("S01E2"));
+        assert!(
+            !screen.contains("S01E1"),
+            "a row the narrowing hid was drawn"
+        );
+
+        narrow(&mut app, "zzz");
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Nothing matches \"zzz\"."),
+            "the strip went away with its last row"
+        );
     }
 
     /// Where the queue is drawn, and what is on a row of it: what the episode is, how

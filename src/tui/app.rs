@@ -7,8 +7,9 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Position;
 use ratatui::widgets::ListState;
 
+use crate::api::Page;
 use crate::download::{DownloadOptions, OnDisk, episode_info, on_disk};
-use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Opens, Playhead, Season, SeasonEpisode, opens, single_name};
 use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
@@ -16,7 +17,9 @@ use super::art::Gallery;
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions, Target};
 use super::theme::Theme;
-use super::worker::{Listing, Queued, Request, Response, Update, Worker};
+use super::worker::{
+    Choice, FilterKind, Filters, Listing, Queued, Request, Response, Update, Worker,
+};
 
 /// Which column the keyboard is pointed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,11 +156,39 @@ fn episode_number(episode: &SeasonEpisode) -> String {
     }
 }
 
+/// What the seasons column calls a season: its own title, unless it has none or is
+/// carrying the series' title, which the column to its left is already showing. The row
+/// and the narrowing read a season the same way, so what is typed is matched against
+/// what is on the screen rather than against what Crunchyroll happened to send.
+///
+/// The one row a film or a concert fills that column with is called what it is - `Film`,
+/// `Music` - rather than claiming a season number it has not got. Its title would only
+/// repeat the column to the left, which is the same rule the seasons themselves follow.
+pub fn season_title(season: &Season, series_title: &str) -> String {
+    if let Some(word) = single_name(&season.kind) {
+        word.to_owned()
+    } else if season.title.is_empty() || season.title == series_title {
+        format!("Season {}", season.season_number)
+    } else {
+        season.title.clone()
+    }
+}
+
 /// What a notice calls an episode: the number above, behind the E the episode column
 /// shows. The title would be truer to the episode, but it is the number the user just
 /// moved the cursor onto, and a sentence on the status line has no room for both.
+///
+/// A film has no number to be called by, and the one row it fills the column with is the
+/// row every one of these sentences is about, so there it is the title that goes in.
+/// `Marked Suzume watched` is the thing to say: `Marked E1 watched` reads back a number
+/// nobody gave it, and `Marked Film watched` is what the column calls the row said out
+/// loud where it makes no sense.
 fn episode_label(episode: &SeasonEpisode) -> String {
-    format!("E{}", episode_number(episode))
+    match single_name(&episode.kind) {
+        Some(word) if episode.title.is_empty() => word.to_owned(),
+        Some(_) => episode.title.clone(),
+        None => format!("E{}", episode_number(episode)),
+    }
 }
 
 /// How much of the season is marked, as the status line says it.
@@ -173,7 +204,69 @@ fn marks_tally(count: usize) -> String {
     }
 }
 
+/// What the status line says about a filter that cannot reach the list in front of it.
+///
+/// One clause for both of the moments it is needed - a filter set from the watchlist,
+/// and the column cycled off the catalogue with one on - because they are the same fact
+/// and hearing it two ways would read as two different rules.
+fn only_the_catalogue(what: &str) -> String {
+    format!("{what} - the filters narrow the catalogue only.")
+}
+
+/// What a row of the catalogue column reads as, for the narrowing to match against and
+/// for a page arriving to be held to.
+///
+/// Out here rather than inside [`App::narrow`] with the other three columns' words, and
+/// for the one reason worth moving it for: the catalogue is the column that grows a page
+/// at a time, so [`Pane::append`] needs the same reading of a row that the narrowing was
+/// typed against. Two spellings of it could drift, and the drift would show as rows
+/// appearing under a query that does not hold them.
+fn series_text(series: &CatalogItem) -> String {
+    series.title.clone()
+}
+
+/// Whether a row holds what was typed into the filter box.
+///
+/// A plain substring rather than the subsequence fzf matches with, and the reason is
+/// the order of these lists. fzf can afford to let `tje` find `The Journey Ends`,
+/// because it sorts what it matched by how well it matched and the best line ends up
+/// under the cursor; this cannot sort, because the order of a column here is a fact
+/// about it - a season is numbered, the queue is the order things were asked for - and
+/// a list shuffled by a score is a list nobody can read down. Left in their own order,
+/// a subsequence match is barely a filter: three letters scattered anywhere in a title
+/// keep most of a season, and a narrowing that does not narrow is worse than none.
+/// Every row a substring leaves standing visibly holds what was typed, which is the
+/// whole of the explanation anyone needs for why it is still there.
+///
+/// Case is ignored until the query carries one, which is vim's smartcase and fzf's
+/// default: `ed` finds `Ed` and `wanted` alike, and `Ed` finds only the first. Someone
+/// typing in lower case is typing quickly, and a capital is someone being specific.
+fn matches(row: &str, query: &str) -> bool {
+    if query.chars().any(char::is_uppercase) {
+        row.contains(query)
+    } else {
+        row.to_lowercase().contains(query)
+    }
+}
+
+/// What a column has been narrowed to: what was typed, and the rows of the list it
+/// leaves standing, in the order the list had them.
+struct Narrowing {
+    query: String,
+    rows: Vec<usize>,
+}
+
 /// One column: what it holds, where the cursor is, and whether it is still waiting.
+///
+/// The list is kept whole and a narrowing is a list of the rows of it that are showing,
+/// which is the one arrangement the cursor cannot come adrift from. Everything on the
+/// screen counts in rows rather than in items - `state.selected()` is a row, the list
+/// widget is handed the rows and writes its own offset back in them, and the pointer
+/// turns a line of the terminal into one - so there is a single index space up here,
+/// and [`Pane::selected`] is the only place it is turned back into an item. Drawing the
+/// whole list and skipping the hidden rows as they went past was the other way to do
+/// it, and it would have left the widget's offset counting one thing while the cursor,
+/// the marks and the mouse counted another.
 pub struct Pane<T> {
     pub items: Vec<T>,
     pub state: ListState,
@@ -186,6 +279,11 @@ pub struct Pane<T> {
     /// for again in another language, is still the same list to the user, so the cursor
     /// has no business going back to the top.
     pub pending_cursor: Option<usize>,
+    /// What this column has been narrowed to, while it is narrowed to anything. Each
+    /// column keeps its own, which is why it lives here rather than beside the box that
+    /// types it: walking over to the seasons and back has no business taking a
+    /// narrowing along, or dropping the one that is already there.
+    narrowing: Option<Narrowing>,
 }
 
 impl<T> Default for Pane<T> {
@@ -197,18 +295,107 @@ impl<T> Default for Pane<T> {
             error: None,
             owner: String::new(),
             pending_cursor: None,
+            narrowing: None,
         }
     }
 }
 
 impl<T> Pane<T> {
+    /// What was typed into this column's filter box, while a narrowing is on it.
+    pub fn query(&self) -> Option<&str> {
+        self.narrowing
+            .as_ref()
+            .map(|narrowing| narrowing.query.as_str())
+    }
+
+    /// How many rows the column is showing: all of them, or what the narrowing left.
+    pub fn rows(&self) -> usize {
+        self.narrowing
+            .as_ref()
+            .map_or(self.items.len(), |narrowing| narrowing.rows.len())
+    }
+
+    /// The item a row of the column is drawn from.
+    fn item_of(&self, row: usize) -> Option<usize> {
+        match &self.narrowing {
+            Some(narrowing) => narrowing.rows.get(row).copied(),
+            None => (row < self.items.len()).then_some(row),
+        }
+    }
+
+    /// Which row an item is on, where the narrowing leaves it showing at all.
+    fn row_of(&self, index: usize) -> Option<usize> {
+        match &self.narrowing {
+            Some(narrowing) => narrowing.rows.iter().position(|shown| *shown == index),
+            None => (index < self.items.len()).then_some(index),
+        }
+    }
+
+    /// The items the column is showing, in the order it shows them: what is drawn, and
+    /// what the keys that mean "everything in this column" act on.
+    pub fn shown(&self) -> Vec<&T> {
+        match &self.narrowing {
+            Some(narrowing) => narrowing
+                .rows
+                .iter()
+                .filter_map(|index| self.items.get(*index))
+                .collect(),
+            None => self.items.iter().collect(),
+        }
+    }
+
+    /// Where the cursor is in the whole list, which is what anything kept alongside the
+    /// list - a playhead, a mark, the cursor a reload puts back - is keyed by.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.state.selected().and_then(|row| self.item_of(row))
+    }
+
     pub fn selected(&self) -> Option<&T> {
-        self.state
-            .selected()
+        self.selected_index()
             .and_then(|index| self.items.get(index))
     }
 
+    /// Narrows the column to the rows whose words hold `query`, or widens it again when
+    /// the query is empty. `text` reads a row back as the words it shows, which is what
+    /// the user is typing at: see [`App::narrow`], which knows what the rows of each
+    /// column say and is the only caller.
+    ///
+    /// The cursor follows the item it was on wherever the query leaves it standing, and
+    /// falls to the first row where it does not. It cannot simply be left where it was:
+    /// a cursor on a row nobody can see is the one thing this must not do, since what
+    /// is played, what is queued and what a click lands on are all read off it.
+    pub fn narrow(&mut self, query: &str, text: impl Fn(&T) -> String) {
+        let was_on = self.selected_index();
+        self.narrowing = (!query.is_empty()).then(|| Narrowing {
+            query: query.to_owned(),
+            rows: self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches(&text(item), query))
+                .map(|(index, _)| index)
+                .collect(),
+        });
+        let landed = was_on.and_then(|index| self.row_of(index));
+        self.state
+            .select(landed.or_else(|| (self.rows() > 0).then_some(0)));
+    }
+
+    /// Takes in a list, with the cursor put back where a reload asked for it.
+    ///
+    /// A narrowing does not survive this, whichever of the ways the column came to be
+    /// filled again: a season opened, a reload, a change of language, another catalogue
+    /// listing. What was typed is a claim about the words that were on the screen when
+    /// it was typed, and none of those hands the same words back - a new season has
+    /// rows nobody has typed at, and a change of language brings the same episodes back
+    /// under different titles, where a query typed against the English ones matches
+    /// nothing. Either would leave a column looking empty for a reason three keystrokes
+    /// in the past with nothing on the screen still saying so. The cursor and the marks
+    /// are carried across a reload, and they are the argument for this rather than
+    /// against it: those name a row that can be found again, while a narrowing names
+    /// text that is about to be replaced.
     pub fn set(&mut self, items: Vec<T>) {
+        self.narrowing = None;
         let restored = self
             .pending_cursor
             .take()
@@ -221,6 +408,7 @@ impl<T> Pane<T> {
 
     pub fn clear(&mut self) {
         self.items.clear();
+        self.narrowing = None;
         self.state.select(None);
         self.loading = false;
         self.error = None;
@@ -229,55 +417,214 @@ impl<T> Pane<T> {
     }
 
     pub fn move_by(&mut self, delta: isize) {
-        if self.items.is_empty() {
+        let rows = self.rows();
+        if rows == 0 {
             return;
         }
-        let last = self.items.len() as isize - 1;
+        let last = rows as isize - 1;
         let current = self.state.selected().unwrap_or(0) as isize;
         self.state
             .select(Some(current.saturating_add(delta).clamp(0, last) as usize));
     }
 
     pub fn select_edge(&mut self, last: bool) {
-        if self.items.is_empty() {
+        let rows = self.rows();
+        if rows == 0 {
             return;
         }
-        self.state
-            .select(Some(if last { self.items.len() - 1 } else { 0 }));
+        self.state.select(Some(if last { rows - 1 } else { 0 }));
     }
 
-    /// Puts the cursor on `index`, and ignores one past the end: a list answered again
-    /// since the frame a click was aimed at may be shorter than that frame said it was.
-    pub fn select(&mut self, index: usize) {
-        if index < self.items.len() {
-            self.state.select(Some(index));
+    /// Puts the cursor on `row`, and ignores one past the end: a list answered again
+    /// since the frame a click was aimed at may be shorter than that frame said it was,
+    /// and so may a narrowing typed since.
+    pub fn select(&mut self, row: usize) {
+        if row < self.rows() {
+            self.state.select(Some(row));
         }
     }
 
-    /// The first row the list drew and how many items it holds - everything the pointer
-    /// needs to turn a row of the screen into an index. The offset is what the list
-    /// widget wrote back as it drew, so it is where the list actually was rather than
-    /// where it was asked to be.
+    /// Adds to what the column is already showing, for a list that arrives a page at a
+    /// time.
+    ///
+    /// The cursor is left alone rather than put back at the top: the user is standing at
+    /// the bottom of the list, which is what asked for these rows in the first place, and
+    /// a column that jumped home every time a page landed would be unusable. A column
+    /// that was empty until now gets a cursor, since a list with rows in it and nothing
+    /// selected cannot be walked.
+    ///
+    /// A narrowing survives this, and the new rows are held to it - which is the opposite
+    /// of what [`Pane::set`] does with one, for the opposite reason. A page is the same
+    /// list going on, with the same words on the screen the query was typed against, so
+    /// the query still means what it meant; and a page arriving unnarrowed would append a
+    /// hundred rows that do not match to the bottom of a column whose title says it is
+    /// showing four. The rows already there keep their places, so the cursor keeps its
+    /// row.
+    pub fn append(&mut self, items: Vec<T>, text: impl Fn(&T) -> String) {
+        self.items.extend(items);
+        self.loading = false;
+        if let Some(query) = self.query().map(str::to_owned) {
+            let cursor = self.state.selected();
+            self.narrow(&query, text);
+            // `narrow` puts the cursor back on the item it was on, which is the row it was
+            // already on here, since nothing before this page moved. Said outright anyway:
+            // a page landing must not move the cursor, and the arithmetic that says so is
+            // in another method.
+            if let Some(row) = cursor {
+                self.state.select(Some(row));
+            }
+        }
+        if self.state.selected().is_none() && self.rows() > 0 {
+            self.state.select(Some(0));
+        }
+    }
+
+    /// The first row the list drew and how many rows it is showing - everything the
+    /// pointer needs to turn a row of the screen into one of the column's. The offset is
+    /// what the list widget wrote back as it drew, so it is where the list actually was
+    /// rather than where it was asked to be, and the count is what the widget was handed:
+    /// a narrowed column answers for what it narrowed to, which is what is on the screen.
     pub fn window(&self) -> (usize, usize) {
-        (self.state.offset(), self.items.len())
+        (self.state.offset(), self.rows())
     }
 }
 
-/// The language list while it is open: which of the two settings it is choosing for,
-/// and the locales it is offering.
+/// How far through its list the catalogue column has read, and how much further there is
+/// to go.
+///
+/// The offsets are kept here rather than counted off the rows on screen, because the two
+/// do not always agree: a watchlist page of a hundred rows is a hundred offsets whether or
+/// not two of them were rows this column has nowhere to open, and a page the simulcast
+/// filter has sieved is shorter still. Asking for the next page at `items.len()` would
+/// hand back rows already on screen a page later.
+pub struct Paging {
+    /// Where the next page begins, or `None` once the list has been read to the end -
+    /// which a listing that is not paged at all says of its very first page.
+    pub next: Option<usize>,
+    /// The offset of the page asked for and not yet answered, if there is one. It is
+    /// both the flag that keeps a second request from going out while the first is in
+    /// flight and the name the answer is recognised by: a page whose offset is not this
+    /// one belongs to a list the user has left or to a page already appended, and is
+    /// dropped the way [`Pane::owner`] drops an answer about the wrong series.
+    pub asked: Option<usize>,
+    /// How many series the whole list holds, where the endpoint counts the same things
+    /// the column shows. The header prints it against what is loaded; see
+    /// [`crate::api::Page`] for why most of the lists have nothing to put here.
+    pub total: Option<usize>,
+}
+
+impl Paging {
+    /// A list about to be read from the top. Nothing is known about its length yet, and
+    /// the first page is the one at offset zero.
+    fn first() -> Self {
+        Self {
+            next: Some(0),
+            asked: None,
+            total: None,
+        }
+    }
+}
+
+/// Which list is open over the interface, and so what choosing a row from it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Picking {
+    Audio,
+    Subtitles,
+    /// One of the two filters that take their value from a list Crunchyroll keeps.
+    Filter(FilterKind),
+}
+
+impl Picking {
+    /// The list `next-column` looks at from this one. The four are two pairs that are
+    /// read together - the two languages, and the two filters - and flipping between a
+    /// pair without going back out first is what that key was doing when there was only
+    /// one pair of them.
+    const fn other(self) -> Self {
+        match self {
+            Self::Audio => Self::Subtitles,
+            Self::Subtitles => Self::Audio,
+            Self::Filter(FilterKind::Genre) => Self::Filter(FilterKind::Season),
+            Self::Filter(FilterKind::Season) => Self::Filter(FilterKind::Genre),
+        }
+    }
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Audio => " Audio language ",
+            Self::Subtitles => " Subtitle language ",
+            Self::Filter(which) => which.title(),
+        }
+    }
+}
+
+/// A list of values while it is open: which list it is, and what it is offering.
+///
+/// It was the language list and is now four lists, because they are the same thing to
+/// look at and the same thing to drive: a column of values with the one in force marked,
+/// the keys of a pane, escape to leave it alone. Each row carries the value that gets
+/// applied beside the words it is shown as, so nothing about the list itself depends on
+/// where its rows came from - a locale this program has a name for, or a category
+/// Crunchyroll named in the account's own language.
 pub struct Picker {
-    pub audio: bool,
-    pub pane: Pane<String>,
+    pub kind: Picking,
+    pub pane: Pane<Choice>,
 }
 
 impl Picker {
-    pub fn title(&self) -> &'static str {
-        if self.audio {
-            " Audio language "
-        } else {
-            " Subtitle language "
+    pub const fn title(&self) -> &'static str {
+        self.kind.title()
+    }
+}
+
+/// The box along the top while something is being typed into it, and what a return
+/// will mean when it is.
+///
+/// One box rather than two fields that must never both be filled in: a letter typed
+/// while either of them is open belongs in that box and nowhere else, and the event
+/// loop has one question to ask rather than two that could disagree.
+pub enum Editing {
+    /// `search`: a query for Crunchyroll. Nothing goes anywhere until the return, and
+    /// then the answer replaces the catalogue column.
+    Search(String),
+    /// `filter`: a narrowing of the column named here, which happens as each letter
+    /// lands and asks nobody anything. Which column is written down when the key is
+    /// pressed rather than read off the focus as each letter arrives, so the box and
+    /// the column it is narrowing cannot come apart.
+    Narrow { focus: Focus, query: String },
+}
+
+impl Editing {
+    /// What is in the box.
+    pub fn query(&self) -> &str {
+        match self {
+            Self::Search(query) | Self::Narrow { query, .. } => query,
         }
     }
+
+    /// Takes a letter, or a backspace, and says whether the box reads differently
+    /// afterwards - which is when a narrowing has to be worked out again.
+    fn typed(&mut self, key: KeyEvent) -> bool {
+        let query = match self {
+            Self::Search(query) | Self::Narrow { query, .. } => query,
+        };
+        match key.code {
+            KeyCode::Backspace => query.pop().is_some(),
+            KeyCode::Char(letter) => {
+                query.push(letter);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What a column is showing and what it holds, where it has been narrowed at all.
+/// Nothing when it has not: there is nothing to report about a column showing
+/// everything it has.
+fn narrowed_to<T>(pane: &Pane<T>) -> Option<(usize, usize)> {
+    pane.query()
+        .is_some()
+        .then(|| (pane.rows(), pane.items.len()))
 }
 
 pub struct App {
@@ -328,9 +675,24 @@ pub struct App {
     /// give back.
     pub marked: HashSet<String>,
     pub listing: Listing,
-    /// The search box while it is being typed into.
-    pub editing: Option<String>,
-    /// The language list while it is open.
+    /// Where the catalogue column has got to in that listing.
+    pub paging: Paging,
+    /// What the browse listings are narrowed to. Carried on the interface rather than
+    /// inside the listing, because it survives the column being cycled round the ring
+    /// and put back - see [`App::choose_filter`].
+    pub filters: Filters,
+    /// The values behind the two filters that take one, once they have been asked for.
+    ///
+    /// Kept for the run rather than fetched each time a list is opened. Crunchyroll's
+    /// categories change a few times a year and its seasons four times, which is not
+    /// between two presses of a key, and the list is one a user narrowing a catalogue
+    /// opens, closes and opens again. A list that failed to arrive leaves nothing here,
+    /// so the next press asks afresh rather than offering an empty list for ever.
+    filter_values: HashMap<FilterKind, Vec<Choice>>,
+    /// The box along the top while it is being typed into: the search, or a column
+    /// being narrowed.
+    pub editing: Option<Editing>,
+    /// The list of values while one is open.
     pub picker: Option<Picker>,
     pub notice: Option<Notice>,
     /// What the API client would have printed had the interface not owned the screen.
@@ -386,6 +748,9 @@ impl App {
             // with no history, or a request that fails, falls back to the catalogue
             // when the answer arrives.
             listing: Listing::History,
+            paging: Paging::first(),
+            filters: Filters::default(),
+            filter_values: HashMap::new(),
             editing: None,
             picker: None,
             notice: None,
@@ -486,46 +851,264 @@ impl App {
             .collect();
     }
 
+    /// Starts the catalogue column over on the list it is showing.
+    ///
+    /// Every caller of this is a new list or the same list from scratch - the first
+    /// screen, the fallback out of an empty history, a reload, a change of order, a
+    /// search and the way back out of one - and all of them mean the first page. An
+    /// offset carried over from the list being put away would open the next one halfway
+    /// down, and its total would have the header counting against somebody else's list.
+    /// Narrows a column to the rows that hold `query`, or widens it again when the
+    /// query is empty.
+    ///
+    /// What a row reads as is decided here, because this is the only place that knows
+    /// what each column draws. A series is its title. A season is the words its row
+    /// shows, which are not always Crunchyroll's - a season with no title of its own is
+    /// drawn as `Season 2`, and typing `season 2` has to find it. An episode is its
+    /// number and its title, since `e12` and `journey` are both things someone would
+    /// type at a season. A queue row is its number, its title and the series it came
+    /// from: the queue outlives the column it was filled from, so the series is the
+    /// only thing left on the row tying it to where it came from.
+    fn narrow(&mut self, focus: Focus, query: &str) {
+        match focus {
+            Focus::Series => self.series.narrow(query, series_text),
+            Focus::Seasons => {
+                // Copied out first, because the row this is matching against is drawn
+                // against the selected series and the two have to read alike.
+                let series_title = self
+                    .series
+                    .selected()
+                    .map_or_else(String::new, |series| series.title.clone());
+                self.seasons
+                    .narrow(query, |season| season_title(season, &series_title));
+            }
+            Focus::Episodes => self.episodes.narrow(query, |episode| {
+                format!("E{} {}", episode_number(episode), episode.title)
+            }),
+            Focus::Downloads => self.downloads.narrow(query, |download| {
+                format!("{} {} {}", download.number, download.title, download.series)
+            }),
+        }
+    }
+
+    /// Works the queue's narrowing out again against the list as it is now.
+    ///
+    /// The queue is the one column whose list is not handed back whole by a request but
+    /// grows and shrinks a row at a time under the user's hands, so the rows a narrowing
+    /// is holding are about to be pointing at the wrong episodes - or past the end. The
+    /// seasons and the episodes have no equivalent: every list they ever get comes through
+    /// [`Pane::set`], which drops the narrowing outright. The catalogue is the one column
+    /// in between, since a page appended to it is the same list going on rather than
+    /// another list, and [`Pane::append`] holds the new rows to the narrowing itself.
+    fn renarrow_downloads(&mut self) {
+        if let Some(query) = self.downloads.query().map(str::to_owned) {
+            self.narrow(Focus::Downloads, &query);
+        }
+    }
+
     fn request_catalog(&mut self) {
         self.series.clear();
         self.seasons.clear();
         self.clear_episodes();
-        self.series.loading = true;
+        self.paging = Paging::first();
         self.focus = Focus::Series;
-        self.worker.send(Request::Catalog(self.listing.clone()));
+        self.request_catalog_page(0);
     }
 
-    fn request_seasons(&mut self) {
-        let Some(series) = self.series.selected() else {
-            return;
-        };
-        let series_id = series.id.clone();
-        self.seasons.clear();
-        self.clear_episodes();
-        self.seasons.loading = true;
-        self.seasons.owner = series_id.clone();
-        self.focus = Focus::Seasons;
-        self.worker.send(Request::Seasons {
-            series_id,
-            audio: self.audio(),
-            subs: self.subs(),
+    /// Asks for one page of the list the column is showing, and writes down which one is
+    /// being waited for.
+    fn request_catalog_page(&mut self, start: usize) {
+        self.series.loading = true;
+        self.paging.asked = Some(start);
+        self.worker.send(Request::Catalog {
+            listing: self.listing.clone(),
+            start,
+            filters: self.filters.clone(),
         });
     }
 
+    /// Asks for the page after the rows the column already holds.
+    ///
+    /// Nothing happens while an answer is outstanding, so holding `down` against the
+    /// bottom of the list asks once rather than once per repeat; and nothing happens once
+    /// the list has been read to the end, which is what a listing that cannot be paged
+    /// says of its first page. A page that failed leaves `next` where it was, so the
+    /// next time the cursor comes to rest on the last row it is asked for again - the
+    /// user's own retry, rather than a loop that would hammer an endpoint that is down.
+    fn request_next_catalog_page(&mut self) {
+        if self.paging.asked.is_some() {
+            return;
+        }
+        let Some(start) = self.paging.next else {
+            return;
+        };
+        self.request_catalog_page(start);
+    }
+
+    /// Asks for the next page once the cursor has come to rest on the last row the
+    /// catalogue column holds.
+    ///
+    /// Every way of moving a cursor ends up here rather than a key of its own: `down`
+    /// clamped against the bottom, a `page-down` that overshot, `bottom`, the wheel and a
+    /// drag all put the cursor somewhere through [`App::pane_move`], [`App::put_cursor`]
+    /// or [`App::focused_pane_edge`], and the list growing when you reach the end of it
+    /// is not a thing anyone should have to ask for by name. Only the catalogue: the
+    /// seasons and the episodes of one season arrive whole, and the queue is this run's
+    /// own doing.
+    fn catalog_page_if_at_the_end(&mut self, focus: Focus) {
+        if focus != Focus::Series {
+            return;
+        }
+        let Some(cursor) = self.series.state.selected() else {
+            return;
+        };
+        // Rows rather than items, which is what the cursor counts. A narrowed catalogue is
+        // the case that makes the difference: the last row a narrowing left is the end of
+        // what the user can walk to, and it is exactly where the next page is worth
+        // asking for - a query that kept four rows out of a hundred has hidden ninety-six
+        // series the user is not looking for and says nothing about the hundred behind
+        // them.
+        if cursor + 1 >= self.series.rows() {
+            self.request_next_catalog_page();
+        }
+    }
+
+    /// Opens the row the catalogue column is on into the middle column.
+    ///
+    /// A series opens into its seasons, which is the request this has always been. A film
+    /// has no seasons endpoint and no episodes endpoint behind it, and a concert has
+    /// nothing underneath it at all, so for those the middle column holds one row standing
+    /// for the thing itself and the right column is asked for behind it straight away.
+    /// There is nothing to choose in a column with one row in it, and leaving the cursor
+    /// there would put a keypress between every film and playing it for the sake of a
+    /// decision nobody has to make. The shape still holds - `back` comes out of a film
+    /// into the catalogue exactly as it comes out of a season - and the column says what
+    /// it is holding rather than pretending to a season: see [`App::open_single`].
+    fn request_seasons(&mut self) {
+        let Some(series) = self.series.selected().cloned() else {
+            return;
+        };
+        match series.opens() {
+            Some(Opens::Seasons) => {
+                let series_id = series.id;
+                self.seasons.clear();
+                self.clear_episodes();
+                self.seasons.loading = true;
+                self.seasons.owner = series_id.clone();
+                self.focus = Focus::Seasons;
+                self.worker.send(Request::Seasons {
+                    series_id,
+                    audio: self.audio(),
+                    subs: self.subs(),
+                });
+            }
+            Some(Opens::Films | Opens::Itself) => self.open_single(&series),
+            // Every list that fills this column drops what it cannot open, so nothing
+            // should reach here. A row that arrived by some road nobody has thought of
+            // yet is still better answered than left to do nothing when it is opened.
+            None => self.complain(format!(
+                "Crunchyroll calls {} a {}, which this client has nothing to open.",
+                series.title, series.kind
+            )),
+        }
+    }
+
+    /// The middle column for a catalogue row that is not a series: one row, standing for
+    /// the film or the concert itself, with the right column asked for behind it.
+    ///
+    /// The row carries the catalogue entry's type, and that is the whole of what anything
+    /// afterwards needs to know about it: it is why the column is titled `Film`, and why
+    /// opening that row asks for the films inside a listing rather than the episodes of a
+    /// season. Carried on the row rather than read off the catalogue cursor a second time,
+    /// so that it is still the right answer once the cursor has moved on.
+    fn open_single(&mut self, item: &CatalogItem) {
+        self.seasons.clear();
+        self.clear_episodes();
+        self.seasons.owner = item.id.clone();
+        self.seasons.set(vec![Season {
+            id: item.id.clone(),
+            kind: item.kind.clone(),
+            title: item.title.clone(),
+            ..Season::default()
+        }]);
+        self.request_episodes();
+    }
+
+    /// The one row a concert or a music video fills the episodes column with.
+    ///
+    /// Built here rather than asked for: what the catalogue row names is already the thing
+    /// that plays, and a column left sitting on `Loading...` waiting for an answer nobody
+    /// is going to send would be a poor way of saying so. The blurb and the still come off
+    /// the catalogue entry while it is still there to be read - a catalogue replaced by
+    /// another list in the meantime costs the panel its description and nothing that
+    /// plays.
+    ///
+    /// The numbers are the ones `api::films` settles on for a film, and for the same
+    /// reasons: season one, episode one, and the thing named twice - once as what the file
+    /// goes under, once as its own title.
+    fn single_row(&self, season: &Season) -> SeasonEpisode {
+        let listed = self.series.items.iter().find(|item| item.id == season.id);
+        SeasonEpisode {
+            id: season.id.clone(),
+            kind: season.kind.clone(),
+            season_number: 1,
+            episode_number: 1,
+            series_title: season.title.clone(),
+            title: season.title.clone(),
+            // Nothing here says what a concert's audio is, and the downloader needs a
+            // locale to hang its one stream on: the locale it was asked for is the only
+            // answer there is, and an empty one would make every concert unplayable.
+            audio_locale: self.audio(),
+            description: listed
+                .map(|item| item.description.clone())
+                .unwrap_or_default(),
+            images: listed.map(|item| item.images.clone()).unwrap_or_default(),
+            ..SeasonEpisode::default()
+        }
+    }
+
     fn request_episodes(&mut self) {
-        let Some(season) = self.seasons.selected() else {
+        let Some(season) = self.seasons.selected().cloned() else {
             return;
         };
         let season_id = season.id.clone();
         self.clear_episodes();
-        self.episodes.loading = true;
         self.episodes.owner = season_id.clone();
         self.focus = Focus::Episodes;
-        self.worker.send(Request::Episodes {
-            season_id,
-            audio: self.audio(),
-            subs: self.subs(),
-        });
+        match opens(&season.kind) {
+            // A film's listing, whose films are a question of their own and come back as
+            // an episodes answer like any other.
+            Some(Opens::Films) => {
+                self.episodes.loading = true;
+                self.worker.send(Request::Movies {
+                    listing_id: season_id,
+                    audio: self.audio(),
+                    subs: self.subs(),
+                });
+            }
+            // Already the thing that plays, so the column is filled from here. The
+            // playheads have to be asked for by hand: that request usually rides on the
+            // back of an answer, and without it this would be the one row in the interface
+            // that could not say where the account had got to in it.
+            Some(Opens::Itself) => {
+                let row = self.single_row(&season);
+                let episode_ids = vec![row.id.clone()];
+                self.episodes.set(vec![row]);
+                self.look_on_disk();
+                self.worker.send(Request::Playheads {
+                    season_id,
+                    episode_ids,
+                });
+            }
+            Some(Opens::Seasons) | None => {
+                self.episodes.loading = true;
+                self.worker.send(Request::Episodes {
+                    season_id,
+                    audio: self.audio(),
+                    subs: self.subs(),
+                });
+            }
+        }
     }
 
     /// Asks for the season that is already open a second time, keeping what the user put
@@ -540,14 +1123,15 @@ impl App {
     /// safe to carry because they name episodes by id, so a list that comes back without
     /// one of them simply has nothing marked there.
     fn request_episodes_again(&mut self) {
-        let cursor = self.episodes.state.selected();
+        let cursor = self.episodes.selected_index();
         let marks = std::mem::take(&mut self.marked);
         self.request_episodes();
         self.episodes.pending_cursor = cursor;
         self.marked = marks;
     }
 
-    /// A catalogue answer, and the one decision the opening screen still has to make.
+    /// A page of the catalogue, and the one decision the opening screen still has to
+    /// make.
     ///
     /// The interface asks for Continue watching first, which is the best thing to open
     /// on right up until the account has never watched anything, or the request fails:
@@ -557,13 +1141,39 @@ impl App {
     /// saying so, since a column showing a different list from the one that was asked
     /// for has no business doing it quietly.
     ///
+    /// The page is checked against the list on screen and against the offset the column
+    /// is waiting for, which are two different questions. The first is the pane owner's
+    /// job done for a list rather than a series: an answer for a list the user has since
+    /// cycled past has nothing to do with what is drawn now. The second is what keeps a
+    /// page from being appended twice - a request that was still in flight when the list
+    /// was started over comes back looking like page one of a list that is indeed the
+    /// one on screen, and appending it would show the first hundred series twice.
+    ///
     /// Split out of [`App::drain`] so a test can hand the interface an answer without a
     /// worker behind it.
-    fn catalog_arrived(&mut self, listing: Listing, result: Result<Vec<CatalogItem>, String>) {
-        if listing != self.listing {
+    fn catalog_arrived(
+        &mut self,
+        listing: Listing,
+        start: usize,
+        filters: Filters,
+        result: Result<Page, String>,
+    ) {
+        // Three things have to match, and they are the three the request carried. The
+        // filters are half of what was asked, so they are half of what makes an answer
+        // stale: a page of the whole catalogue arriving after a genre has been chosen is
+        // as much the answer to a question nobody is asking any more as a page of the
+        // watchlist would be. The offset is the other half - see [`Paging::asked`].
+        if listing != self.listing || filters != self.filters || self.paging.asked != Some(start) {
             return;
         }
-        let nothing_to_show = result.as_ref().is_ok_and(Vec::is_empty) || result.is_err();
+        self.paging.asked = None;
+        // The first page replaces what the column held and every page after it is added
+        // to the end, which is also why only the first one restores a cursor and only
+        // the first one can send the interface looking for another list: a later page is
+        // an addition to a column that already has something worth reading in it.
+        let first = start == 0;
+        let nothing_to_show =
+            first && (result.as_ref().is_ok_and(|page| page.items.is_empty()) || result.is_err());
         if listing == Listing::History && nothing_to_show && !self.gave_up_on_history {
             self.gave_up_on_history = true;
             self.sort = 0;
@@ -577,18 +1187,68 @@ impl App {
             return;
         }
         match result {
-            Ok(items) => {
-                let count = items.len();
-                self.series.set(items);
-                if count == 0 {
-                    self.say("No series found.");
+            Ok(page) => {
+                self.paging.total = page.total;
+                self.paging.next = page.next;
+                let count = page.items.len();
+                if first {
+                    self.series.set(page.items);
+                    if count == 0 {
+                        self.say("No series found.");
+                    }
+                } else {
+                    self.series.append(page.items, series_text);
                 }
             }
             Err(error) => {
                 self.series.loading = false;
-                self.series.error = Some(error.clone());
+                if first {
+                    self.series.error = Some(error.clone());
+                    self.complain(error);
+                } else {
+                    // The rows already loaded are still perfectly good, and throwing
+                    // away a hundred series the user has been walking through because
+                    // the hundred-and-first could not be fetched would be a strange way
+                    // to report it. So the column is left as it is and the status line
+                    // carries the news, which is where everything else that fails
+                    // quietly in the background says so.
+                    self.complain(format!("Could not load more series ({error})"));
+                }
+            }
+        }
+    }
+
+    /// The values behind one of the two list filters.
+    ///
+    /// Kept whatever is on screen by the time they arrive: the categories are a fact
+    /// about Crunchyroll rather than about the column, and an answer thrown away because
+    /// the list had been closed would only be asked for again the next time it was
+    /// opened. What the answer may not do is reach into a list the user has moved on
+    /// from - the discipline every other answer here keeps - so the open list is
+    /// refilled only where it is the one that asked, and a list since closed, or swapped
+    /// for the other filter, is left exactly as it was found.
+    ///
+    /// A list that failed leaves the popup showing All, which still clears the filter,
+    /// and says why on the status line. The alternative - closing the popup out from
+    /// under the user - would take away the one row it did have to offer. A failure for
+    /// a list nobody is looking at any more is dropped like any other stale answer,
+    /// since there is nothing left on screen for it to explain.
+    fn filter_values_arrived(&mut self, which: FilterKind, result: Result<Vec<Choice>, String>) {
+        let open = self.picker.as_ref().map(|picker| picker.kind) == Some(Picking::Filter(which));
+        match result {
+            Ok(values) => {
+                self.filter_values.insert(which, values);
+                if open {
+                    self.open_picker(Picking::Filter(which));
+                }
+            }
+            Err(error) if open => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.pane.loading = false;
+                }
                 self.complain(error);
             }
+            Err(_) => {}
         }
     }
 
@@ -617,7 +1277,13 @@ impl App {
     /// produce.
     pub fn accept(&mut self, response: Response) {
         match response {
-            Response::Catalog { listing, result } => self.catalog_arrived(listing, result),
+            Response::Catalog {
+                listing,
+                start,
+                filters,
+                result,
+            } => self.catalog_arrived(listing, start, filters, result),
+            Response::FilterValues { which, result } => self.filter_values_arrived(which, result),
             Response::Seasons { series_id, result } => {
                 if series_id != self.seasons.owner {
                     return;
@@ -745,6 +1411,7 @@ impl App {
             Focus::Episodes => self.episodes.move_by(delta),
             Focus::Downloads => self.downloads.move_by(delta),
         }
+        self.catalog_page_if_at_the_end(focus);
     }
 
     fn focused_pane_move(&mut self, delta: isize) {
@@ -778,11 +1445,13 @@ impl App {
             Focus::Episodes => self.episodes.select(index),
             Focus::Downloads => self.downloads.select(index),
         }
+        self.catalog_page_if_at_the_end(focus);
     }
 
-    /// The item on `row` of a column, if the pointer is on one rather than on a border,
-    /// a title, or the sentence an empty column draws.
-    fn item_at(&self, focus: Focus, row: u16) -> Option<usize> {
+    /// Which row of a column the pointer is on, if it is on one rather than on a border,
+    /// a title, or the sentence an empty column draws. A row rather than an item, since
+    /// the column may be narrowed and the cursor counts in rows - see [`Pane`].
+    fn row_at(&self, focus: Focus, row: u16) -> Option<usize> {
         let (offset, len) = self.pane_window(focus);
         mouse::row_at(self.regions.column(focus), offset, len, row)
     }
@@ -794,6 +1463,7 @@ impl App {
             Focus::Episodes => self.episodes.select_edge(last),
             Focus::Downloads => self.downloads.select_edge(last),
         }
+        self.catalog_page_if_at_the_end(self.focus);
     }
 
     fn descend(&mut self) -> Action {
@@ -834,16 +1504,38 @@ impl App {
     }
 
     /// The episodes to act on: the selected one, or the rest of the season after it.
+    ///
+    /// The rest of the season is the rest of what the column is showing. A narrowing is
+    /// what the user is looking at, and a key pressed against a screen holding three
+    /// episodes must not hand mpv the twenty-one it is hiding - which is the same
+    /// reason the cursor may only ever be on a row that is showing.
     fn selection(&mut self, to_end: bool) -> Vec<SeasonEpisode> {
-        let Some(index) = self.episodes.state.selected() else {
-            self.complain("Open a season first.");
+        let Some(row) = self.episodes.state.selected() else {
+            self.nothing_to_act_on();
             return Vec::new();
         };
-        if to_end {
-            self.episodes.items[index..].to_vec()
+        let shown = self.episodes.shown();
+        let taken = if to_end {
+            shown.get(row..)
         } else {
-            self.episodes.items[index..=index].to_vec()
-        }
+            shown.get(row..=row)
+        };
+        taken
+            .unwrap_or_default()
+            .iter()
+            .map(|episode| (*episode).clone())
+            .collect()
+    }
+
+    /// What to say when the episodes column has nothing under the cursor. A column with
+    /// no season in it and a column narrowed until nothing is left are two different
+    /// problems, and only one of them is answered by opening a season.
+    fn nothing_to_act_on(&mut self) {
+        self.complain(if self.episodes.items.is_empty() {
+            "Open a season first."
+        } else {
+            "Nothing in this season matches what the column was narrowed to."
+        });
     }
 
     /// Puts the selected series on the watchlist, or takes it off.
@@ -874,7 +1566,7 @@ impl App {
     /// open a season.
     fn mark(&mut self, watched: bool) {
         let Some(episode) = self.episodes.selected() else {
-            self.complain("Open a season first.");
+            self.nothing_to_act_on();
             return;
         };
         let episode_id = episode.id.clone();
@@ -921,7 +1613,7 @@ impl App {
             return;
         }
         let Some(episode) = self.episodes.selected() else {
-            self.complain("Open a season first.");
+            self.nothing_to_act_on();
             return;
         };
         let episode_id = episode.id.clone();
@@ -948,6 +1640,13 @@ impl App {
     /// the order they were pressed would put that order into the Downloads panel, where
     /// it would sit for the rest of the hour as the only account of what was asked for,
     /// reading back something no longer visible anywhere on screen.
+    ///
+    /// The whole season rather than what a narrowing is showing of it, which is the
+    /// opposite of what `download-season` does and is right for the opposite reason. A
+    /// mark is something the user put on an episode by hand, and a narrowing typed
+    /// afterwards is a way of looking at the column: hiding a marked row does not
+    /// unmark it, and a `d` that queued only the marks that happened to be on the
+    /// screen would let a query typed later decide what four deliberate presses meant.
     fn marked_episodes(&self) -> Vec<SeasonEpisode> {
         self.episodes
             .items
@@ -981,10 +1680,16 @@ impl App {
     /// be meant by a handful of marks, and it stays the way to ask for it.
     fn queue_downloads(&mut self, whole_season: bool) {
         let (episodes, from_marks) = if whole_season {
-            if self.episodes.items.is_empty() {
-                self.complain("Open a season first.");
+            // What is showing rather than what the season holds. `download-season` says
+            // the column, and while a narrowing is on it the column is what the
+            // narrowing left: queueing two dozen episodes off a screen showing three is
+            // the one mistake this key must not make. The marks below are the opposite
+            // case and are left alone - see [`App::marked_episodes`].
+            let showing: Vec<SeasonEpisode> = self.episodes.shown().into_iter().cloned().collect();
+            if showing.is_empty() {
+                self.nothing_to_act_on();
             }
-            (self.episodes.items.clone(), false)
+            (showing, false)
         } else {
             let marked = self.marked_episodes();
             if marked.is_empty() {
@@ -1002,7 +1707,14 @@ impl App {
             self.next_download += 1;
             self.downloads.items.push(Download {
                 id,
-                number: format!("S{:02}E{}", episode.season_number, episode_number(&episode)),
+                // The number slot takes the word the episodes column puts in the same
+                // place, for a row that has no number: the title is drawn beside it
+                // either way, so `Film  Suzume` reads as the queue saying what the row
+                // is, where `S01E1 Suzume` would be claiming a number nobody gave it.
+                number: single_name(&episode.kind).map_or_else(
+                    || format!("S{:02}E{}", episode.season_number, episode_number(&episode)),
+                    str::to_owned,
+                ),
                 title: episode.title.clone(),
                 series: episode.series_title.clone(),
                 state: State::Queued,
@@ -1014,10 +1726,12 @@ impl App {
                 options: self.options.clone(),
             })));
         }
+        self.renarrow_downloads();
         // A panel with a list in it and no cursor anywhere has nothing the arrow keys
-        // could move, so the first row queued takes one.
+        // could move, so the first row queued takes one - unless a narrowing is hiding
+        // every row there is, in which case there is still nothing to put it on.
         if self.downloads.state.selected().is_none() {
-            self.downloads.state.select(Some(0));
+            self.downloads.select(0);
         }
         // One sentence rather than two. Marking already says how many are marked as each
         // one goes on, so the only thing left to say here is what the key took, and
@@ -1040,7 +1754,10 @@ impl App {
     /// dropped at both ends: the row goes, and the number goes to the worker so that
     /// the thread passes over the request when it reaches it.
     fn drop_download(&mut self) {
-        let Some(index) = self.downloads.state.selected() else {
+        let (Some(row), Some(index)) = (
+            self.downloads.state.selected(),
+            self.downloads.selected_index(),
+        ) else {
             return;
         };
         let Some(download) = self.downloads.items.get(index) else {
@@ -1054,12 +1771,14 @@ impl App {
             self.worker.abandon(download.id);
         }
         self.downloads.items.remove(index);
+        self.renarrow_downloads();
         // The row the cursor was on has gone, so it lands on whatever took its place -
-        // or on the last row, where it was the last row that went.
-        let left = self.downloads.items.len();
+        // or on the last row, where it was the last row that went. Rows rather than
+        // episodes, because it is the hole in the list the eye is resting on.
+        let left = self.downloads.rows();
         self.downloads
             .state
-            .select((left > 0).then(|| index.min(left - 1)));
+            .select((left > 0).then(|| row.min(left - 1)));
     }
 
     /// The locales worth offering for the current selection, most specific first: what
@@ -1108,16 +1827,73 @@ impl App {
         locales
     }
 
-    /// Opens the language list on the locale in use.
-    fn open_picker(&mut self, audio: bool) {
-        let locales = self.locales(audio);
-        let current = if audio { self.audio() } else { self.subs() };
+    /// Opens one of the four lists, on the value in force.
+    ///
+    /// The two filter lists come off the network, so one whose values have not been
+    /// fetched yet opens holding nothing but All and asks for them. That is the right
+    /// way round: the popup is up the moment the key is pressed, and it fills in a beat
+    /// later, rather than the key doing nothing visible while a request is out.
+    fn open_picker(&mut self, picking: Picking) {
+        let rows = self.picker_rows(picking);
+        let current = self.chosen(picking);
         let mut pane = Pane {
-            pending_cursor: locales.iter().position(|locale| *locale == current),
+            pending_cursor: rows.iter().position(|row| row.value == current),
             ..Pane::default()
         };
-        pane.set(locales);
-        self.picker = Some(Picker { audio, pane });
+        pane.set(rows);
+        if let Picking::Filter(which) = picking
+            && !self.filter_values.contains_key(&which)
+        {
+            pane.loading = true;
+            self.worker.send(Request::FilterValues(which));
+        }
+        self.picker = Some(Picker {
+            kind: picking,
+            pane,
+        });
+    }
+
+    /// What one of the four lists offers.
+    ///
+    /// Both filter lists open with an All row of their own making, at the top where the
+    /// eye lands, because taking a filter off has to be as easy as putting one on and
+    /// there is no other key for it. Its value is the empty string, which is what no
+    /// filter set reads as everywhere else - so All is the row the list opens on and
+    /// marks while nothing is chosen, without anything having to know that it is
+    /// special.
+    fn picker_rows(&self, picking: Picking) -> Vec<Choice> {
+        match picking {
+            Picking::Audio | Picking::Subtitles => self
+                .locales(picking == Picking::Audio)
+                .into_iter()
+                .map(|locale| Choice {
+                    label: language_name(&locale).to_owned(),
+                    value: locale,
+                })
+                .collect(),
+            Picking::Filter(which) => {
+                let mut rows = vec![Choice {
+                    value: String::new(),
+                    label: "All".to_owned(),
+                }];
+                rows.extend(self.filter_values.get(&which).cloned().unwrap_or_default());
+                rows
+            }
+        }
+    }
+
+    /// The value in force for one of the four lists: the row it opens on, and the row it
+    /// marks. A filter nobody has set is the empty string, which is the All row's value.
+    pub fn chosen(&self, picking: Picking) -> String {
+        match picking {
+            Picking::Audio => self.audio(),
+            Picking::Subtitles => self.subs(),
+            Picking::Filter(which) => self
+                .filters
+                .chosen(which)
+                .map(|chosen| chosen.value.clone())
+                .unwrap_or_default(),
+        }
     }
 
     fn cycle_locale(&mut self, audio: bool) {
@@ -1156,7 +1932,7 @@ impl App {
         if !self.episodes.owner.is_empty() {
             self.request_episodes_again();
         } else if !self.seasons.owner.is_empty() {
-            let cursor = self.seasons.state.selected();
+            let cursor = self.seasons.selected_index();
             self.request_seasons();
             self.seasons.pending_cursor = cursor;
         }
@@ -1190,17 +1966,93 @@ impl App {
             self.sort = sort;
         }
         self.request_catalog();
+        self.say_filters_are_off_here();
+    }
+
+    /// Puts a filter on the catalogue, or takes it off again when the row chosen is All.
+    ///
+    /// This is where the one decision the whole feature turns on lives. A filter narrows
+    /// the browse listings and nothing else - see [`Filters`] - so one set while the
+    /// column is showing the watchlist, the history or a search would be a word in the
+    /// header about a list it has nothing to do with. Rather than let the header say
+    /// something untrue, or refuse the key and leave the user working out why nothing
+    /// happened, the column goes back to the browse order it was last on and the filter
+    /// shows its effect there at once. That is the move `back` out of a search already
+    /// makes, it is said on the status line as it happens, and it costs one press of
+    /// `order` to undo.
+    fn choose_filter(&mut self, which: FilterKind, chosen: Choice) {
+        let changed = self.chosen(Picking::Filter(which)) != chosen.value;
+        self.filters
+            .set(which, (!chosen.value.is_empty()).then_some(chosen));
+        self.filters_changed(changed);
+    }
+
+    /// The simulcast filter, which is a yes or a no and so has no list to pick from.
+    fn toggle_simulcast(&mut self) {
+        self.filters.simulcast = !self.filters.simulcast;
+        self.filters_changed(true);
+    }
+
+    /// What every change to a filter does once the change itself has been made.
+    ///
+    /// The catalogue is asked for again from the start rather than narrowed where it
+    /// sits: a filtered catalogue is a different hundred series, not the same hundred
+    /// with rows hidden, and Crunchyroll is the only thing that knows which. The status
+    /// line then says what is on screen, filters and all, because the column changing
+    /// under the cursor without a word is the one thing that would read as a glitch.
+    ///
+    /// A row chosen a second time changes nothing and is not asked for again - the
+    /// answer is already in the column - but it is still said, since the key was pressed
+    /// and silence is the same answer a broken key gives.
+    fn filters_changed(&mut self, changed: bool) {
+        let moved = !matches!(self.listing, Listing::Browse(_));
+        if moved {
+            self.listing = Listing::Browse(self.sort);
+        }
+        if changed || moved {
+            self.request_catalog();
+        }
+        let showing = format!("Showing {}", self.showing());
+        self.say(if moved {
+            only_the_catalogue(&showing)
+        } else {
+            format!("{showing}.")
+        });
+    }
+
+    /// The list on screen and what it is narrowed by: `Popular · Genre: Action`.
+    fn showing(&self) -> String {
+        let label = self.listing.label();
+        match self.filters.summary() {
+            summary if summary.is_empty() => label,
+            summary => format!("{label} · {summary}"),
+        }
+    }
+
+    /// Says so when the column has arrived somewhere the filters do not reach.
+    ///
+    /// The header shows them only while a browse listing is on screen, which is the only
+    /// way it can describe what is under it. A word that disappears without anything
+    /// being said reads as a filter that has been forgotten rather than one that is out
+    /// of force for as long as this list is up, so leaving the catalogue says which it
+    /// is. Nothing is said on the way back: the header saying it again is the whole
+    /// news.
+    fn say_filters_are_off_here(&mut self) {
+        if self.filters.any() && !matches!(self.listing, Listing::Browse(_)) {
+            let label = self.listing.label();
+            self.say(only_the_catalogue(&label));
+        }
     }
 
     fn reload(&mut self) {
         match self.focus {
             Focus::Series => {
-                let cursor = self.series.state.selected();
+                let cursor = self.series.selected_index();
                 self.request_catalog();
                 self.series.pending_cursor = cursor;
             }
             Focus::Seasons => {
-                let cursor = self.seasons.state.selected();
+                let cursor = self.seasons.selected_index();
                 self.request_seasons();
                 self.seasons.pending_cursor = cursor;
             }
@@ -1215,32 +2067,114 @@ impl App {
         match key.code {
             KeyCode::Esc => self.editing = None,
             KeyCode::Enter => {
-                let query = self.editing.take().unwrap_or_default().trim().to_owned();
+                let query = self
+                    .editing
+                    .take()
+                    .map_or_else(String::new, |editing| editing.query().trim().to_owned());
                 self.listing = if query.is_empty() {
                     Listing::Browse(self.sort)
                 } else {
                     Listing::Search(query)
                 };
                 self.request_catalog();
+                self.say_filters_are_off_here();
             }
-            KeyCode::Backspace => {
-                if let Some(query) = self.editing.as_mut() {
-                    query.pop();
+            _ => {
+                if let Some(editing) = self.editing.as_mut() {
+                    editing.typed(key);
                 }
             }
-            KeyCode::Char(letter) => {
-                if let Some(query) = self.editing.as_mut() {
-                    query.push(letter);
-                }
-            }
-            _ => {}
         }
     }
 
-    /// The language list has the keys of a column, plus the one that cycles the columns
-    /// to look at the other list without going back out first. Anything else does
-    /// nothing while it is open, which is what a new command should do here until
-    /// someone decides otherwise.
+    /// A key while the filter box is open.
+    ///
+    /// The column is narrowed again as each letter lands rather than when the box is
+    /// closed, which is the whole difference between this and the search: nothing is
+    /// being asked of anybody, so there is nothing to wait for and no reason to make
+    /// the user guess at what a query will leave standing. Backspace widens by the same
+    /// road, since the rows are worked out from the query afresh every time and never
+    /// whittled down from what the last letter left.
+    ///
+    /// The return keeps what the box built and gets out of the way: the column goes on
+    /// showing what it was narrowed to, and its title goes on saying so. Escape throws
+    /// it away and the whole list comes back. Since the box always opens empty, those
+    /// two mean exactly what they mean in the search box - keep this, or forget it.
+    fn edit_narrow(&mut self, key: KeyEvent) {
+        let Some(Editing::Narrow { focus, .. }) = self.editing.as_ref() else {
+            return;
+        };
+        let focus = *focus;
+        match key.code {
+            KeyCode::Esc => {
+                self.editing = None;
+                self.narrow(focus, "");
+            }
+            KeyCode::Enter => {
+                self.editing = None;
+                // A narrowing is quiet by nature - the rows it hid are simply not there
+                // - so the one moment it is settled on is the moment to say how much of
+                // the column is left and how to get the rest back. The key is read off
+                // the bindings rather than written down, since it is one someone may
+                // have moved.
+                if let Some((showing, held)) = self.narrowed_to(focus) {
+                    let key = self.keys.first(Command::Filter);
+                    self.say(format!(
+                        "Showing {showing} of {held} - {key} then esc puts the list back."
+                    ));
+                }
+            }
+            _ => {
+                if self
+                    .editing
+                    .as_mut()
+                    .is_some_and(|editing| editing.typed(key))
+                {
+                    let query = self
+                        .editing
+                        .as_ref()
+                        .map_or_else(String::new, |editing| editing.query().to_owned());
+                    self.narrow(focus, &query);
+                }
+            }
+        }
+    }
+
+    /// Opens the box that narrows the column the keyboard is in.
+    ///
+    /// It opens empty, and whatever the column was narrowed to goes as it opens, so the
+    /// whole list is back on the screen while the first letter is typed. Opening on the
+    /// narrowing already there - so that one could be refined rather than retyped - was
+    /// the other way round, and it would have left escape meaning one thing on a fresh
+    /// box and another on a reopened one. This way escape always ends with the full
+    /// list back, and the key twice over - `f` then `esc` - is how a narrowing is taken
+    /// off, which is one thing to remember rather than two.
+    fn open_narrow(&mut self) {
+        let focus = self.focus;
+        self.narrow(focus, "");
+        self.editing = Some(Editing::Narrow {
+            focus,
+            query: String::new(),
+        });
+    }
+
+    /// What a column is showing and what it holds, where it is narrowed at all.
+    fn narrowed_to(&self, focus: Focus) -> Option<(usize, usize)> {
+        match focus {
+            Focus::Series => narrowed_to(&self.series),
+            Focus::Seasons => narrowed_to(&self.seasons),
+            Focus::Episodes => narrowed_to(&self.episodes),
+            Focus::Downloads => narrowed_to(&self.downloads),
+        }
+    }
+
+    /// An open list has the keys of a column, plus the one that cycles the columns - which
+    /// looks at the other list of the pair without going back out first - and the keys
+    /// that open each of the four, so a list opened by mistake is one key from the right
+    /// one. Anything else does nothing while it is open, `simulcast` included: it is the
+    /// filter with no list behind it, and taking it as a keypress about the catalogue
+    /// from inside a popup about the catalogue would be the one place where a key changed
+    /// what is underneath the thing being looked at.
     fn edit_picker(&mut self, command: Command) {
         let Some(picker) = self.picker.as_mut() else {
             return;
@@ -1254,17 +2188,23 @@ impl App {
             Command::Top => picker.pane.select_edge(false),
             Command::Bottom => picker.pane.select_edge(true),
             Command::NextColumn => {
-                let other = !picker.audio;
+                let other = picker.kind.other();
                 self.open_picker(other);
             }
-            Command::AudioLanguage => self.open_picker(true),
-            Command::SubtitleLanguage => self.open_picker(false),
+            Command::AudioLanguage => self.open_picker(Picking::Audio),
+            Command::SubtitleLanguage => self.open_picker(Picking::Subtitles),
+            Command::Genre => self.open_picker(Picking::Filter(FilterKind::Genre)),
+            Command::AnimeSeason => self.open_picker(Picking::Filter(FilterKind::Season)),
             Command::Open => {
-                let audio = picker.audio;
+                let kind = picker.kind;
                 let chosen = picker.pane.selected().cloned();
                 self.picker = None;
                 if let Some(chosen) = chosen {
-                    self.choose_locale(audio, chosen);
+                    match kind {
+                        Picking::Audio => self.choose_locale(true, chosen.value),
+                        Picking::Subtitles => self.choose_locale(false, chosen.value),
+                        Picking::Filter(which) => self.choose_filter(which, chosen),
+                    }
                 }
             }
             _ => {}
@@ -1277,11 +2217,18 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
-        // The search box is typing rather than commands: every letter belongs in the
-        // query, whatever it would otherwise do.
-        if self.editing.is_some() {
-            self.edit_search(key);
-            return Action::None;
+        // The box along the top is typing rather than commands: every letter belongs in
+        // it, whatever it would otherwise do.
+        match self.editing {
+            Some(Editing::Search(_)) => {
+                self.edit_search(key);
+                return Action::None;
+            }
+            Some(Editing::Narrow { .. }) => {
+                self.edit_narrow(key);
+                return Action::None;
+            }
+            None => {}
         }
         let command = self.keys.command(key);
         if self.picker.is_some() {
@@ -1327,7 +2274,8 @@ impl App {
                 return Action::Quit;
             }
             Command::Help => self.show_help = true,
-            Command::Search => self.editing = Some(String::new()),
+            Command::Search => self.editing = Some(Editing::Search(String::new())),
+            Command::Filter => self.open_narrow(),
             Command::Up => self.focused_pane_move(-1),
             Command::Down => self.focused_pane_move(1),
             Command::PageUp => self.focused_pane_move(-10),
@@ -1352,8 +2300,11 @@ impl App {
             Command::Watchlist => self.toggle_watchlist(),
             Command::MarkWatched => self.mark(true),
             Command::MarkUnwatched => self.mark(false),
-            Command::AudioLanguage => self.open_picker(true),
-            Command::SubtitleLanguage => self.open_picker(false),
+            Command::AudioLanguage => self.open_picker(Picking::Audio),
+            Command::SubtitleLanguage => self.open_picker(Picking::Subtitles),
+            Command::Genre => self.open_picker(Picking::Filter(FilterKind::Genre)),
+            Command::AnimeSeason => self.open_picker(Picking::Filter(FilterKind::Season)),
+            Command::Simulcast => self.toggle_simulcast(),
             Command::NextAudio => self.cycle_locale(true),
             Command::NextSubtitle => self.cycle_locale(false),
             Command::Quality => self.cycle_quality(),
@@ -1404,8 +2355,11 @@ impl App {
     /// into a drag is the same gesture either way, and waiting for the release only
     /// makes the interface answer late.
     fn click(&mut self, at: Position) -> Action {
-        // The search box owns the pointer as it owns the keyboard: a click is the way
-        // out of it, as escape is, and nothing else.
+        // The box along the top owns the pointer as it owns the keyboard: a click is a
+        // way out of it and nothing else. It is the return rather than escape, though -
+        // the rows under the pointer are the ones the narrowing left, and taking them
+        // out from under a finger that was aiming at one would be a poor answer to a
+        // click. A search box has nothing to keep, so for that one the two are the same.
         if self.editing.is_some() {
             self.editing = None;
             return Action::None;
@@ -1430,7 +2384,7 @@ impl App {
             Target::Column(focus) => {
                 let working_there = self.focus == focus;
                 self.focus = focus;
-                let Some(index) = self.item_at(focus, at.y) else {
+                let Some(index) = self.row_at(focus, at.y) else {
                     return Action::None;
                 };
                 // A click on the row the cursor is already on, in the column already
@@ -1461,7 +2415,7 @@ impl App {
             return;
         }
         if self.regions.at(at) == Target::Column(self.focus)
-            && let Some(index) = self.item_at(self.focus, at.y)
+            && let Some(index) = self.row_at(self.focus, at.y)
         {
             self.put_cursor(self.focus, index);
         }
@@ -1510,7 +2464,7 @@ impl App {
         }
     }
 
-    /// The locale under the pointer, while the language list is open.
+    /// The row under the pointer, while a list is open over the interface.
     fn picked_at(&self, at: Position) -> Option<usize> {
         let picker = self.picker.as_ref()?;
         let (offset, len) = picker.pane.window();
@@ -1525,7 +2479,7 @@ impl App {
         }
     }
 
-    /// The columns' rule again: a click chooses a locale, and a click on the one already
+    /// The columns' rule again: a click chooses a row, and a click on the one already
     /// chosen applies it.
     fn click_picker(&mut self, at: Position) {
         let Some(index) = self.picked_at(at) else {
@@ -1554,10 +2508,13 @@ mod tests {
     use crate::tui::art::Gallery;
     use crate::tui::keys::{Bindings, Command};
     use crate::tui::theme::Theme;
-    use crate::tui::worker::{Listing, Request, Response, Update, Worker};
+    use crate::tui::worker::{
+        Choice, FilterKind, Filters, Listing, Request, Response, Update, Worker,
+    };
 
     use super::{
-        Action, App, Focus, OnDisk, Pane, SeasonEpisode, State, episode_label, whole_seconds,
+        Action, App, Editing, Focus, OnDisk, Page, Pane, SeasonEpisode, State, episode_label,
+        matches, whole_seconds,
     };
 
     /// An interface with nothing behind it: the worker swallows every request and never
@@ -1588,6 +2545,62 @@ mod tests {
         CatalogItem {
             id: id.to_owned(),
             kind: "series".to_owned(),
+            ..CatalogItem::default()
+        }
+    }
+
+    /// One page of a catalogue list as the worker hands it over: `count` series starting
+    /// at `start`, with what the endpoint said about the length of the list and about
+    /// where the next page begins. The ids carry the offset they came from, so a page
+    /// appended in the wrong place or appended twice shows up as an id in the wrong row
+    /// rather than only as a count.
+    fn page(
+        start: usize,
+        count: usize,
+        total: Option<usize>,
+        next: Option<usize>,
+    ) -> Result<Page, String> {
+        Ok(Page {
+            items: (start..start + count)
+                .map(|index| series(&format!("G{index}")))
+                .collect(),
+            total,
+            next,
+        })
+    }
+
+    /// Hands the interface a catalogue answer the way the worker does, naming the list and
+    /// the offset it was asked for and the filters the interface is holding - which is
+    /// what the interface checks all three against. Every test that is not about the
+    /// filters themselves means this by a page arriving.
+    fn catalog(app: &mut App, listing: Listing, start: usize, result: Result<Page, String>) {
+        let filters = app.filters.clone();
+        app.accept(Response::Catalog {
+            listing,
+            start,
+            filters,
+            result,
+        });
+    }
+
+    /// A catalogue column part-way through a long list: `loaded` series in it, `total` in
+    /// the list, and a page waiting behind them. The order is changed first because the
+    /// interface opens on the history, which is the one list that is not paged.
+    fn with_catalogue(app: &mut App, loaded: usize, total: usize) {
+        app.run(Command::Order);
+        let listing = app.listing.clone();
+        catalog(app, listing, 0, page(0, loaded, Some(total), Some(loaded)));
+        app.sent();
+    }
+
+    /// A catalogue row of some other kind: a film's listing, a concert, or something this
+    /// client has never heard of.
+    fn catalogued(id: &str, kind: &str, title: &str) -> CatalogItem {
+        CatalogItem {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            title: title.to_owned(),
+            description: "A door opens.".to_owned(),
             ..CatalogItem::default()
         }
     }
@@ -1923,7 +2936,7 @@ mod tests {
         let mut app = app();
         assert_eq!(app.listing, Listing::History);
 
-        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        catalog(&mut app, Listing::History, 0, page(0, 0, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
         assert!(app.series.loading, "the catalogue was asked for");
         assert!(
@@ -1932,7 +2945,7 @@ mod tests {
         );
 
         // And the answer to that request is taken as the list it is.
-        app.catalog_arrived(Listing::Browse(0), Ok(vec![series("GY8VEQ95Y")]));
+        catalog(&mut app, Listing::Browse(0), 0, page(0, 1, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
         assert_eq!(app.series.items.len(), 1);
         assert!(!app.series.loading);
@@ -1945,7 +2958,12 @@ mod tests {
     #[test]
     fn a_failed_history_opens_the_catalogue_instead() {
         let mut app = app();
-        app.catalog_arrived(Listing::History, Err("no account id".to_owned()));
+        catalog(
+            &mut app,
+            Listing::History,
+            0,
+            Err("no account id".to_owned()),
+        );
         assert_eq!(app.listing, Listing::Browse(0));
         assert_eq!(app.series.error, None, "the column kept the error");
         assert!(
@@ -1962,18 +2980,18 @@ mod tests {
     #[test]
     fn the_fallback_happens_once() {
         let mut app = app();
-        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        catalog(&mut app, Listing::History, 0, page(0, 0, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
 
         // An empty catalogue is not a reason to go looking for another list.
-        app.catalog_arrived(Listing::Browse(0), Ok(Vec::new()));
+        catalog(&mut app, Listing::Browse(0), 0, page(0, 0, None, None));
         assert_eq!(app.listing, Listing::Browse(0));
 
         // Nor is the history, once it has been chosen deliberately.
         while app.listing != Listing::History {
             app.run(Command::Order);
         }
-        app.catalog_arrived(Listing::History, Ok(Vec::new()));
+        catalog(&mut app, Listing::History, 0, page(0, 0, None, None));
         assert_eq!(
             app.listing,
             Listing::History,
@@ -1994,7 +3012,7 @@ mod tests {
         app.run(Command::Order);
         assert_eq!(app.listing, Listing::Browse(2));
 
-        app.editing = Some("frieren".to_owned());
+        app.editing = Some(Editing::Search("frieren".to_owned()));
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.listing, Listing::Search("frieren".to_owned()));
 
@@ -2003,6 +3021,467 @@ mod tests {
         // And the ring carries on from there rather than starting over.
         app.run(Command::Order);
         assert_eq!(app.listing, Listing::Watchlist);
+    }
+
+    /// The whole point of the feature: the catalogue used to be the first hundred series
+    /// and nothing else, and walking to the end of it now asks for the next hundred and
+    /// puts them after the ones already there. Appending rather than replacing is what
+    /// makes the list one list - a page that replaced what was on screen would leave the
+    /// user at the top of a column they had just walked to the bottom of.
+    #[test]
+    fn reaching_the_bottom_of_the_catalogue_asks_for_the_next_page() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        assert_eq!(app.paging.total, Some(250));
+
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 100,
+                filters: Filters::default(),
+            }],
+            "the end of the loaded list asked for nothing"
+        );
+
+        let cursor = app.series.state.selected();
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        assert_eq!(app.series.items.len(), 200);
+        assert_eq!(
+            app.series.items[0].id, "G0",
+            "the first page was thrown away"
+        );
+        assert_eq!(app.series.items[100].id, "G100");
+        assert_eq!(
+            app.series.state.selected(),
+            cursor,
+            "the cursor was moved off the row the user was standing on"
+        );
+        assert_eq!(app.paging.next, Some(200));
+    }
+
+    /// One request in flight at a time. Holding `down` against the bottom of the list is
+    /// several keypresses at the last row, and each of them asks the same question: a
+    /// column that sent one request per repeat would fetch the same page a dozen times
+    /// and append every copy of it.
+    #[test]
+    fn only_one_page_is_asked_for_at_a_time() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+
+        app.run(Command::Bottom);
+        app.run(Command::Down);
+        app.run(Command::Down);
+        app.run(Command::PageDown);
+        assert_eq!(
+            app.sent().len(),
+            1,
+            "the same page was asked for repeatedly"
+        );
+
+        // And once it has arrived, the one after it can be asked for.
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 200,
+                filters: Filters::default(),
+            }]
+        );
+    }
+
+    /// A list that has been read to the end is not asked about again, however long the
+    /// user stands at the bottom of it. Without that the last row of every finished list
+    /// would be a request per keypress, into a list that has nothing left to give.
+    #[test]
+    fn a_list_read_to_its_end_is_not_asked_for_again() {
+        let mut app = app();
+        app.run(Command::Order);
+        let listing = app.listing.clone();
+        catalog(&mut app, listing, 0, page(0, 40, Some(40), None));
+        app.sent();
+        app.run(Command::Bottom);
+        assert!(
+            app.sent().is_empty(),
+            "a list with nothing behind it was asked for more"
+        );
+    }
+
+    /// The history is the one list in the ring that is not paged, and it says so by
+    /// answering with no page after its first: it is a page of episodes boiled down to
+    /// the series behind them, so an offset into it means nothing to the rows the column
+    /// shows - `api::CrunchyrollClient::history` sets out why. The interface needs no
+    /// rule of its own about which lists page; it asks for what the last answer said was
+    /// there, and the history says there is nothing.
+    #[test]
+    fn the_history_is_shown_whole_and_not_paged() {
+        let mut app = app();
+        assert_eq!(app.listing, Listing::History);
+        catalog(&mut app, Listing::History, 0, page(0, 20, None, None));
+        app.sent();
+
+        app.run(Command::Bottom);
+        assert!(
+            app.sent().is_empty(),
+            "the history was asked for a second page of series it cannot offer"
+        );
+        assert_eq!(
+            app.paging.total, None,
+            "the header would be counting episodes against series"
+        );
+    }
+
+    /// Two ways a page can arrive that must not be drawn, and they are different
+    /// questions. A page of a list the user has cycled past belongs to a column that is
+    /// no longer on screen - the pane owner's argument, made about a list rather than a
+    /// series. A second copy of a page already appended belongs to the list on screen,
+    /// and appending it would show the same hundred series twice.
+    #[test]
+    fn a_page_nobody_is_waiting_for_is_dropped() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        app.run(Command::Order);
+        app.sent();
+
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        assert!(
+            app.series.items.is_empty(),
+            "a page of the list the user left was drawn into the one they went to"
+        );
+
+        let listing = app.listing.clone();
+        catalog(
+            &mut app,
+            listing.clone(),
+            0,
+            page(0, 100, Some(250), Some(100)),
+        );
+        assert_eq!(app.series.items.len(), 100);
+        catalog(&mut app, listing, 0, page(0, 100, Some(250), Some(100)));
+        assert_eq!(
+            app.series.items.len(),
+            100,
+            "the same page was appended a second time"
+        );
+    }
+
+    /// A page that fails is a page that fails, not a catalogue that fails. The hundred
+    /// series already loaded are still perfectly good and the user is standing among
+    /// them, so they stay where they are and the status line carries the news - the same
+    /// place everything else that goes wrong in the background says so. Asking again is
+    /// the user's own move: the cursor is still on the last row, so the next press at the
+    /// bottom retries.
+    #[test]
+    fn a_page_that_fails_leaves_the_column_alone() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        app.sent();
+
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            Err("503 Service Unavailable".to_owned()),
+        );
+        assert_eq!(app.series.items.len(), 100, "the column was emptied");
+        assert_eq!(
+            app.series.error, None,
+            "the column put an error where its rows were"
+        );
+        assert!(
+            said(&app).contains("503 Service Unavailable"),
+            "{}",
+            said(&app)
+        );
+        assert!(app.notice.as_ref().is_some_and(|notice| notice.error));
+
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 100,
+                filters: Filters::default(),
+            }],
+            "a page that failed could not be asked for again"
+        );
+    }
+
+    /// One way of getting to the bottom of a column, under the name to put in the
+    /// failure if it does not.
+    type Way = (&'static str, fn(&mut App));
+
+    /// Whichever way the user gets to the last row is the way that asks for more. `down`
+    /// clamped against the bottom, a `page-down` that overshoots, `bottom`, and the
+    /// pointer - the wheel moves a column's cursor and a drag puts it on a row, both
+    /// through the same two helpers the keys use. A trigger hung off one key would leave
+    /// the list refusing to grow for anyone who scrolls with the wheel.
+    #[test]
+    fn every_way_to_the_last_row_asks_for_the_next_page() {
+        let ways: [Way; 5] = [
+            ("down", |app| {
+                for _ in 0..12 {
+                    app.run(Command::Down);
+                }
+            }),
+            ("page-down", |app| {
+                app.run(Command::PageDown);
+                app.run(Command::PageDown);
+            }),
+            ("bottom", |app| {
+                app.run(Command::Bottom);
+            }),
+            ("the wheel", |app| app.pane_move(Focus::Series, 12)),
+            ("a drag", |app| app.put_cursor(Focus::Series, 11)),
+        ];
+        for (how, reach_the_end) in ways {
+            let mut app = app();
+            with_catalogue(&mut app, 12, 40);
+            reach_the_end(&mut app);
+            assert_eq!(app.series.state.selected(), Some(11), "{how} stopped short");
+            assert_eq!(
+                app.sent(),
+                vec![Request::Catalog {
+                    listing: Listing::Browse(0),
+                    start: 12,
+                    filters: Filters::default(),
+                }],
+                "{how} reached the end of the list and asked for nothing"
+            );
+        }
+    }
+
+    /// Every way of starting a list over reads it from the top again. The offsets belong
+    /// to the list that was open, so one carried into a reload, a change of order, a
+    /// search or the way out of one would open the new list a hundred series in - and
+    /// leave the header counting against a total that was somebody else's.
+    #[test]
+    fn a_list_started_over_asks_for_its_first_page() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            100,
+            page(100, 100, Some(250), Some(200)),
+        );
+        assert_eq!(app.series.items.len(), 200);
+        app.sent();
+
+        app.run(Command::Reload);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 0,
+                filters: Filters::default(),
+            }]
+        );
+        assert_eq!(app.paging.next, Some(0));
+        assert_eq!(
+            app.paging.total, None,
+            "the length of the list before the reload outlived it"
+        );
+
+        app.run(Command::Order);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(1),
+                start: 0,
+                filters: Filters::default(),
+            }]
+        );
+
+        app.editing = Some(Editing::Search("frieren".to_owned()));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Search("frieren".to_owned()),
+                start: 0,
+                filters: Filters::default(),
+            }]
+        );
+
+        app.run(Command::Back);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(1),
+                start: 0,
+                filters: Filters::default(),
+            }]
+        );
+    }
+
+    /// A narrowed catalogue goes on being a paged one, which is where the two most
+    /// invasive things in this branch meet.
+    ///
+    /// The cursor counts rows, so the end of a narrowed column is the last row the
+    /// narrowing left - and that is where the next page is worth asking for, since a query
+    /// keeping two rows out of a hundred says nothing at all about the hundred behind
+    /// them. The page that arrives is held to the narrowing rather than dropping it: a
+    /// hundred unmatched rows appended to a column whose title reads `Series "on" 2/100`
+    /// would be the title and the column disagreeing, and the query is still a claim about
+    /// the same words on the same screen. And the cursor stays on the row it was on, since
+    /// nothing above it moved.
+    #[test]
+    fn a_narrowed_catalogue_goes_on_paging_and_holds_the_new_rows_to_the_query() {
+        let mut app = app();
+        app.run(Command::Order);
+        let listing = app.listing.clone();
+        catalog(
+            &mut app,
+            listing,
+            0,
+            Ok(Page {
+                items: ["Frieren", "Dandadan", "Grand Blue"]
+                    .iter()
+                    .map(|title| CatalogItem {
+                        id: format!("G{title}"),
+                        kind: "series".to_owned(),
+                        title: (*title).to_owned(),
+                        ..CatalogItem::default()
+                    })
+                    .collect(),
+                total: Some(9),
+                next: Some(3),
+            }),
+        );
+        app.sent();
+
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        for letter in "an".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(letter)));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.series.rows(), 2, "Dandadan and Grand Blue, not Frieren");
+        assert!(
+            app.sent().is_empty(),
+            "narrowing a column went and asked Crunchyroll something"
+        );
+
+        app.run(Command::Bottom);
+        assert_eq!(app.series.state.selected(), Some(1));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 3,
+                filters: Filters::default(),
+            }],
+            "the last row a narrowing left is the end of the column, and asked for nothing"
+        );
+
+        catalog(
+            &mut app,
+            Listing::Browse(0),
+            3,
+            Ok(Page {
+                items: ["Bocchi the Rock", "Vinland Saga", "Ranma"]
+                    .iter()
+                    .map(|title| CatalogItem {
+                        id: format!("G{title}"),
+                        kind: "series".to_owned(),
+                        title: (*title).to_owned(),
+                        ..CatalogItem::default()
+                    })
+                    .collect(),
+                total: Some(9),
+                next: Some(6),
+            }),
+        );
+        assert_eq!(app.series.items.len(), 6, "the page was not appended");
+        assert_eq!(
+            app.series
+                .shown()
+                .iter()
+                .map(|series| series.title.clone())
+                .collect::<Vec<_>>(),
+            ["Dandadan", "Grand Blue", "Vinland Saga", "Ranma"],
+            "the new rows were let past the narrowing, or held back too hard"
+        );
+        assert_eq!(
+            app.series.state.selected(),
+            Some(1),
+            "a page landing moved the cursor off the row the user was standing on"
+        );
+        assert_eq!(app.series.query(), Some("an"));
+    }
+
+    /// Where the two halves of this branch meet: a narrowed catalogue is paged like any
+    /// other, and every page of it has to carry the same filters as the first.
+    ///
+    /// A second page asked for unnarrowed would append a hundred series from the whole
+    /// catalogue to the bottom of a column that says `Genre: Action` at the top, which is
+    /// the one way a pager and a filter can lie to each other. Setting a filter also
+    /// starts the list over: the narrowed catalogue is a different hundred series rather
+    /// than the same hundred with rows taken out, and only Crunchyroll knows which - so
+    /// the offset the column had walked to means nothing under the new question.
+    #[test]
+    fn the_next_page_of_a_narrowed_catalogue_is_narrowed_the_same_way() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        app.sent();
+
+        app.choose_filter(
+            FilterKind::Genre,
+            Choice {
+                value: "action".to_owned(),
+                label: "Action".to_owned(),
+            },
+        );
+        let narrowed = app.filters.clone();
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 0,
+                filters: narrowed.clone(),
+            }],
+            "the filter left the column where the unnarrowed list had got to"
+        );
+
+        app.accept(Response::Catalog {
+            listing: Listing::Browse(0),
+            start: 0,
+            filters: narrowed.clone(),
+            result: page(0, 100, Some(120), Some(100)),
+        });
+        app.sent();
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 100,
+                filters: narrowed,
+            }],
+            "the second page of a narrowed catalogue was asked for unnarrowed"
+        );
     }
 
     /// The playhead that marks an episode watched is its own running time, and the
@@ -2036,6 +3515,18 @@ mod tests {
             ..SeasonEpisode::default()
         };
         assert_eq!(episode_label(&special), "ESP");
+        // A film has no number at all, and the row the sentence is about is the only row
+        // in the column, so it is called by its title rather than by a number nobody gave
+        // it.
+        assert_eq!(
+            episode_label(&SeasonEpisode {
+                kind: "movie".to_owned(),
+                title: "Suzume".to_owned(),
+                episode_number: 1,
+                ..SeasonEpisode::default()
+            }),
+            "Suzume"
+        );
         assert_eq!(
             episode_label(&SeasonEpisode {
                 episode: String::new(),
@@ -2223,6 +3714,142 @@ mod tests {
         }
     }
 
+    /// The crux of putting films in the catalogue: `open` on one has to end at a row that
+    /// `p` plays and `d` queues, down the paths an episode already goes. The middle column
+    /// is not a stop on the way, since there is nothing to choose in a column holding one
+    /// row, so opening the film fills it with the row that says what the thing is and asks
+    /// for the films behind the listing in the same breath.
+    #[test]
+    fn a_film_opens_into_a_row_that_plays_and_queues() {
+        let mut app = app();
+        app.series
+            .set(vec![catalogued("GM5V7XW1Q", "movie_listing", "Suzume")]);
+        app.sent();
+        app.run(Command::Open);
+
+        assert_eq!(
+            app.seasons.items.len(),
+            1,
+            "the middle column was left empty"
+        );
+        assert_eq!(app.seasons.items[0].kind, "movie_listing");
+        assert_eq!(
+            app.focus,
+            Focus::Episodes,
+            "the cursor stopped in a column with one row in it"
+        );
+        assert!(app.episodes.loading);
+        assert_eq!(
+            app.sent(),
+            [Request::Movies {
+                listing_id: "GM5V7XW1Q".to_owned(),
+                audio: "ja-JP".to_owned(),
+                subs: "en-US".to_owned(),
+            }]
+        );
+
+        // The films the listing holds, in the shape `api::films` builds them.
+        app.accept(Response::Episodes {
+            season_id: "GM5V7XW1Q".to_owned(),
+            result: Ok(vec![SeasonEpisode {
+                id: "GY8DVXWZ1".to_owned(),
+                kind: "movie".to_owned(),
+                season_number: 1,
+                episode_number: 1,
+                series_title: "Suzume".to_owned(),
+                title: "Suzume".to_owned(),
+                audio_locale: "ja-JP".to_owned(),
+                duration_ms: 7_212_000,
+                ..SeasonEpisode::default()
+            }]),
+        });
+        assert_eq!(app.episodes.items.len(), 1);
+        // The playheads that ride along with any episodes answer are of no interest here.
+        let _ = app.sent();
+
+        let Action::Play(playing) = app.run(Command::Play) else {
+            panic!("the film is a row that does nothing when it is played");
+        };
+        assert_eq!(playing.len(), 1);
+        assert_eq!(playing[0].id, "GY8DVXWZ1");
+
+        app.run(Command::Download);
+        assert_eq!(queued(&app), ["GY8DVXWZ1"]);
+        assert_eq!(
+            app.downloads.items[0].number, "Film",
+            "the queue numbered a film as though it were an episode of something"
+        );
+        assert_eq!(said(&app), "Queued 1 episode for download");
+    }
+
+    /// A concert and a music video are already the thing that plays, so opening one asks
+    /// Crunchyroll for nothing: there is no listing behind it to fetch, and a column left
+    /// on `Loading...` would be waiting for an answer nobody was ever going to send. It
+    /// still has to end at a row that plays and queues, and it still has to be able to say
+    /// where the account had got to in it, which is the one request it does send.
+    #[test]
+    fn a_concert_opens_into_a_row_without_asking_for_anything() {
+        let mut app = app();
+        app.series
+            .set(vec![catalogued("MC413F1E4B", "musicConcert", "LiSA LiVE")]);
+        app.sent();
+        app.run(Command::Open);
+
+        assert_eq!(app.focus, Focus::Episodes);
+        assert!(
+            !app.episodes.loading,
+            "the column is waiting for an answer nobody is going to send"
+        );
+        assert_eq!(app.episodes.items.len(), 1);
+        let row = &app.episodes.items[0];
+        assert_eq!(row.id, "MC413F1E4B", "the concert is what plays");
+        assert_eq!(row.title, "LiSA LiVE");
+        assert_eq!(
+            row.description, "A door opens.",
+            "the blurb came off the catalogue entry it was opened from"
+        );
+        assert_eq!(
+            row.audio_locale, "ja-JP",
+            "the downloader has no locale to hang its one stream on"
+        );
+        assert_eq!(
+            app.sent(),
+            [Request::Playheads {
+                season_id: "MC413F1E4B".to_owned(),
+                episode_ids: vec!["MC413F1E4B".to_owned()],
+            }]
+        );
+
+        let Action::Play(playing) = app.run(Command::Play) else {
+            panic!("the concert is a row that does nothing when it is played");
+        };
+        assert_eq!(playing[0].id, "MC413F1E4B");
+        app.run(Command::Download);
+        assert_eq!(app.downloads.items[0].number, "Music");
+    }
+
+    /// Every list that fills the catalogue column drops what it cannot open, so nothing
+    /// should reach this - but a row that did and then did nothing when it was opened
+    /// would look like the interface having stopped answering.
+    #[test]
+    fn a_row_nothing_knows_how_to_open_says_so() {
+        let mut app = app();
+        app.series
+            .set(vec![catalogued("GARTIST1", "artist", "LiSA")]);
+        app.sent();
+        app.run(Command::Open);
+
+        assert!(app.seasons.items.is_empty());
+        assert_eq!(
+            app.focus,
+            Focus::Series,
+            "the cursor left for a column with nothing in it"
+        );
+        assert!(said(&app).contains("artist"), "said {:?}", said(&app));
+        assert!(app.notice.as_ref().is_some_and(|notice| notice.error));
+        assert!(app.sent().is_empty(), "something was asked for anyway");
+    }
+
     #[test]
     fn cursor_stays_inside_a_pane() {
         let mut pane = Pane::default();
@@ -2268,6 +3895,396 @@ mod tests {
         pane.select(0);
         assert_eq!(pane.state.selected(), None, "an empty pane has no row 0");
         assert_eq!(pane.window(), (0, 0));
+    }
+
+    /// Types a narrowing into the column the keyboard is in, the way a user does it: the
+    /// key that opens the box, and then letters. The box is left open, since what
+    /// happens while it is open is most of what these tests are about.
+    fn typed(app: &mut App, query: &str) {
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        for letter in query.chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(letter)));
+        }
+    }
+
+    /// The episodes the column is showing, by id.
+    fn showing(app: &App) -> Vec<String> {
+        app.episodes
+            .shown()
+            .iter()
+            .map(|episode| episode.id.clone())
+            .collect()
+    }
+
+    /// A substring rather than fzf's scattered letters, and case ignored until the query
+    /// carries one. Both are decisions someone will want to revisit, so they are written
+    /// down here: `tje` finding `The Journey Ends` is the fzf behaviour this deliberately
+    /// does not have, because these lists cannot be reordered by how well a row matched.
+    #[test]
+    fn matching_ignores_case_until_the_query_carries_one() {
+        assert!(matches("The Journey Ends", "journey"));
+        assert!(matches("The Journey Ends", "The Journey"));
+        assert!(
+            !matches("The Journey Ends", "tje"),
+            "a subsequence match would keep most of a season"
+        );
+        assert!(!matches("The Journey Ends", "journeys"));
+
+        // Smart case: lower case is someone typing quickly, and a capital is someone
+        // being specific.
+        assert!(matches("Ed", "ed") && matches("wanted", "ed"));
+        assert!(matches("Ed", "Ed"));
+        assert!(
+            !matches("wanted", "Ed"),
+            "the capital was supposed to mean something"
+        );
+        // An empty query matches everything, which is what stops a box with nothing
+        // typed into it yet from emptying the column - though `Pane::narrow` never gets
+        // this far with one.
+        assert!(matches("anything", ""));
+    }
+
+    /// The whole of what `f` is for: the column narrows as each letter lands, backspace
+    /// widens it again, nothing is asked of Crunchyroll at any point, and escape leaves
+    /// the list as it was found. Waiting for the return - which is what `/` does - would
+    /// make the user guess at what a query was going to leave standing.
+    #[test]
+    fn a_narrowing_happens_as_each_letter_lands_and_esc_puts_the_list_back() {
+        let mut app = app();
+        with_episodes(&mut app, 12);
+        app.episodes.select(10);
+
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        assert!(app.editing.is_some(), "the box did not open");
+        assert_eq!(
+            app.episodes.rows(),
+            12,
+            "the box opens on the whole list, so that escape has one meaning"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        assert_eq!(showing(&app), ["E1", "E10", "E11", "E12"]);
+        assert_eq!(
+            app.episodes.state.selected(),
+            Some(2),
+            "the cursor did not follow the episode it was on"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        assert_eq!(showing(&app), ["E12"]);
+        assert_eq!(
+            app.episodes.selected().map(|episode| episode.id.clone()),
+            Some("E12".to_owned()),
+            "the cursor was left on a row nobody can see"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(
+            showing(&app),
+            ["E1", "E10", "E11", "E12"],
+            "backspace did not widen it again"
+        );
+        assert!(
+            app.sent().is_empty(),
+            "a narrowing went and asked Crunchyroll something"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.editing.is_none());
+        assert_eq!(app.episodes.query(), None);
+        assert_eq!(app.episodes.rows(), 12);
+        assert_eq!(
+            app.episodes.selected().map(|episode| episode.id.clone()),
+            Some("E12".to_owned()),
+            "escape put the list back and took the row the user had chosen with it"
+        );
+    }
+
+    /// The return keeps what the box built, and that is the one moment worth a sentence:
+    /// a narrowing is quiet by nature - the rows it hid are simply not there - so the
+    /// status line says how much of the column is left and how to get the rest back.
+    /// Pressing the key again is that way back, since the box opens on the whole list.
+    #[test]
+    fn the_return_keeps_the_narrowing_and_says_how_much_is_left() {
+        let mut app = app();
+        with_episodes(&mut app, 12);
+        typed(&mut app, "1");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.editing.is_none());
+        assert_eq!(app.episodes.query(), Some("1"));
+        assert_eq!(app.episodes.rows(), 4);
+        assert_eq!(
+            said(&app),
+            "Showing 4 of 12 - f then esc puts the list back."
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('f')));
+        assert_eq!(app.episodes.rows(), 12);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(
+            app.episodes.query(),
+            None,
+            "f then esc left the narrowing on"
+        );
+    }
+
+    /// Every cursor operation counts in rows, so none of them can put the cursor on a
+    /// row the narrowing is hiding - and `selected` turns a row back into the episode
+    /// the user is looking at. This is the invariant the whole design exists for: what
+    /// is played, queued and marked is read off that one answer.
+    #[test]
+    fn the_cursor_can_only_land_on_a_row_the_narrowing_left() {
+        let mut app = app();
+        with_episodes(&mut app, 12);
+        typed(&mut app, "1");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        app.run(Command::Bottom);
+        assert_eq!(app.episodes.state.selected(), Some(3));
+        assert_eq!(
+            app.episodes.selected_index(),
+            Some(11),
+            "the last row of four is the twelfth episode"
+        );
+        app.run(Command::Down);
+        assert_eq!(
+            app.episodes.state.selected(),
+            Some(3),
+            "the cursor walked off the end of the narrowing"
+        );
+        app.run(Command::Up);
+        assert_eq!(
+            app.episodes.selected().map(|episode| episode.id.clone()),
+            Some("E11".to_owned())
+        );
+        app.run(Command::PageUp);
+        assert_eq!(app.episodes.state.selected(), Some(0));
+        assert_eq!(app.episodes.window(), (0, 4), "the pointer was told twelve");
+
+        // And a row past the end of what is showing moves nothing, the way a click aimed
+        // at a frame the list has since changed under moves nothing.
+        app.episodes.select(9);
+        assert_eq!(app.episodes.state.selected(), Some(0));
+    }
+
+    /// Each column keeps its own, so walking between them carries nothing along and
+    /// drops nothing either. A narrowing that followed the keyboard would be a narrowing
+    /// the user had to undo before looking at anything else.
+    #[test]
+    fn each_column_keeps_its_own_narrowing() {
+        let mut app = app();
+        app.series.set(vec![series("GY1"), series("GY2")]);
+        with_episodes(&mut app, 4);
+        // The seasons are numbered here because that is what their rows read as: a
+        // season with no title of its own is drawn as `Season 2`.
+        app.seasons.set(vec![
+            Season {
+                id: "S1".to_owned(),
+                season_number: 1,
+                ..Season::default()
+            },
+            Season {
+                id: "S2".to_owned(),
+                season_number: 2,
+                ..Season::default()
+            },
+        ]);
+
+        typed(&mut app, "3");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(showing(&app), ["E3"]);
+
+        app.run(Command::Back);
+        assert_eq!(app.focus, Focus::Seasons);
+        assert_eq!(
+            app.seasons.rows(),
+            2,
+            "the episodes' narrowing came along to the seasons"
+        );
+        typed(&mut app, "2");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.seasons.rows(),
+            1,
+            "a season is matched against the words its row shows"
+        );
+        assert_eq!(
+            app.seasons.selected().map(|season| season.id.clone()),
+            Some("S2".to_owned())
+        );
+        assert_eq!(
+            showing(&app),
+            ["E3"],
+            "the seasons' narrowing reached the episodes"
+        );
+
+        app.run(Command::Back);
+        assert_eq!(app.focus, Focus::Series);
+        assert_eq!(app.series.rows(), 2);
+        assert_eq!(app.episodes.query(), Some("3"));
+        assert_eq!(app.seasons.query(), Some("2"));
+    }
+
+    /// A narrowing belongs to the rows it was typed against, so it goes whenever the
+    /// column is filled again - another season, a reload, a change of language. The
+    /// cursor is carried across a reload and the narrowing is not, which is the same
+    /// argument in both directions: a cursor names a row that can be found again, and a
+    /// query names words that are about to be replaced.
+    #[test]
+    fn a_narrowing_does_not_survive_the_column_being_filled_again() {
+        let mut app = app();
+        with_episodes(&mut app, 12);
+        app.episodes.select(2);
+        typed(&mut app, "3");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(showing(&app), ["E3"]);
+
+        app.run(Command::Reload);
+        assert_eq!(
+            app.episodes.pending_cursor,
+            Some(2),
+            "the cursor came back as a row of the narrowing rather than as an episode"
+        );
+        let _ = app.sent();
+        with_episodes(&mut app, 12);
+        assert_eq!(app.episodes.query(), None, "a reload kept the narrowing");
+        assert_eq!(app.episodes.rows(), 12);
+        assert_eq!(
+            app.episodes.selected().map(|episode| episode.id.clone()),
+            Some("E3".to_owned()),
+            "the cursor did not come back to the episode it was on"
+        );
+
+        // And another season is the same answer arrived at from the other direction.
+        typed(&mut app, "3");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.focus = Focus::Seasons;
+        app.seasons.select(1);
+        app.run(Command::Open);
+        assert_eq!(app.episodes.query(), None);
+        assert_eq!(app.episodes.rows(), 0);
+    }
+
+    /// The two keys that mean a whole column take what the column is showing. A screen
+    /// with three episodes on it must not hand mpv the twenty-one it is hiding, which is
+    /// the same rule that keeps the cursor on a visible row - the narrowing is what the
+    /// user is looking at, and these two keys are about what is in front of them.
+    #[test]
+    fn the_keys_for_a_whole_column_take_the_rows_that_are_showing() {
+        let mut app = app();
+        with_episodes(&mut app, 12);
+        typed(&mut app, "1");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        app.run(Command::Down);
+        match app.run(Command::PlayRest) {
+            Action::Play(episodes) => assert_eq!(
+                episodes
+                    .iter()
+                    .map(|episode| episode.id.clone())
+                    .collect::<Vec<_>>(),
+                ["E10", "E11", "E12"],
+                "the rest of the season reached past the narrowing"
+            ),
+            _ => panic!("nothing was played"),
+        }
+
+        app.run(Command::DownloadSeason);
+        assert_eq!(queued(&app), ["E1", "E10", "E11", "E12"]);
+        assert_eq!(said(&app), "Queued 4 episodes for download");
+
+        // Narrowed to nothing there is nothing to act on, and saying to open a season
+        // would be answering a question nobody asked: there is one open.
+        typed(&mut app, "zzz");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.run(Command::DownloadSeason);
+        assert!(queued(&app).is_empty());
+        assert_eq!(
+            said(&app),
+            "Nothing in this season matches what the column was narrowed to."
+        );
+    }
+
+    /// A narrowing hides rows; it does not touch what the user has put on them. The
+    /// marks stay where they are, `d` goes on queueing all of them, and an episode that
+    /// cannot be seen cannot be marked or unmarked by accident either, because the
+    /// cursor cannot reach it.
+    #[test]
+    fn a_narrowing_hides_a_marked_row_without_touching_the_mark() {
+        let mut app = app();
+        with_episodes(&mut app, 12);
+        app.episodes.select(1);
+        app.run(Command::Mark);
+        assert!(app.marked.contains("E2"));
+
+        typed(&mut app, "1");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(showing(&app), ["E1", "E10", "E11", "E12"]);
+        assert!(app.marked.contains("E2"), "the narrowing took the mark off");
+
+        app.run(Command::Download);
+        assert_eq!(
+            queued(&app),
+            ["E2"],
+            "a mark is put on by hand, and a query typed afterwards does not undo it"
+        );
+        assert_eq!(said(&app), "Queued the marked episode for download");
+
+        // And with nothing showing, the key that marks has nothing to mark rather than
+        // the first row of the season.
+        typed(&mut app, "zzz");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.run(Command::Mark);
+        assert_eq!(app.marked.len(), 1, "a hidden row was marked");
+        assert_eq!(
+            said(&app),
+            "Nothing in this season matches what the column was narrowed to."
+        );
+    }
+
+    /// The queue is the one column whose list changes a row at a time under the user's
+    /// hands rather than arriving whole, so its narrowing has to be worked out again as
+    /// rows are queued and dropped. Rows pointing at the episodes they used to point at
+    /// would drop the wrong download, which is the one mistake the panel cannot recover
+    /// from.
+    #[test]
+    fn the_queue_keeps_its_narrowing_as_rows_come_and_go() {
+        let mut app = app();
+        with_episodes(&mut app, 4);
+        app.run(Command::DownloadSeason);
+        app.focus = Focus::Downloads;
+
+        typed(&mut app, "e2");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.downloads.rows(), 1);
+        assert_eq!(app.downloads.selected().map(|row| row.id), Some(1));
+
+        app.focus = Focus::Episodes;
+        app.episodes.select(1);
+        app.run(Command::Download);
+        assert_eq!(app.downloads.items.len(), 5);
+        assert_eq!(
+            app.downloads.rows(),
+            2,
+            "the row that arrived was never measured against the query"
+        );
+
+        app.focus = Focus::Downloads;
+        app.downloads.select(1);
+        assert_eq!(app.downloads.selected().map(|row| row.id), Some(4));
+        app.run(Command::Open);
+        assert_eq!(
+            app.downloads.items.len(),
+            4,
+            "a row was dropped by row number"
+        );
+        assert_eq!(app.downloads.rows(), 1);
+        assert_eq!(
+            app.downloads.selected().map(|row| row.id),
+            Some(1),
+            "the cursor was left somewhere the narrowing is not"
+        );
     }
 
     /// The quality is part of the file name, so `v` changes which file each row is

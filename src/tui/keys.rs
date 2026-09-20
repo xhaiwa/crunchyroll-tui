@@ -21,7 +21,11 @@ pub enum Command {
     Back,
     NextColumn,
     Search,
+    Filter,
     Order,
+    Genre,
+    AnimeSeason,
+    Simulcast,
     Reload,
     Play,
     PlayRest,
@@ -57,7 +61,11 @@ impl Command {
             Self::Back => "back",
             Self::NextColumn => "next-column",
             Self::Search => "search",
+            Self::Filter => "filter",
             Self::Order => "order",
+            Self::Genre => "genre",
+            Self::AnimeSeason => "anime-season",
+            Self::Simulcast => "simulcast",
             Self::Reload => "reload",
             Self::Play => "play",
             Self::PlayRest => "play-rest",
@@ -82,7 +90,7 @@ impl Command {
 /// Every command and the keys it answers to out of the box - vim's, with the arrows
 /// beside them. They are written the way a user would write them in the config and read
 /// by the same parser, so the defaults cannot mean something the config file cannot say.
-pub const DEFAULTS: [(Command, &[&str]); 28] = [
+pub const DEFAULTS: [(Command, &[&str]); 32] = [
     (Command::Up, &["up", "k"]),
     (Command::Down, &["down", "j"]),
     (Command::PageUp, &["pgup"]),
@@ -93,7 +101,11 @@ pub const DEFAULTS: [(Command, &[&str]); 28] = [
     (Command::Back, &["left", "h", "esc"]),
     (Command::NextColumn, &["tab"]),
     (Command::Search, &["/"]),
+    (Command::Filter, &["f"]),
     (Command::Order, &["o"]),
+    (Command::Genre, &["c"]),
+    (Command::AnimeSeason, &["n"]),
+    (Command::Simulcast, &["u"]),
     (Command::Reload, &["r"]),
     (Command::Play, &["p"]),
     (Command::PlayRest, &["P"]),
@@ -455,12 +467,15 @@ mod tests {
     }
 
     /// The point of the section: a layout that is not vim's. Naming a command drops the
-    /// keys it had, and takes the new one off whatever was holding it.
+    /// keys it had, and takes the new one off whatever was holding it - so `u` going to
+    /// `up` leaves `simulcast` needing somewhere of its own, or the file has quietly put
+    /// a command out of reach.
     #[test]
     fn remaps_a_command_and_frees_the_key_it_had() {
         let (bindings, warnings) = settings(
             "\
 up = \"u\"
+simulcast = \"U\"
 down = \"e\"
 subtitle-language = [\"s\", \"ctrl-s\"]
 ",
@@ -544,6 +559,7 @@ back = [\"n\", \"left\", \"esc\"]
 down = [\"e\", \"down\"]
 up = [\"i\", \"up\"]
 open = [\"o\", \"enter\", \"right\"]
+anime-season = \"N\"
 images = \"I\"
 order = \"O\"
 ",
@@ -556,6 +572,7 @@ order = \"O\"
             ('e', Command::Down),
             ('i', Command::Up),
             ('o', Command::Open),
+            ('N', Command::AnimeSeason),
             ('I', Command::Images),
             ('O', Command::Order),
         ] {
@@ -565,7 +582,7 @@ order = \"O\"
                 "{letter}"
             );
         }
-        // Nothing was left behind by moving four actions and the two they displaced.
+        // Nothing was left behind by moving four actions and the three they displaced.
         let (_, none) = Settings::default().resolve();
         assert!(none.is_empty(), "{none:?}");
         assert_eq!(

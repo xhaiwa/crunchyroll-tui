@@ -221,7 +221,9 @@ mpv-args = []
 
 [keys]
 
-# Moving around a column.
+# Moving around a column. Any of these that ends on the last row of the Series
+# column asks Crunchyroll for the next hundred series and adds them to the end,
+# so the catalogue is walked rather than paged by hand.
 up = ["up", "k"]
 down = ["down", "j"]
 page-up = "pgup"
@@ -235,13 +237,33 @@ open = ["enter", "right", "l"]
 back = ["left", "h", "esc"]
 next-column = "tab"
 
-# The catalogue. An empty search goes back to browsing, and `order` cycles the
+# The catalogue. `search` asks Crunchyroll for a query and replaces the column
+# with what comes back; an empty search goes back to browsing. `order` cycles the
 # lists the column can show: popular, recently added, A to Z, the account's own
 # watchlist, and then Continue watching, which is its history and what the
 # interface opens on.
 search = "/"
 order = "o"
 reload = "r"
+
+# Narrowing the catalogue. `genre` and `anime-season` open a list of what
+# Crunchyroll offers, with All at the top of it to take the filter off again;
+# `simulcast` is a yes or a no and needs no list. All three narrow the browse
+# listings only - set one while the watchlist, the history or a search is up and
+# the column goes back to the catalogue, which is the only list they can narrow.
+genre = "c"
+anime-season = "n"
+simulcast = "u"
+
+# Narrowing the column you are already in, which asks nobody anything. `filter`
+# opens a box, and each letter typed into it hides the rows that do not hold what
+# you have typed - in the series, seasons, episodes or downloads column,
+# whichever has the cursor. Return keeps the narrowing and closes the box, escape
+# puts the whole list back, and the column's title says what it is showing for as
+# long as it is narrowed. Each column keeps its own, and any column that is
+# filled again - another season, a reload, a change of language - comes back
+# whole.
+filter = "f"
 
 # Getting an episode. The season forms take everything from the cursor down for
 # playing, and the whole season for the download queue. `mark` covers the case
