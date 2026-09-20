@@ -98,8 +98,15 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
     ListItem::new(Line::from(spans))
 }
 
-/// One episode: its number, what this machine already has of it, what the account has
-/// already made of it, and its title.
+/// What a marked episode is drawn with. A bar rather than a dot: every other glyph this
+/// column can show is round or a tick - the two circles say what is on the disk and the
+/// check is the account's opinion of the episode - and a mark is none of those, so it
+/// takes a shape none of them has and stands at the left edge, beside the cursor, where
+/// what the user has picked belongs.
+const MARK: &str = "\u{258c}";
+
+/// One episode: whether it is marked, its number, what this machine already has of it,
+/// what the account has already made of it, and its title.
 ///
 /// The marker takes the running time's place rather than a column of its own. The three
 /// lists are already fighting for room on a narrow terminal, and a title pushed off the
@@ -116,18 +123,34 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
 /// that way by a run that stopped - and the two cells are spent whether there is a file
 /// or not, since a marker that appeared only when it had something to report would shift
 /// every title in the column as the eye ran down it.
+///
+/// A mark is a third fact, and the only one of the three the user put there, so it takes
+/// a cell of its own in front of the number: `mark` says whether this row has one, or
+/// `None` where the season has no marks at all and the cell is not drawn. That cell
+/// comes and goes where the disk marker's two never do, and the reason is the same
+/// reason - nothing may shift while the eye runs down a column. A mark is a fact about
+/// the whole season, so it is the whole column that gains the cell with the first mark
+/// and loses it with the last; the disk marker is a fact about one row, and a cell that
+/// came and went row by row is what would leave the titles ragged. Between them they
+/// keep the rule the first paragraph is about: a gutter standing empty down every season
+/// nobody is marking would spend a column of every title on the seasons that are.
 fn episode_row(
     theme: &Theme,
     episode: &SeasonEpisode,
     playhead: Option<&Playhead>,
     held: OnDisk,
+    mark: Option<bool>,
 ) -> ListItem<'static> {
     let number = if episode.episode.is_empty() {
         episode.episode_number.to_string()
     } else {
         episode.episode.clone()
     };
-    let mut spans = vec![theme.accent(format!("E{number:<3}"))];
+    let mut spans = Vec::new();
+    if let Some(marked) = mark {
+        spans.push(theme.accent(if marked { MARK } else { " " }));
+    }
+    spans.push(theme.accent(format!("E{number:<3}")));
     spans.push(match held {
         OnDisk::Complete => theme.accent("● "),
         OnDisk::Partial => theme.dim("◐ "),
@@ -566,7 +589,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 19] = [
+const HELP: [(&[Command], &str); 20] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -589,8 +612,12 @@ const HELP: [(&[Command], &str); 19] = [
         "play the episode / the rest of the season",
     ),
     (
+        &[Command::Mark],
+        "mark the episode, to queue several of them at once",
+    ),
+    (
         &[Command::Download, Command::DownloadSeason],
-        "queue the episode / the whole season for download",
+        "queue the episode or the marked ones / the whole season",
     ),
     (
         &[Command::Watchlist],
@@ -864,16 +891,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             tick,
         )
     } else {
+        let marked: Vec<bool> = app
+            .episodes
+            .items
+            .iter()
+            .map(|episode| app.marked.contains(&episode.id))
+            .collect();
+        // Read off the open list rather than off the set, so a mark carried across a
+        // list that came back without its episode does not open a gutter for a row that
+        // is not there - see [`episode_row`].
+        let gutter = marked.contains(&true);
         app.episodes
             .items
             .iter()
-            .map(|episode| {
+            .zip(marked)
+            .map(|(episode, marked)| {
                 let held = app
                     .downloaded
                     .get(&episode.id)
                     .copied()
                     .unwrap_or(OnDisk::Missing);
-                episode_row(&theme, episode, app.playheads.get(&episode.id), held)
+                episode_row(
+                    &theme,
+                    episode,
+                    app.playheads.get(&episode.id),
+                    held,
+                    gutter.then_some(marked),
+                )
             })
             .collect()
     };
@@ -1048,7 +1092,7 @@ mod tests {
     use crate::tui::worker::{Listing, Request, Response, Worker};
 
     use super::{
-        HELP, cells, downloads_height, draw, duration, meter, poster_width, thumbnail_width,
+        HELP, MARK, cells, downloads_height, draw, duration, meter, poster_width, thumbnail_width,
     };
     use crate::tui::app::State;
     use crate::tui::worker::Update;
@@ -1700,6 +1744,69 @@ mod tests {
             .collect();
         let screen = rendered(120, 30, &mut app);
         assert!(screen.contains("24:21"), "so the running time is back");
+    }
+
+    /// A mark is a decision the user made about a row, so it has to be visible on that
+    /// row - and the column it needs has to be there only while a mark is on one of them,
+    /// since the width of this column is what the titles are living on.
+    #[test]
+    fn a_marked_episode_carries_a_bar_and_an_unmarked_season_carries_no_column() {
+        let mut app = app();
+        let plain = rendered(120, 30, &mut app);
+        assert!(
+            !plain.contains(MARK),
+            "a season with nothing marked drew the column anyway"
+        );
+        // The cursor is on E1, so its row is the arrow and then the number.
+        assert!(plain.contains("\u{203a} E1"));
+
+        app.marked.insert("E2".to_owned());
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains(&format!("{MARK}E2")),
+            "the marked episode is not wearing its mark"
+        );
+        assert!(
+            screen.contains("\u{203a}  E1"),
+            "the unmarked rows did not move over with the marked one"
+        );
+
+        // And the column goes again with the last mark, rather than standing empty for
+        // the rest of the season.
+        app.marked.clear();
+        assert_eq!(rendered(120, 30, &mut app), plain);
+    }
+
+    /// The three things a row can say about an episode are three different things, and
+    /// the row has to be able to say all of them at once: an episode can be half on the
+    /// disk, half watched, and marked for downloading again, and each of those is read
+    /// off a different part of the row. The mark and the disk marker in particular are
+    /// two markers a few cells apart, so neither may be mistaken for the other.
+    #[test]
+    fn a_mark_and_a_disk_marker_are_read_apart_on_one_row() {
+        let mut app = app();
+        app.downloaded = [
+            ("E1".to_owned(), OnDisk::Complete),
+            ("E2".to_owned(), OnDisk::Partial),
+        ]
+        .into_iter()
+        .collect();
+        app.playheads = [("E2".to_owned(), playhead("E2", 842, false))]
+            .into_iter()
+            .collect();
+        app.marked.insert("E2".to_owned());
+
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains(&format!("{MARK}E2  \u{25d0}")),
+            "the mark and what is on the disk ran into one another"
+        );
+        assert!(
+            screen.contains("14:02"),
+            "and neither of them took the playhead's slot"
+        );
+        // E1 is on the disk and not marked, so it shows the circle and an empty gutter.
+        assert!(screen.contains("\u{203a}  E1  \u{25cf}"));
     }
 
     /// A season already sitting on the disk looked exactly like one that was not, and
