@@ -8,7 +8,7 @@ use ratatui::layout::Position;
 use ratatui::widgets::ListState;
 
 use crate::download::{DownloadOptions, OnDisk, episode_info, on_disk};
-use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Opens, Playhead, Season, SeasonEpisode, opens, single_name};
 use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
@@ -156,8 +156,18 @@ fn episode_number(episode: &SeasonEpisode) -> String {
 /// What a notice calls an episode: the number above, behind the E the episode column
 /// shows. The title would be truer to the episode, but it is the number the user just
 /// moved the cursor onto, and a sentence on the status line has no room for both.
+///
+/// A film has no number to be called by, and the one row it fills the column with is the
+/// row every one of these sentences is about, so there it is the title that goes in.
+/// `Marked Suzume watched` is the thing to say: `Marked E1 watched` reads back a number
+/// nobody gave it, and `Marked Film watched` is what the column calls the row said out
+/// loud where it makes no sense.
 fn episode_label(episode: &SeasonEpisode) -> String {
-    format!("E{}", episode_number(episode))
+    match single_name(&episode.kind) {
+        Some(word) if episode.title.is_empty() => word.to_owned(),
+        Some(_) => episode.title.clone(),
+        None => format!("E{}", episode_number(episode)),
+    }
 }
 
 /// How much of the season is marked, as the status line says it.
@@ -495,37 +505,142 @@ impl App {
         self.worker.send(Request::Catalog(self.listing.clone()));
     }
 
+    /// Opens the row the catalogue column is on into the middle column.
+    ///
+    /// A series opens into its seasons, which is the request this has always been. A film
+    /// has no seasons endpoint and no episodes endpoint behind it, and a concert has
+    /// nothing underneath it at all, so for those the middle column holds one row standing
+    /// for the thing itself and the right column is asked for behind it straight away.
+    /// There is nothing to choose in a column with one row in it, and leaving the cursor
+    /// there would put a keypress between every film and playing it for the sake of a
+    /// decision nobody has to make. The shape still holds - `back` comes out of a film
+    /// into the catalogue exactly as it comes out of a season - and the column says what
+    /// it is holding rather than pretending to a season: see [`App::open_single`].
     fn request_seasons(&mut self) {
-        let Some(series) = self.series.selected() else {
+        let Some(series) = self.series.selected().cloned() else {
             return;
         };
-        let series_id = series.id.clone();
+        match series.opens() {
+            Some(Opens::Seasons) => {
+                let series_id = series.id;
+                self.seasons.clear();
+                self.clear_episodes();
+                self.seasons.loading = true;
+                self.seasons.owner = series_id.clone();
+                self.focus = Focus::Seasons;
+                self.worker.send(Request::Seasons {
+                    series_id,
+                    audio: self.audio(),
+                    subs: self.subs(),
+                });
+            }
+            Some(Opens::Films | Opens::Itself) => self.open_single(&series),
+            // Every list that fills this column drops what it cannot open, so nothing
+            // should reach here. A row that arrived by some road nobody has thought of
+            // yet is still better answered than left to do nothing when it is opened.
+            None => self.complain(format!(
+                "Crunchyroll calls {} a {}, which this client has nothing to open.",
+                series.title, series.kind
+            )),
+        }
+    }
+
+    /// The middle column for a catalogue row that is not a series: one row, standing for
+    /// the film or the concert itself, with the right column asked for behind it.
+    ///
+    /// The row carries the catalogue entry's type, and that is the whole of what anything
+    /// afterwards needs to know about it: it is why the column is titled `Film`, and why
+    /// opening that row asks for the films inside a listing rather than the episodes of a
+    /// season. Carried on the row rather than read off the catalogue cursor a second time,
+    /// so that it is still the right answer once the cursor has moved on.
+    fn open_single(&mut self, item: &CatalogItem) {
         self.seasons.clear();
         self.clear_episodes();
-        self.seasons.loading = true;
-        self.seasons.owner = series_id.clone();
-        self.focus = Focus::Seasons;
-        self.worker.send(Request::Seasons {
-            series_id,
-            audio: self.audio(),
-            subs: self.subs(),
-        });
+        self.seasons.owner = item.id.clone();
+        self.seasons.set(vec![Season {
+            id: item.id.clone(),
+            kind: item.kind.clone(),
+            title: item.title.clone(),
+            ..Season::default()
+        }]);
+        self.request_episodes();
+    }
+
+    /// The one row a concert or a music video fills the episodes column with.
+    ///
+    /// Built here rather than asked for: what the catalogue row names is already the thing
+    /// that plays, and a column left sitting on `Loading...` waiting for an answer nobody
+    /// is going to send would be a poor way of saying so. The blurb and the still come off
+    /// the catalogue entry while it is still there to be read - a catalogue replaced by
+    /// another list in the meantime costs the panel its description and nothing that
+    /// plays.
+    ///
+    /// The numbers are the ones `api::films` settles on for a film, and for the same
+    /// reasons: season one, episode one, and the thing named twice - once as what the file
+    /// goes under, once as its own title.
+    fn single_row(&self, season: &Season) -> SeasonEpisode {
+        let listed = self.series.items.iter().find(|item| item.id == season.id);
+        SeasonEpisode {
+            id: season.id.clone(),
+            kind: season.kind.clone(),
+            season_number: 1,
+            episode_number: 1,
+            series_title: season.title.clone(),
+            title: season.title.clone(),
+            // Nothing here says what a concert's audio is, and the downloader needs a
+            // locale to hang its one stream on: the locale it was asked for is the only
+            // answer there is, and an empty one would make every concert unplayable.
+            audio_locale: self.audio(),
+            description: listed
+                .map(|item| item.description.clone())
+                .unwrap_or_default(),
+            images: listed.map(|item| item.images.clone()).unwrap_or_default(),
+            ..SeasonEpisode::default()
+        }
     }
 
     fn request_episodes(&mut self) {
-        let Some(season) = self.seasons.selected() else {
+        let Some(season) = self.seasons.selected().cloned() else {
             return;
         };
         let season_id = season.id.clone();
         self.clear_episodes();
-        self.episodes.loading = true;
         self.episodes.owner = season_id.clone();
         self.focus = Focus::Episodes;
-        self.worker.send(Request::Episodes {
-            season_id,
-            audio: self.audio(),
-            subs: self.subs(),
-        });
+        match opens(&season.kind) {
+            // A film's listing, whose films are a question of their own and come back as
+            // an episodes answer like any other.
+            Some(Opens::Films) => {
+                self.episodes.loading = true;
+                self.worker.send(Request::Movies {
+                    listing_id: season_id,
+                    audio: self.audio(),
+                    subs: self.subs(),
+                });
+            }
+            // Already the thing that plays, so the column is filled from here. The
+            // playheads have to be asked for by hand: that request usually rides on the
+            // back of an answer, and without it this would be the one row in the interface
+            // that could not say where the account had got to in it.
+            Some(Opens::Itself) => {
+                let row = self.single_row(&season);
+                let episode_ids = vec![row.id.clone()];
+                self.episodes.set(vec![row]);
+                self.look_on_disk();
+                self.worker.send(Request::Playheads {
+                    season_id,
+                    episode_ids,
+                });
+            }
+            Some(Opens::Seasons) | None => {
+                self.episodes.loading = true;
+                self.worker.send(Request::Episodes {
+                    season_id,
+                    audio: self.audio(),
+                    subs: self.subs(),
+                });
+            }
+        }
     }
 
     /// Asks for the season that is already open a second time, keeping what the user put
@@ -1002,7 +1117,14 @@ impl App {
             self.next_download += 1;
             self.downloads.items.push(Download {
                 id,
-                number: format!("S{:02}E{}", episode.season_number, episode_number(&episode)),
+                // The number slot takes the word the episodes column puts in the same
+                // place, for a row that has no number: the title is drawn beside it
+                // either way, so `Film  Suzume` reads as the queue saying what the row
+                // is, where `S01E1 Suzume` would be claiming a number nobody gave it.
+                number: single_name(&episode.kind).map_or_else(
+                    || format!("S{:02}E{}", episode.season_number, episode_number(&episode)),
+                    str::to_owned,
+                ),
                 title: episode.title.clone(),
                 series: episode.series_title.clone(),
                 state: State::Queued,
@@ -1592,6 +1714,18 @@ mod tests {
         }
     }
 
+    /// A catalogue row of some other kind: a film's listing, a concert, or something this
+    /// client has never heard of.
+    fn catalogued(id: &str, kind: &str, title: &str) -> CatalogItem {
+        CatalogItem {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            title: title.to_owned(),
+            description: "A door opens.".to_owned(),
+            ..CatalogItem::default()
+        }
+    }
+
     /// An open season, so that the download keys have something to act on, with the
     /// seasons column behind it - which is the only way a season is ever open, and what
     /// the keys that ask for the same season again need in order to have something to
@@ -2036,6 +2170,18 @@ mod tests {
             ..SeasonEpisode::default()
         };
         assert_eq!(episode_label(&special), "ESP");
+        // A film has no number at all, and the row the sentence is about is the only row
+        // in the column, so it is called by its title rather than by a number nobody gave
+        // it.
+        assert_eq!(
+            episode_label(&SeasonEpisode {
+                kind: "movie".to_owned(),
+                title: "Suzume".to_owned(),
+                episode_number: 1,
+                ..SeasonEpisode::default()
+            }),
+            "Suzume"
+        );
         assert_eq!(
             episode_label(&SeasonEpisode {
                 episode: String::new(),
@@ -2221,6 +2367,142 @@ mod tests {
             assert_eq!(said(&app), "Marking is the episodes column's key.");
             assert!(app.notice.as_ref().is_some_and(|notice| notice.error));
         }
+    }
+
+    /// The crux of putting films in the catalogue: `open` on one has to end at a row that
+    /// `p` plays and `d` queues, down the paths an episode already goes. The middle column
+    /// is not a stop on the way, since there is nothing to choose in a column holding one
+    /// row, so opening the film fills it with the row that says what the thing is and asks
+    /// for the films behind the listing in the same breath.
+    #[test]
+    fn a_film_opens_into_a_row_that_plays_and_queues() {
+        let mut app = app();
+        app.series
+            .set(vec![catalogued("GM5V7XW1Q", "movie_listing", "Suzume")]);
+        app.sent();
+        app.run(Command::Open);
+
+        assert_eq!(
+            app.seasons.items.len(),
+            1,
+            "the middle column was left empty"
+        );
+        assert_eq!(app.seasons.items[0].kind, "movie_listing");
+        assert_eq!(
+            app.focus,
+            Focus::Episodes,
+            "the cursor stopped in a column with one row in it"
+        );
+        assert!(app.episodes.loading);
+        assert_eq!(
+            app.sent(),
+            [Request::Movies {
+                listing_id: "GM5V7XW1Q".to_owned(),
+                audio: "ja-JP".to_owned(),
+                subs: "en-US".to_owned(),
+            }]
+        );
+
+        // The films the listing holds, in the shape `api::films` builds them.
+        app.accept(Response::Episodes {
+            season_id: "GM5V7XW1Q".to_owned(),
+            result: Ok(vec![SeasonEpisode {
+                id: "GY8DVXWZ1".to_owned(),
+                kind: "movie".to_owned(),
+                season_number: 1,
+                episode_number: 1,
+                series_title: "Suzume".to_owned(),
+                title: "Suzume".to_owned(),
+                audio_locale: "ja-JP".to_owned(),
+                duration_ms: 7_212_000,
+                ..SeasonEpisode::default()
+            }]),
+        });
+        assert_eq!(app.episodes.items.len(), 1);
+        // The playheads that ride along with any episodes answer are of no interest here.
+        let _ = app.sent();
+
+        let Action::Play(playing) = app.run(Command::Play) else {
+            panic!("the film is a row that does nothing when it is played");
+        };
+        assert_eq!(playing.len(), 1);
+        assert_eq!(playing[0].id, "GY8DVXWZ1");
+
+        app.run(Command::Download);
+        assert_eq!(queued(&app), ["GY8DVXWZ1"]);
+        assert_eq!(
+            app.downloads.items[0].number, "Film",
+            "the queue numbered a film as though it were an episode of something"
+        );
+        assert_eq!(said(&app), "Queued 1 episode for download");
+    }
+
+    /// A concert and a music video are already the thing that plays, so opening one asks
+    /// Crunchyroll for nothing: there is no listing behind it to fetch, and a column left
+    /// on `Loading...` would be waiting for an answer nobody was ever going to send. It
+    /// still has to end at a row that plays and queues, and it still has to be able to say
+    /// where the account had got to in it, which is the one request it does send.
+    #[test]
+    fn a_concert_opens_into_a_row_without_asking_for_anything() {
+        let mut app = app();
+        app.series
+            .set(vec![catalogued("MC413F1E4B", "musicConcert", "LiSA LiVE")]);
+        app.sent();
+        app.run(Command::Open);
+
+        assert_eq!(app.focus, Focus::Episodes);
+        assert!(
+            !app.episodes.loading,
+            "the column is waiting for an answer nobody is going to send"
+        );
+        assert_eq!(app.episodes.items.len(), 1);
+        let row = &app.episodes.items[0];
+        assert_eq!(row.id, "MC413F1E4B", "the concert is what plays");
+        assert_eq!(row.title, "LiSA LiVE");
+        assert_eq!(
+            row.description, "A door opens.",
+            "the blurb came off the catalogue entry it was opened from"
+        );
+        assert_eq!(
+            row.audio_locale, "ja-JP",
+            "the downloader has no locale to hang its one stream on"
+        );
+        assert_eq!(
+            app.sent(),
+            [Request::Playheads {
+                season_id: "MC413F1E4B".to_owned(),
+                episode_ids: vec!["MC413F1E4B".to_owned()],
+            }]
+        );
+
+        let Action::Play(playing) = app.run(Command::Play) else {
+            panic!("the concert is a row that does nothing when it is played");
+        };
+        assert_eq!(playing[0].id, "MC413F1E4B");
+        app.run(Command::Download);
+        assert_eq!(app.downloads.items[0].number, "Music");
+    }
+
+    /// Every list that fills the catalogue column drops what it cannot open, so nothing
+    /// should reach this - but a row that did and then did nothing when it was opened
+    /// would look like the interface having stopped answering.
+    #[test]
+    fn a_row_nothing_knows_how_to_open_says_so() {
+        let mut app = app();
+        app.series
+            .set(vec![catalogued("GARTIST1", "artist", "LiSA")]);
+        app.sent();
+        app.run(Command::Open);
+
+        assert!(app.seasons.items.is_empty());
+        assert_eq!(
+            app.focus,
+            Focus::Series,
+            "the cursor left for a column with nothing in it"
+        );
+        assert!(said(&app).contains("artist"), "said {:?}", said(&app));
+        assert!(app.notice.as_ref().is_some_and(|notice| notice.error));
+        assert!(app.sent().is_empty(), "something was asked for anyway");
     }
 
     #[test]

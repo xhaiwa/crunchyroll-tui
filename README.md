@@ -230,10 +230,38 @@ Every one of these can be moved somewhere else; see [Keys](#keys) below.
 
 `o` walks one ring: the three browse orders, then the watchlist of whatever account the
 `etp_rt` cookie belongs to, then Continue watching, which is that account's own history
-and the list the interface opens on. The watchlist holds only the series on it - a film
-there has no seasons behind it and would be a row that does nothing when opened. A search
-is not on that ring; it is left with `back` rather than cycled past, and leaving one comes
-back to the browse order that was in use when it started.
+and the list the interface opens on. All four hold whatever the account has on them,
+films and concerts included; the only rows dropped are the ones nothing here knows how to
+open, an artist page among them. A search is not on that ring; it is left with `back`
+rather than cycled past, and leaving one comes back to the browse order that was in use
+when it started.
+
+The catalogue is not series only. Browsing and searching ask for films as well, and a
+film keeps the three columns: opening one puts a single row reading `Film` in the middle
+column - it is a film rather than a season, and the column is titled `Film` while it is
+showing one - and the right column fills with the film itself. Usually that is the one
+thing the listing holds; a feature Crunchyroll has split in half is two rows. The cursor
+lands in the right column, since a column with one row in it is nothing to choose from,
+and from there `p` plays and `d` queues exactly as for an episode. A film has the same
+playback path an episode has, which is the whole reason it can be offered at all. The
+row's tag in the catalogue column says `film` where a series would say `2 seasons`, and
+the panel underneath gives the year, the running time and the ratings.
+
+Films land on disk as `Suzume/Suzume S01E01 - Suzume [1080p].mkv`. A film has no season
+and no episode, and the numbers in that name have to say something, so they say this is
+the first and only part of the thing named in front of them - the two halves of a split
+feature are `E01` and `E02`, in the order the listing gives them. The title appears twice
+because one function names every file this program writes and a film is the case where
+the series and the episode are the same thing; a special case there would be paid for by
+every episode.
+
+Concerts and music videos are single playable items with nothing above them, so opening
+one asks Crunchyroll for nothing at all: the middle column says `Music`, the right column
+holds the item itself, and `p` and `d` work from there. They are kept wherever they turn
+up - on the watchlist, in Continue watching, among the mixed results of a search - but
+they are not asked for by name when the catalogue is browsed or searched. There was no
+way to check what those two endpoints call a concert, and a type they do not recognise
+costs the whole page rather than the music in it.
 
 `w` acts on the series the catalogue column has selected, whoever has the keyboard: the
 seasons and the episodes on screen are that series' own. `m` and `M` act on the episode

@@ -93,6 +93,21 @@ pub enum Request {
         audio: String,
         subs: String,
     },
+    /// The films a movie listing holds, which is the other question the middle column
+    /// can ask. A film has no seasons endpoint and no episodes endpoint, so the one row
+    /// the middle column shows for it opens into the films inside the listing instead -
+    /// usually exactly one of them.
+    ///
+    /// Answered as a [`Response::Episodes`] under the listing's own id, because that is
+    /// what the answer is: a list of rows for the episodes column, owned by the row that
+    /// was opened. Everything the interface does when a season arrives - the cursor, the
+    /// disk markers, the playheads it asks for next - is the same work for a film, and a
+    /// second answer meaning the same thing would have to be told to do all of it again.
+    Movies {
+        listing_id: String,
+        audio: String,
+        subs: String,
+    },
     /// Put the series on the watchlist, or take it off if it is already there. Which of
     /// the two it is takes a request of its own to find out, and that answer is only
     /// worth having on the thread that is about to act on it: asking from the interface
@@ -353,6 +368,17 @@ impl Worker {
                         let result = client.season_episodes(&season_id, &audio, &subs);
                         Response::Episodes {
                             season_id,
+                            result: result.map_err(|error| format!("{error:#}")),
+                        }
+                    }
+                    Request::Movies {
+                        listing_id,
+                        audio,
+                        subs,
+                    } => {
+                        let result = client.movies(&listing_id, &audio, &subs);
+                        Response::Episodes {
+                            season_id: listing_id,
                             result: result.map_err(|error| format!("{error:#}")),
                         }
                     }

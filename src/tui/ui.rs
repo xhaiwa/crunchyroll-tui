@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
 use crate::download::OnDisk;
-use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode, single_name};
 use crate::play::resume_at;
 use crate::util::language_name;
 
@@ -69,11 +69,18 @@ fn placeholder(
 
 fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
     let metadata = &series.series_metadata;
+    let film = &series.movie_listing_metadata;
     let mut tags = Vec::new();
-    if metadata.season_count > 1 {
+    // What it is, where it is not a series. `2 seasons` is a thing to say about a series
+    // and nothing to say about a film, and the catalogue now mixes the two: a row that
+    // said neither would leave the column looking like a list of series with some odd
+    // short ones in it.
+    if let Some(word) = single_name(&series.kind) {
+        tags.push(word.to_lowercase());
+    } else if metadata.season_count > 1 {
         tags.push(format!("{} seasons", metadata.season_count));
     }
-    if metadata.is_dubbed {
+    if metadata.is_dubbed || film.is_dubbed {
         tags.push("dub".to_owned());
     }
     let mut spans = vec![theme.text(series.title.clone())];
@@ -84,9 +91,15 @@ fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
 }
 
 fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'static> {
-    // A season usually carries the title of the series, which the column to the left
-    // is already showing.
-    let title = if season.title.is_empty() || season.title == series_title {
+    // The one row a film or a concert fills this column with, which says what the thing
+    // is rather than claiming a season number it has not got. The title would only
+    // repeat the column to the left, which is the same rule the seasons themselves
+    // follow just below.
+    let title = if let Some(word) = single_name(&season.kind) {
+        word.to_owned()
+    } else if season.title.is_empty() || season.title == series_title {
+        // A season usually carries the title of the series, which the column to the left
+        // is already showing.
         format!("Season {}", season.season_number)
     } else {
         season.title.clone()
@@ -150,7 +163,13 @@ fn episode_row(
     if let Some(marked) = mark {
         spans.push(theme.accent(if marked { MARK } else { " " }));
     }
-    spans.push(theme.accent(format!("E{number:<3}")));
+    // `E1` is a number an episode has and a film has not, so a row that is a whole thing
+    // in itself is called what the rest of the interface calls it. The word is spent in
+    // the four cells the number slot already takes, so nothing below it moves.
+    spans.push(match single_name(&episode.kind) {
+        Some(word) => theme.accent(format!("{word:<4}")),
+        None => theme.accent(format!("E{number:<3}")),
+    });
     spans.push(match held {
         OnDisk::Complete => theme.accent("● "),
         OnDisk::Partial => theme.dim("◐ "),
@@ -332,21 +351,51 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 return lines;
             };
             let metadata = &series.series_metadata;
+            // A film keeps the same facts under a name of its own and leaves
+            // `series_metadata` empty, so both are read and whichever has something to
+            // say fills the line. Nothing has both.
+            let film = &series.movie_listing_metadata;
             lines.push(Line::from(theme.strong(series.title.clone())));
             let mut facts = Vec::new();
-            if metadata.series_launch_year > 0 {
-                facts.push(metadata.series_launch_year.to_string());
+            // What it is comes first where it is not a series, because everything after
+            // it reads differently for a film - a running time rather than a count of
+            // episodes - and this is the one place with room to say which is being
+            // described.
+            if let Some(word) = single_name(&series.kind) {
+                facts.push(word.to_owned());
+            }
+            let year = if metadata.series_launch_year > 0 {
+                metadata.series_launch_year
+            } else {
+                film.movie_release_year
+            };
+            if year > 0 {
+                facts.push(year.to_string());
             }
             if metadata.episode_count > 0 {
                 facts.push(format!("{} episodes", metadata.episode_count));
             }
+            if film.duration_ms > 0 {
+                facts.push(duration(film.duration_ms));
+            }
             if !metadata.audio_locales.is_empty() {
                 facts.push(format!("{} audio tracks", metadata.audio_locales.len()));
             }
-            if !metadata.subtitle_locales.is_empty() {
-                facts.push(format!("{} subtitles", metadata.subtitle_locales.len()));
+            let subtitles = if metadata.subtitle_locales.is_empty() {
+                &film.subtitle_locales
+            } else {
+                &metadata.subtitle_locales
+            };
+            if !subtitles.is_empty() {
+                facts.push(format!("{} subtitles", subtitles.len()));
             }
-            facts.extend(metadata.maturity_ratings.iter().cloned());
+            facts.extend(
+                metadata
+                    .maturity_ratings
+                    .iter()
+                    .chain(film.maturity_ratings.iter())
+                    .cloned(),
+            );
             if metadata.is_simulcast {
                 facts.push("simulcast".to_owned());
             }
@@ -358,14 +407,19 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 return lines;
             };
             lines.push(Line::from(theme.strong(episode.title.clone())));
-            let mut facts = vec![format!(
-                "S{}E{}",
-                episode.season_number,
-                if episode.episode.is_empty() {
-                    episode.episode_number.to_string()
-                } else {
-                    episode.episode.clone()
-                }
+            let mut facts = vec![single_name(&episode.kind).map_or_else(
+                || {
+                    format!(
+                        "S{}E{}",
+                        episode.season_number,
+                        if episode.episode.is_empty() {
+                            episode.episode_number.to_string()
+                        } else {
+                            episode.episode.clone()
+                        }
+                    )
+                },
+                str::to_owned,
             )];
             if episode.duration_ms > 0 {
                 facts.push(duration(episode.duration_ms));
@@ -872,9 +926,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .collect()
     };
     let focused = focus == Focus::Seasons;
+    // The column is named after what it is holding. A film's one row is not a season, and
+    // a header still calling it one would be the last thing on screen saying so.
+    let heading = app
+        .seasons
+        .items
+        .first()
+        .and_then(|season| single_name(&season.kind))
+        .unwrap_or("Seasons");
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block(&theme, "Seasons", focused))
+            .block(pane_block(&theme, heading, focused))
             .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
@@ -1083,7 +1145,8 @@ mod tests {
 
     use crate::download::{DownloadOptions, OnDisk};
     use crate::model::{
-        Artwork, CatalogItem, Images, Playhead, Season, SeasonEpisode, SeriesMetadata,
+        Artwork, CatalogItem, Images, MovieListingMetadata, Playhead, Season, SeasonEpisode,
+        SeriesMetadata,
     };
     use crate::tui::app::{Action, App, Focus};
     use crate::tui::art::Gallery;
@@ -1175,6 +1238,7 @@ mod tests {
                 poster_tall: artwork(POSTER, 360),
                 ..Images::default()
             },
+            ..CatalogItem::default()
         }]);
         app.seasons.set(vec![Season {
             id: "S1".to_owned(),
@@ -1183,6 +1247,7 @@ mod tests {
             number_of_episodes: 28,
             audio_locales: vec!["ja-JP".to_owned(), "en-US".to_owned(), "fr-FR".to_owned()],
             subtitle_locales: vec!["en-US".to_owned(), "fr-FR".to_owned()],
+            ..Season::default()
         }]);
         app.episodes.set(vec![
             SeasonEpisode {
@@ -1264,6 +1329,69 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
+    }
+
+    /// A film keeps the three columns and changes the words in them. Four places would
+    /// otherwise be saying series things about it: the catalogue row, where `2 seasons`
+    /// becomes what the thing is; the middle column's title and its one row, which is not
+    /// a season and must not be numbered as one; the number slot in the episodes column,
+    /// where `E1` is a number nobody gave the film; and the panel, which has a running
+    /// time to show where a series has a count of episodes.
+    #[test]
+    fn a_film_reads_as_a_film_in_every_column() {
+        let mut app = app();
+        app.series.set(vec![CatalogItem {
+            id: "GM5V7XW1Q".to_owned(),
+            kind: "movie_listing".to_owned(),
+            title: "Suzume".to_owned(),
+            description: "A door opens.".to_owned(),
+            movie_listing_metadata: MovieListingMetadata {
+                movie_release_year: 2022,
+                duration_ms: 7_212_000,
+                maturity_ratings: vec!["PG-13".to_owned()],
+                ..MovieListingMetadata::default()
+            },
+            ..CatalogItem::default()
+        }]);
+        app.seasons.set(vec![Season {
+            id: "GM5V7XW1Q".to_owned(),
+            kind: "movie_listing".to_owned(),
+            title: "Suzume".to_owned(),
+            ..Season::default()
+        }]);
+        app.episodes.set(vec![SeasonEpisode {
+            id: "GY8DVXWZ1".to_owned(),
+            kind: "movie".to_owned(),
+            season_number: 1,
+            episode_number: 1,
+            series_title: "Suzume".to_owned(),
+            title: "Suzume".to_owned(),
+            duration_ms: 7_212_000,
+            ..SeasonEpisode::default()
+        }]);
+
+        let screen = rendered(120, 30, &mut app);
+        for expected in [
+            "Suzume  film",
+            " Film ",
+            "Film · 2022 · 2:00:12 · PG-13",
+            "A door opens.",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+        assert!(
+            !screen.contains("Season 0"),
+            "the middle column numbered a film as a season"
+        );
+
+        // And the panel, which prints the number of whatever the cursor is on, says what
+        // the row is instead of giving the film a season and an episode.
+        app.focus = Focus::Episodes;
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Film · 2:00:12"),
+            "the panel numbered the film"
+        );
     }
 
     /// Nothing is worth less to someone with a colourscheme than an app that ignores it,

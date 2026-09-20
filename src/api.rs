@@ -13,8 +13,9 @@ use uuid::Uuid;
 use crate::credentials::Secret;
 use crate::model::{
     BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, HistoryEntry,
-    HistoryResponse, ObjectsResponse, Playhead, PlayheadsResponse, SearchResponse, Season,
-    SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse, WatchlistEntry, WatchlistResponse,
+    HistoryResponse, Movie, MoviesResponse, ObjectsResponse, Playhead, PlayheadsResponse,
+    SearchGroup, SearchResponse, Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse,
+    WatchlistEntry, WatchlistResponse,
 };
 
 const USER_AGENT_VALUE: &str =
@@ -132,22 +133,108 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The series among a watchlist's rows.
+/// The rows of a watchlist the catalogue column can open.
 ///
-/// The watchlist takes no `type` filter the way browse and search do, so the sifting has
-/// to happen here, and it is the same sifting `search` does for the same reason: a movie
-/// has no seasons endpoint and no episodes endpoint, so one in this column is a dead end
-/// for anyone who selects it.
+/// The watchlist holds whatever the account put on it - series, films, the odd concert -
+/// and it takes no `type` filter the way browse and search do, so the sifting happens
+/// here. It used to keep the series and drop the rest, because a film had nowhere to go:
+/// there is no seasons endpoint behind one and the middle column had nothing to show. It
+/// has now, so the only rows left to drop are the ones nothing in this client knows how
+/// to open, which [`crate::model::opens`] is the list of.
 ///
-/// Split out from the request so the part that does not need an account or a network can
+/// Split out from the request so the part that needs neither an account nor a network can
 /// be tested against the two shapes the rows arrive in.
-fn watchlist_series(entries: Vec<WatchlistEntry>) -> Vec<CatalogItem> {
+fn watchlist_items(entries: Vec<WatchlistEntry>) -> Vec<CatalogItem> {
     entries
         .into_iter()
         .map(WatchlistEntry::into_item)
-        .filter(|item| item.kind == "series")
+        .filter(|item| item.opens().is_some())
         .collect()
 }
+
+/// The same sifting for a search answer, which needs it for a reason of its own: search
+/// answers with one group per type asked for, and adds a `top_results` group that mixes
+/// in whatever it likes regardless of what was asked. A music video turning up there is
+/// kept now rather than dropped - it is a single playable thing, which is exactly what
+/// this client can do something with - and an artist or a season still goes.
+fn searched(groups: Vec<SearchGroup>) -> Vec<CatalogItem> {
+    groups
+        .into_iter()
+        .flat_map(|group| group.items)
+        .filter(|item| item.opens().is_some())
+        .collect()
+}
+
+/// The films of a movie listing, as the rows the rest of the program already handles.
+///
+/// Everything below the episodes column - playing, the queue, the name of the file that
+/// gets written - takes a [`SeasonEpisode`], and a film is one thing that plays, so it is
+/// handed over as one rather than given a path of its own. Four fields have no answer of
+/// their own for a film and are decided here.
+///
+/// The series title is the listing's, so a film lands in a directory named after itself
+/// and is named there again with its own title beside the numbers, as in the file
+/// `Suzume/Suzume S01E01 - Suzume [1080p].mkv`. Saying it twice is the price of
+/// `output_path` staying the one function that names every file this program writes, and
+/// a special case there would have to be paid for by every episode.
+///
+/// The season is 1 and the films are numbered from 1 in the order the listing gives them,
+/// which for a feature split in half is the order they are meant to be watched in. Zero
+/// would be the honest answer, since a film has no season and no episode, but it is honest
+/// only inside the struct: it reaches the disk as `S00E00` in the middle of that file
+/// name, where nothing can dress it up, and reaches the downloader's own commentary as
+/// episode 0. Reading the numbers as what they are here says something true instead -
+/// this is the first and only part of the thing named in front of them - and what the
+/// screen calls the row is settled by `model::single_name` rather than by these two.
+///
+/// The audio locale is the film's own where it names one and the one that was asked for
+/// where it does not. `download_episode` maps the requested locale onto the film's own id
+/// when there are no dub versions to choose between, and an empty locale there means
+/// "none of the requested audio locales are available" for every film there is. Whether
+/// `/movies` names a locale at all could not be checked from here, so this is the
+/// defensive reading of both answers.
+fn films(movies: Vec<Movie>, asked_audio: &str) -> Vec<SeasonEpisode> {
+    movies
+        .into_iter()
+        .enumerate()
+        .map(|(index, movie)| SeasonEpisode {
+            id: movie.id,
+            // What the column, the queue and the panel call the row. The films endpoint
+            // is asked about films and answers with films, so nothing else can say it.
+            kind: "movie".to_owned(),
+            season_number: 1,
+            episode_number: i32::try_from(index + 1).unwrap_or(i32::MAX),
+            series_title: if movie.movie_listing_title.is_empty() {
+                movie.title.clone()
+            } else {
+                movie.movie_listing_title
+            },
+            audio_locale: if movie.audio_locale.is_empty() {
+                asked_audio.to_owned()
+            } else {
+                movie.audio_locale
+            },
+            versions: movie.versions,
+            title: movie.title,
+            description: movie.description,
+            duration_ms: movie.duration_ms,
+            availability_starts: movie.availability_starts,
+            images: movie.images,
+            ..SeasonEpisode::default()
+        })
+        .collect()
+}
+
+/// The types browse and search are asked for.
+///
+/// Series, and the listings films are published under. Music is left out of the question
+/// rather than guessed at: nothing in this session could ask Crunchyroll what `type`
+/// value browse and search want for a concert or a music video, and a type they do not
+/// recognise is a 400 for the whole page rather than a page with no music in it.
+/// Music that arrives by any other road is kept and is playable: on the watchlist, in the
+/// history, and in the mixed `top_results` a search brings along whatever it was asked
+/// for. See [`crate::model::opens`].
+const CATALOG_TYPES: &str = "series,movie_listing";
 
 /// How many ids one `objects` request may name. The endpoint takes them as a
 /// comma-separated path segment, so a whole page of history in one request would be a URL
@@ -155,22 +242,25 @@ fn watchlist_series(entries: Vec<WatchlistEntry>) -> Vec<CatalogItem> {
 /// player asks for and is comfortably inside anything that counts.
 const OBJECTS_PER_REQUEST: usize = 50;
 
-/// The series behind a page of history, newest first and each one named once.
+/// What a page of history stands for, newest first and each one named once.
 ///
-/// The history is a list of episodes and the catalogue column holds series, so several
-/// entries in a row are usually the same series being worked through. Keeping the first
-/// occurrence rather than the last is the whole point: the first is the most recently
-/// watched, and what the column is for is saying what was being watched last.
+/// Mostly the series behind the episodes: the history is a list of things played and the
+/// catalogue column holds what they belong to, so several entries in a row are usually
+/// the same series being worked through. Keeping the first occurrence rather than the
+/// last is the whole point: the first is the most recently watched, and what the column
+/// is for is saying what was being watched last. An entry that belongs to nothing - a
+/// concert - stands for itself instead; [`HistoryEntry::watched_id`] is where that is
+/// decided.
 ///
 /// Split out from the request because everything interesting about it - the order, and
-/// what happens to an entry that names no series - is worth pinning down without a
+/// what happens to an entry that names nothing at all - is worth pinning down without a
 /// network behind it.
-fn series_watched(entries: &[HistoryEntry]) -> Vec<String> {
+fn watched_ids(entries: &[HistoryEntry]) -> Vec<String> {
     let mut seen = HashSet::new();
     entries
         .iter()
-        .map(HistoryEntry::series_id)
-        .filter(|series| !series.is_empty() && seen.insert(*series))
+        .map(HistoryEntry::watched_id)
+        .filter(|watched| !watched.is_empty() && seen.insert(*watched))
         .map(str::to_owned)
         .collect()
 }
@@ -457,15 +547,12 @@ impl CrunchyrollClient {
 
     /// The catalogue, in whatever order `sort_by` asks for: `popularity`,
     /// `newly_added` or `alphabetical`.
-    ///
-    /// Only series are asked for. A movie listing has no seasons and no episodes
-    /// endpoint, so one in the list would be a dead end for anyone who selected it.
     pub fn browse(&self, sort_by: &str, count: usize, start: usize) -> Result<Vec<CatalogItem>> {
         let mut url = reqwest::Url::parse("https://www.crunchyroll.com/content/v2/discover/browse")
             .expect("valid browse URL");
         url.query_pairs_mut()
             .append_pair("sort_by", sort_by)
-            .append_pair("type", "series")
+            .append_pair("type", CATALOG_TYPES)
             .append_pair("n", &count.to_string())
             .append_pair("start", &start.to_string())
             .append_pair("ratings", "true")
@@ -478,20 +565,39 @@ impl CrunchyrollClient {
             .expect("valid search URL");
         url.query_pairs_mut()
             .append_pair("q", query)
-            .append_pair("type", "series")
+            .append_pair("type", CATALOG_TYPES)
             .append_pair("n", &count.to_string())
             .append_pair("ratings", "true")
             .append_pair("locale", "en-US");
-        // Search answers with one group per requested type, so a single `type=series`
-        // still arrives wrapped in a group. `top_results` mixes types in regardless of
-        // what was asked for, and anything that is not a series is a dead end here.
-        Ok(self
-            .get_json::<SearchResponse>(url.as_str())?
-            .data
-            .into_iter()
-            .flat_map(|group| group.items)
-            .filter(|item| item.kind == "series")
-            .collect())
+        // Search answers with one group per requested type, so even a single type still
+        // arrives wrapped in a group - and `top_results` comes along with whatever it
+        // likes in it regardless of what was asked for. See [`searched`].
+        Ok(searched(
+            self.get_json::<SearchResponse>(url.as_str())?.data,
+        ))
+    }
+
+    /// The films one movie listing holds, ready for the episodes column.
+    ///
+    /// `locale` and nothing else. The seasons and the episodes endpoints also take a
+    /// `preferred_audio_language`, and it may well be that this one does too, but there
+    /// was no account and no network here to ask Crunchyroll, and a parameter invented
+    /// for an endpoint is a request that may come back 400 for every film there is.
+    /// Which dub a film is played or written in is settled where it is settled for an
+    /// episode: out of the versions the film carries, when the stream is asked for.
+    pub fn movies(
+        &self,
+        id: &str,
+        audio_locale: &str,
+        sub_locale: &str,
+    ) -> Result<Vec<SeasonEpisode>> {
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/cms/movie_listings/{id}/movies?locale={sub_locale}"
+        );
+        Ok(films(
+            self.get_json::<MoviesResponse>(&url)?.data,
+            audio_locale,
+        ))
     }
 
     /// The series on the account's watchlist, most recently added first.
@@ -510,18 +616,23 @@ impl CrunchyrollClient {
             .append_pair("order", "desc")
             .append_pair("locale", "en-US")
             .append_pair("ratings", "true");
-        Ok(watchlist_series(
+        Ok(watchlist_items(
             self.get_json::<WatchlistResponse>(url.as_str())?.data,
         ))
     }
 
-    /// The series the account was last watching, newest first.
+    /// What the account was last watching, newest first.
     ///
-    /// Crunchyroll keeps the history as episodes, one row per thing played, so the same
-    /// series turns up once for every episode of it that was watched. The catalogue
-    /// column shows series and drills into seasons, so the episodes are boiled down to
-    /// the series behind them and then fetched in full: a title on its own would make
-    /// this the one list in the column with no poster and nothing to say about itself.
+    /// Crunchyroll keeps the history as one row per thing played, so the same series
+    /// turns up once for every episode of it that was watched. The catalogue column shows
+    /// what those belong to and drills into it, so the entries are boiled down to the
+    /// series behind them and then fetched in full: a title on its own would make this
+    /// the one list in the column with no poster and nothing to say about itself.
+    ///
+    /// The fetching is also what sifts the list, which is why it is worth doing even for
+    /// an id the entry already had. Only `objects` can say what a row turned out to be,
+    /// and an episode watched outside any series, or an artist named as an entry's
+    /// parent, is a row the column could do nothing with.
     pub fn history(&self, count: usize) -> Result<Vec<CatalogItem>> {
         let account = self.account_id()?;
         let mut url = reqwest::Url::parse(&format!(
@@ -533,7 +644,11 @@ impl CrunchyrollClient {
             .append_pair("locale", "en-US")
             .append_pair("ratings", "true");
         let watched = self.get_json::<HistoryResponse>(url.as_str())?.data;
-        self.objects(&series_watched(&watched))
+        Ok(self
+            .objects(&watched_ids(&watched))?
+            .into_iter()
+            .filter(|item| item.opens().is_some())
+            .collect())
     }
 
     /// The catalogue entries for a set of ids, in the order they were asked for.
@@ -707,11 +822,15 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use crate::model::{CatalogItem, HistoryResponse, WatchlistResponse};
+    use crate::download::{episode_info, output_path};
+    use crate::model::{
+        CatalogItem, HistoryResponse, MoviesResponse, SearchResponse, WatchlistResponse, opens,
+    };
 
     use super::{
-        Duration, OBJECTS_PER_REQUEST, account_id_from_jwt, build_media_client, in_asked_order,
-        object_batches, playhead_urls, series_watched, watchlist_series,
+        CATALOG_TYPES, Duration, OBJECTS_PER_REQUEST, account_id_from_jwt, build_media_client,
+        films, in_asked_order, object_batches, playhead_urls, searched, watched_ids,
+        watchlist_items,
     };
 
     /// A JWT with `claims` as its payload, signed by nobody: the segments are what is
@@ -763,23 +882,129 @@ mod tests {
         }
     }
 
-    /// A watchlist holds whatever the account put on it, and that includes films. One in
-    /// this column would be a dead end - there is no seasons endpoint behind it - so it
-    /// is dropped here the way `search` drops one, rather than being drawn as a row that
-    /// does nothing when it is opened.
+    /// A watchlist holds whatever the account put on it, and that includes films and the
+    /// occasional concert. All three are kept now: a film opens into the films its listing
+    /// holds and a concert is already the thing that plays, so neither is the dead end it
+    /// was when this list was series only. What is still dropped is a row nothing here
+    /// knows how to open, which is the only kind left that would do nothing when selected.
     #[test]
-    fn a_film_on_the_watchlist_is_not_offered() {
-        let json = r#"{"total":3,"data":[
+    fn the_watchlist_offers_films_and_concerts_as_well_as_series() {
+        let json = r#"{"total":5,"data":[
             {"id":"GY8VEQ95Y","panel":{"id":"GY8VEQ95Y","type":"series","title":"Frieren"}},
             {"id":"GM5V7XW1Q","panel":{"id":"GM5V7XW1Q","type":"movie_listing","title":"Suzume"}},
-            {"id":"G9DUEG5MB","type":"series","title":"Dandadan"}
+            {"id":"G9DUEG5MB","type":"series","title":"Dandadan"},
+            {"id":"MC413F1E4B","panel":{"id":"MC413F1E4B","type":"musicConcert",
+                                        "title":"LiSA LiVE is Smile Always"}},
+            {"id":"GARTIST1","panel":{"id":"GARTIST1","type":"artist","title":"LiSA"}}
         ]}"#;
         let response: WatchlistResponse = serde_json::from_str(json).expect("a watchlist");
-        let titles: Vec<String> = watchlist_series(response.data)
+        let titles: Vec<String> = watchlist_items(response.data)
             .into_iter()
             .map(|item| item.title)
             .collect();
-        assert_eq!(titles, ["Frieren", "Dandadan"]);
+        assert_eq!(
+            titles,
+            ["Frieren", "Suzume", "Dandadan", "LiSA LiVE is Smile Always"]
+        );
+    }
+
+    /// The catalogue asks for two types, and the whole of what this feature is about is
+    /// that the second one is there. Both have to be types `open` can do something with:
+    /// a type asked for that nothing knows how to open would be a page of rows that do
+    /// nothing. Music is deliberately not among them - see [`CATALOG_TYPES`].
+    #[test]
+    fn the_catalogue_asks_for_films_as_well_as_series() {
+        let types: Vec<&str> = CATALOG_TYPES.split(',').collect();
+        assert_eq!(types, ["series", "movie_listing"]);
+        for kind in types {
+            assert!(
+                opens(kind).is_some(),
+                "{kind} is asked for and cannot be opened"
+            );
+        }
+    }
+
+    /// Search answers in groups, one per type asked for, plus a `top_results` that mixes
+    /// in whatever it likes. A film among them is a row like any other now; a music video
+    /// that turns up unasked is kept for the same reason, since it is a single playable
+    /// thing. A season on its own is not something this column can open.
+    #[test]
+    fn a_search_keeps_the_films_and_drops_what_cannot_be_opened() {
+        let json = r#"{"total":2,"data":[
+            {"type":"top_results","count":3,"items":[
+                {"id":"GY8VEQ95Y","type":"series","title":"Frieren"},
+                {"id":"GSEASON1","type":"season","title":"Frieren Season 1"},
+                {"id":"MV88BB8DC","type":"musicVideo","title":"Zankyosanka"}
+            ]},
+            {"type":"movie_listing","count":1,"items":[
+                {"id":"GM5V7XW1Q","type":"movie_listing","title":"Suzume"}
+            ]}
+        ]}"#;
+        let response: SearchResponse = serde_json::from_str(json).expect("a search answer");
+        let titles: Vec<String> = searched(response.data)
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["Frieren", "Zankyosanka", "Suzume"]);
+    }
+
+    /// A film is handed to the episodes column, the queue and the downloader as the one
+    /// thing they all take, which is why the four fields a film has no answer of its own
+    /// for are settled in `films` rather than special-cased in each of them. This is what
+    /// they come to: the listing's title in front so the file lands in a directory named
+    /// after the film, season one, and the films numbered from one in the order the
+    /// listing gives them - which for a feature split in half is the order to watch them
+    /// in.
+    ///
+    /// The audio locale is the one that matters most. A film that names none is labelled
+    /// with the locale that was asked for, because the downloader hangs its single stream
+    /// on the locale it finds here and an empty one means "none of the requested audio
+    /// locales are available" for every film there is.
+    #[test]
+    fn a_film_becomes_a_row_the_episodes_column_can_show() {
+        let json = r#"{"total":2,"data":[
+            {"id":"GY8DVXWZ1","title":"Suzume","movie_listing_id":"GM5V7XW1Q",
+             "movie_listing_title":"Suzume","description":"A door opens.",
+             "duration_ms":7212000,
+             "images":{"thumbnail":[[{"width":320,"source":"still.jpg"}]]}},
+            {"id":"GY8DVXWZ2","title":"Suzume Part 2","movie_listing_title":"Suzume",
+             "audio_locale":"ja-JP","duration_ms":null,
+             "versions":[{"audio_locale":"en-US","guid":"GDUB0001"}]}
+        ]}"#;
+        let response: MoviesResponse = serde_json::from_str(json).expect("a movie listing");
+        let films = films(response.data, "de-DE");
+        assert_eq!(films.len(), 2);
+
+        assert_eq!(films[0].id, "GY8DVXWZ1");
+        assert_eq!(films[0].kind, "movie");
+        assert_eq!(films[0].title, "Suzume");
+        assert_eq!(films[0].series_title, "Suzume");
+        assert_eq!(films[0].season_number, 1);
+        assert_eq!(films[0].episode_number, 1);
+        assert_eq!(films[0].description, "A door opens.");
+        assert_eq!(films[0].duration_ms, 7_212_000);
+        assert_eq!(films[0].images.thumbnail(320), Some("still.jpg"));
+        assert_eq!(
+            films[0].audio_locale, "de-DE",
+            "a film that names no locale is labelled with the one that was asked for"
+        );
+
+        assert_eq!(
+            films[1].episode_number, 2,
+            "the second part is the second row"
+        );
+        assert_eq!(
+            films[1].audio_locale, "ja-JP",
+            "and one that does keeps its own"
+        );
+        assert_eq!(films[1].versions.len(), 1, "a dub to choose is still a dub");
+
+        // And this is what the whole arrangement is for: the name of the file, out of the
+        // one function that names every file this program writes.
+        assert_eq!(
+            output_path(&episode_info(&films[0]), "1080p").to_str(),
+            Some("Suzume/Suzume S01E01 - Suzume [1080p].mkv")
+        );
     }
 
     /// A catalogue entry that is nothing but its id, which is all the ordering cares
@@ -791,24 +1016,28 @@ mod tests {
         }
     }
 
-    /// The history is a list of episodes, and watching three of one series in a row is
-    /// the ordinary case: the column has to show that series once, where the first and
-    /// most recent of those three put it. An entry that names no series at all belongs to
-    /// nothing the column can drill into, so it goes.
+    /// The history is a list of things played, and watching three episodes of one series
+    /// in a row is the ordinary case: the column has to show that series once, where the
+    /// first and most recent of those three put it. An entry that belongs to no series
+    /// stands for itself instead, which is what a concert needs - what `objects` says it
+    /// turned out to be decides whether it can stay - and an entry that names nothing at
+    /// all is nothing to ask about.
     #[test]
-    fn boils_the_history_down_to_the_series_watched() {
+    fn boils_the_history_down_to_what_was_watched() {
         let json = r#"{"data":[
-            {"parent_id":"GY8VEQ95Y"},
+            {"parent_id":"GY8VEQ95Y","parent_type":"series"},
             {"parent_id":"GY8VEQ95Y"},
             {"parent_id":"GRMG8ZQZR"},
             {"parent_id":"","panel":{"episode_metadata":{"series_id":"GEXH3W4JP"}}},
             {"parent_id":"GY8VEQ95Y"},
-            {"id":"GZ7UV8KWZ","panel":null}
+            {"id":"MC413F1E4B","parent_id":"GARTIST1","parent_type":"artist"},
+            {"id":"MC413F1E4B","panel":null},
+            {"panel":null}
         ]}"#;
         let entries = serde_json::from_str::<HistoryResponse>(json).unwrap().data;
         assert_eq!(
-            series_watched(&entries),
-            ["GY8VEQ95Y", "GRMG8ZQZR", "GEXH3W4JP"]
+            watched_ids(&entries),
+            ["GY8VEQ95Y", "GRMG8ZQZR", "GEXH3W4JP", "MC413F1E4B"]
         );
     }
 

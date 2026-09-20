@@ -65,6 +65,81 @@ fn widest_under(sets: &[Vec<Artwork>], at_least: u32) -> Option<&str> {
         .map(|artwork| artwork.source.as_str())
 }
 
+/// What opening one row of the catalogue column leads to.
+///
+/// The column holds three kinds of thing, and it holds three because Crunchyroll
+/// publishes them three ways rather than because the interface went looking for the
+/// variety. A series is the shape the three columns were built around. A film is
+/// published as a listing with the film inside it, so the listing is what the catalogue
+/// shows and the film is what plays. A concert or a music video is already the thing
+/// that plays, with nothing wrapped round it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opens {
+    /// A series: seasons in the middle column, and episodes inside them.
+    Seasons,
+    /// A film's listing: the films it holds, which is usually exactly one.
+    Films,
+    /// Something that is already the thing that plays, so opening it fetches nothing.
+    Itself,
+}
+
+/// What a catalogue entry of this Crunchyroll type opens into, and `None` for one this
+/// client has nothing to do with - an artist, a season handed back on its own, or a type
+/// nobody had published when this was written.
+///
+/// This is the one list of what the catalogue column may hold. The watchlist and the
+/// history sift their rows through it, search sifts the mixed results through it, and
+/// `open` asks it what to do next, so a type added here becomes visible in all four at
+/// once rather than in whichever of them somebody remembered.
+pub fn opens(kind: &str) -> Option<Opens> {
+    match kind {
+        "series" => Some(Opens::Seasons),
+        "movie_listing" => Some(Opens::Films),
+        // A film that arrived as the film rather than as the listing around it, which is
+        // what the mixed part of a search answer does with one.
+        "movie" => Some(Opens::Itself),
+        other if is_music(other) => Some(Opens::Itself),
+        _ => None,
+    }
+}
+
+/// Whether a type names one of Crunchyroll's music items: a concert, or a music video.
+///
+/// A generous guess, deliberately. Music reaches this client from the watchlist, the
+/// history and the mixed part of a search answer, and there was no account and no
+/// network here to ask Crunchyroll what it actually calls one: `musicConcert` is the
+/// spelling its own web player uses, `music_concert` is the spelling every other type on
+/// these endpoints has, and the bare `concert` turns up in older answers. All three are
+/// taken, and `musicVideo` beside them - the case and the punctuation are normalised away
+/// rather than spelled out one variant at a time. Guessing wrong costs a row dropped the
+/// way it is dropped today rather than a row that misbehaves, which is what makes the
+/// guess worth making at all.
+fn is_music(kind: &str) -> bool {
+    let plain: String = kind
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|letter| letter.to_ascii_lowercase())
+        .collect();
+    matches!(plain.as_str(), "musicconcert" | "concert" | "musicvideo")
+}
+
+/// The one word the interface calls a row that is a whole thing in itself rather than
+/// one episode of a season, and `None` for an ordinary episode.
+///
+/// Four places would otherwise be saying `Season 0` and `E1` about something that has
+/// neither: the middle column's only row, the title above it, the number slot in the
+/// episodes column and the number the queue puts on a row. They all ask here, so a film
+/// is called the same thing wherever it is drawn.
+pub fn single_name(kind: &str) -> Option<&'static str> {
+    if kind == "movie_listing" || kind == "movie" {
+        Some("Film")
+    } else if is_music(kind) {
+        Some("Music")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Subtitle {
     #[serde(default)]
@@ -155,6 +230,17 @@ pub struct EpisodeMetadataResponse {
 pub struct SeasonEpisode {
     #[serde(default)]
     pub id: String,
+    /// What this row is, where it is not an episode.
+    ///
+    /// A film, a concert or a music video fills the episodes column with a row of its
+    /// own, and everything downstream of that row - playing it, queueing it, the file it
+    /// writes - is the episode path unchanged, which is the whole point of handing one
+    /// over in this shape. This is the single thing that has to differ: what the row is
+    /// called on screen, since `E1` is something to say about an episode and nothing to
+    /// say about a film. Empty for an episode, which is every row the seasons endpoint
+    /// ever sends.
+    #[serde(default, rename = "type")]
+    pub kind: String,
     #[serde(default)]
     pub versions: Vec<DubVersion>,
     #[serde(default, deserialize_with = "null_default")]
@@ -216,6 +302,15 @@ pub struct PlayheadsResponse {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Season {
     pub id: String,
+    /// What this row is, where it is not a season at all.
+    ///
+    /// A film has no seasons endpoint behind it and the middle column still has to hold
+    /// something, so it holds one row standing for the film itself. This is how that row
+    /// says so - to the column drawing it, which calls it `Film` rather than `Season 0`,
+    /// and to `open`, which has a different question to ask on its behalf. Empty for
+    /// every season Crunchyroll sends.
+    #[serde(default, rename = "type")]
+    pub kind: String,
     #[serde(default, deserialize_with = "null_default")]
     pub season_number: i32,
     #[serde(default, deserialize_with = "null_default")]
@@ -255,6 +350,28 @@ pub struct SeriesMetadata {
     pub is_simulcast: bool,
 }
 
+/// What the catalogue knows about a film before the film itself has been fetched.
+///
+/// The same idea as [`SeriesMetadata`] under the name a `movie_listing` carries it
+/// under, and only the fields the panel below the columns has somewhere to put. The
+/// names are the ones Crunchyroll's own clients read, and there was no network here to
+/// check them against a live answer: a field named wrongly leaves a fact out of the
+/// panel rather than leaving a film unopenable, which is why they are worth reading at
+/// all on a guess.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MovieListingMetadata {
+    #[serde(default, deserialize_with = "null_default")]
+    pub movie_release_year: i32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub subtitle_locales: Vec<String>,
+    #[serde(default)]
+    pub maturity_ratings: Vec<String>,
+    #[serde(default)]
+    pub is_dubbed: bool,
+}
+
 /// One entry of the catalogue, as returned by browse and by search.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CatalogItem {
@@ -268,8 +385,59 @@ pub struct CatalogItem {
     pub description: String,
     #[serde(default)]
     pub series_metadata: SeriesMetadata,
+    /// The same thing for a film, which carries its facts under a name of its own and
+    /// leaves `series_metadata` empty. Both are read where the panel has room for them.
+    #[serde(default, deserialize_with = "null_default")]
+    pub movie_listing_metadata: MovieListingMetadata,
     #[serde(default, deserialize_with = "null_default")]
     pub images: Images,
+}
+
+impl CatalogItem {
+    /// What opening this row leads to, or `None` for a row this client cannot open.
+    pub fn opens(&self) -> Option<Opens> {
+        opens(&self.kind)
+    }
+}
+
+/// One film, as `/content/v2/cms/movie_listings/{id}/movies` hands it over.
+///
+/// A film is two objects on Crunchyroll's side: the listing, which is what the catalogue
+/// shows and what a watchlist holds - the poster, the blurb, the title - and the film
+/// inside it, which is what has a playback URL. Usually there is exactly one of the
+/// latter; a feature Crunchyroll has split in half is two.
+///
+/// Only `id` and `title` can be counted on here. `audio_locale` and `versions` are read
+/// because an episode carries both and a film may well carry them too, and everything
+/// that reads them has an answer for a film that carries neither: see `api::films`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Movie {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+    /// The listing this film came out of, which is the name the column to the left is
+    /// already showing and the name the file on disk goes under.
+    #[serde(default, deserialize_with = "null_default")]
+    pub movie_listing_title: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub description: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub duration_ms: u64,
+    #[serde(default, deserialize_with = "null_default")]
+    pub audio_locale: String,
+    #[serde(default)]
+    pub versions: Vec<DubVersion>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub availability_starts: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub images: Images,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoviesResponse {
+    #[serde(default)]
+    pub data: Vec<Movie>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,27 +487,49 @@ pub struct HistoryPanel {
     pub episode_metadata: EpisodeMetadata,
 }
 
-/// One episode the account has watched, newest first.
+/// One thing the account has watched, newest first: usually an episode.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HistoryEntry {
+    /// What was played. It is the last answer rather than the first, for the entries
+    /// that belong to nothing the column could show instead - see [`Self::watched_id`].
+    #[serde(default, deserialize_with = "null_default")]
+    pub id: String,
     #[serde(default, deserialize_with = "null_default")]
     pub parent_id: String,
+    /// What the parent is, where the entry says: `series` behind an episode. It is worth
+    /// reading because it is the only way to tell a parent the catalogue column can do
+    /// something with from one it cannot.
+    #[serde(default, deserialize_with = "null_default")]
+    pub parent_type: String,
     #[serde(default, deserialize_with = "null_default")]
     pub panel: HistoryPanel,
 }
 
 impl HistoryEntry {
-    /// The series this episode belongs to.
+    /// The id the catalogue column should show for this entry.
     ///
-    /// `parent_id` is the entry's own answer and the one to trust, but it is not always
-    /// filled in, and the panel hanging off the entry says the same thing a second time.
-    /// An entry with neither knows of no series at all, which the caller reads as an
-    /// empty string and drops.
-    pub fn series_id(&self) -> &str {
-        if self.parent_id.is_empty() {
-            &self.panel.episode_metadata.series_id
+    /// The parent, for the ordinary case: the history is a list of episodes, the column
+    /// holds series, and `parent_id` is the entry's own word for which series it came
+    /// from. Where that is not filled in the panel hanging off the entry says the same
+    /// thing a second time, which is why both are read.
+    ///
+    /// Then the entry itself, which is what a concert needs. Music is a single playable
+    /// thing with nothing above it, so an entry for one names either no parent at all or,
+    /// and this is a guess since there was no account here to watch a concert with, the
+    /// artist behind it - which is not something this column can open. Either way the
+    /// thing that was played is the row worth showing, and that is the entry's own id. An
+    /// entry that says nothing about what its parent is gets the benefit of the doubt,
+    /// because that is how most of them arrive.
+    pub fn watched_id(&self) -> &str {
+        let parent_opens = self.parent_type.is_empty() || opens(&self.parent_type).is_some();
+        if !self.parent_id.is_empty() && parent_opens {
+            return &self.parent_id;
+        }
+        let from_panel = &self.panel.episode_metadata.series_id;
+        if from_panel.is_empty() {
+            &self.id
         } else {
-            &self.parent_id
+            from_panel
         }
     }
 }
@@ -386,8 +576,8 @@ pub struct SearchResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        Episode, HistoryResponse, PlayheadsResponse, SeasonEpisode, SeasonEpisodesResponse,
-        WatchlistResponse,
+        Episode, HistoryResponse, Opens, PlayheadsResponse, SeasonEpisode, SeasonEpisodesResponse,
+        WatchlistResponse, opens, single_name,
     };
 
     #[test]
@@ -532,34 +722,72 @@ mod tests {
         let response: HistoryResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.total, 120);
         let entry = &response.data[0];
-        assert_eq!(entry.series_id(), "GY8VEQ95Y");
+        assert_eq!(entry.watched_id(), "GY8VEQ95Y");
         assert_eq!(entry.panel.episode_metadata.series_title, "Frieren");
         assert_eq!(entry.panel.episode_metadata.episode_number, 4);
     }
 
     /// `parent_id` is the entry's own word for which series it came from, and it is not
     /// always there. The panel says the same thing a second time, so an entry without one
-    /// is still worth keeping - and an entry with neither names no series at all, which
-    /// the caller has to be able to tell apart from one that does.
+    /// is still worth keeping - and an entry that belongs to nothing the column can open
+    /// stands for itself, which is how a concert stays in Continue watching instead of
+    /// being dropped for having no series behind it.
     #[test]
-    fn finds_the_series_wherever_the_entry_keeps_it() {
+    fn finds_the_row_a_history_entry_stands_for() {
         let json = r#"{"data":[
             {"parent_id":"","panel":{"episode_metadata":{"series_id":"GY8VEQ95Y"}}},
             {"panel":{"episode_metadata":{"series_id":"GRMG8ZQZR"}}},
             {"parent_id":"GY5P48XEY","panel":{"episode_metadata":{"series_id":"G0LDEN"}}},
+            {"parent_id":"GARTIST1","parent_type":"artist","id":"GCONCERT"},
             {"panel":{"episode_metadata":{"series_id":null}}},
             {"id":"GZ7UV8KWZ"}
         ]}"#;
         let entries = serde_json::from_str::<HistoryResponse>(json).unwrap().data;
-        assert_eq!(entries[0].series_id(), "GY8VEQ95Y");
-        assert_eq!(entries[1].series_id(), "GRMG8ZQZR");
+        assert_eq!(entries[0].watched_id(), "GY8VEQ95Y");
+        assert_eq!(entries[1].watched_id(), "GRMG8ZQZR");
         assert_eq!(
-            entries[2].series_id(),
+            entries[2].watched_id(),
             "GY5P48XEY",
             "the entry's own parent beats the panel's copy of it"
         );
-        assert_eq!(entries[3].series_id(), "");
-        assert_eq!(entries[4].series_id(), "");
+        assert_eq!(
+            entries[3].watched_id(),
+            "GCONCERT",
+            "an artist is not a row this column can open, so the concert stands for itself"
+        );
+        assert_eq!(
+            entries[4].watched_id(),
+            "",
+            "an entry that names nothing at all names nothing at all"
+        );
+        assert_eq!(entries[5].watched_id(), "GZ7UV8KWZ");
+    }
+
+    /// The one list of what the catalogue column may hold: the watchlist, the history and
+    /// a search all sift their rows through it, and `open` asks it what to do next. A
+    /// spelling missed here is a film or a concert quietly dropped from four lists at
+    /// once, which is why the music types are read generously - nothing in this session
+    /// could ask Crunchyroll which of the three spellings it actually sends.
+    #[test]
+    fn says_what_each_kind_of_row_opens_into() {
+        assert_eq!(opens("series"), Some(Opens::Seasons));
+        assert_eq!(opens("movie_listing"), Some(Opens::Films));
+        assert_eq!(opens("movie"), Some(Opens::Itself));
+        for music in ["musicConcert", "music_concert", "concert", "musicVideo"] {
+            assert_eq!(opens(music), Some(Opens::Itself), "{music}");
+            assert_eq!(single_name(music), Some("Music"), "{music}");
+        }
+        // A season or an episode handed back on its own belongs inside a row rather than
+        // being one, an artist is a page this client has nothing to draw, and a type
+        // nobody had published when this was written is the same problem as an artist.
+        for other in ["season", "episode", "artist", "musicArtist", "", "whatever"] {
+            assert_eq!(opens(other), None, "{other}");
+            assert_eq!(single_name(other), None, "{other}");
+        }
+        assert_eq!(single_name("series"), None);
+        for film in ["movie_listing", "movie"] {
+            assert_eq!(single_name(film), Some("Film"), "{film}");
+        }
     }
 
     /// An entry whose panel Crunchyroll has nothing to say about - a deleted episode, or
@@ -574,7 +802,7 @@ mod tests {
             r#"{"data":[{"parent_id":"GY8VEQ95Y","panel":{}}]}"#,
         ] {
             let entries = serde_json::from_str::<HistoryResponse>(json).unwrap().data;
-            assert_eq!(entries[0].series_id(), "GY8VEQ95Y", "{json}");
+            assert_eq!(entries[0].watched_id(), "GY8VEQ95Y", "{json}");
             assert_eq!(entries[0].panel.episode_metadata.series_title, "", "{json}");
         }
     }
