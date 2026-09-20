@@ -21,6 +21,7 @@ pub enum Command {
     Back,
     NextColumn,
     Search,
+    Filter,
     Order,
     Reload,
     Play,
@@ -57,6 +58,7 @@ impl Command {
             Self::Back => "back",
             Self::NextColumn => "next-column",
             Self::Search => "search",
+            Self::Filter => "filter",
             Self::Order => "order",
             Self::Reload => "reload",
             Self::Play => "play",
@@ -82,7 +84,7 @@ impl Command {
 /// Every command and the keys it answers to out of the box - vim's, with the arrows
 /// beside them. They are written the way a user would write them in the config and read
 /// by the same parser, so the defaults cannot mean something the config file cannot say.
-pub const DEFAULTS: [(Command, &[&str]); 28] = [
+pub const DEFAULTS: [(Command, &[&str]); 29] = [
     (Command::Up, &["up", "k"]),
     (Command::Down, &["down", "j"]),
     (Command::PageUp, &["pgup"]),
@@ -93,6 +95,7 @@ pub const DEFAULTS: [(Command, &[&str]); 28] = [
     (Command::Back, &["left", "h", "esc"]),
     (Command::NextColumn, &["tab"]),
     (Command::Search, &["/"]),
+    (Command::Filter, &["f"]),
     (Command::Order, &["o"]),
     (Command::Reload, &["r"]),
     (Command::Play, &["p"]),

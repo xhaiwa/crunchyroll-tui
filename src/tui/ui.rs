@@ -9,7 +9,7 @@ use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 use crate::play::resume_at;
 use crate::util::language_name;
 
-use super::app::{App, Download, Focus, Picker, State};
+use super::app::{App, Download, Editing, Focus, Pane, Picker, State, season_title};
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions};
 use super::theme::Theme;
@@ -33,6 +33,45 @@ fn duration(milliseconds: u64) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// What a column is called, wherever it has to be named. One spelling, so that the box
+/// asking which rows to keep names the column the way the column names itself.
+const fn column_name(focus: Focus) -> &'static str {
+    match focus {
+        Focus::Series => "Series",
+        Focus::Seasons => "Seasons",
+        Focus::Episodes => "Episodes",
+        Focus::Downloads => "Downloads",
+    }
+}
+
+/// A column's name, carrying what it has been narrowed to while it is narrowed:
+/// `Episodes "journ" 2/24`.
+///
+/// A narrowing is invisible otherwise, since the rows it hid are simply not there, and
+/// a column quietly showing two of a season's twenty-four episodes is the sort of thing
+/// somebody comes back to after a cup of tea and reads as a client that has mislaid
+/// half the season. The count is both numbers rather than the one, because how much is
+/// missing is the part that cannot be seen.
+fn pane_title<T>(focus: Focus, pane: &Pane<T>) -> String {
+    let name = column_name(focus);
+    match pane.query() {
+        Some(query) => format!("{name} \"{query}\" {}/{}", pane.rows(), pane.items.len()),
+        None => name.to_owned(),
+    }
+}
+
+/// What a column with no rows in it has to say for itself. A column with nothing in it
+/// and a column narrowed until nothing is left are different problems, and the second
+/// one is the user's own doing and a keystroke to undo, so it says so and quotes what
+/// it was looking for. An empty box under a title reading `Episodes "xyz" 0/24` would
+/// be the interface knowing the answer and keeping it to itself.
+fn nothing_shown<T>(pane: &Pane<T>, idle: &str) -> String {
+    match pane.query() {
+        Some(query) if !pane.items.is_empty() => format!("Nothing matches \"{query}\"."),
+        _ => idle.to_owned(),
     }
 }
 
@@ -85,13 +124,8 @@ fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
 
 fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'static> {
     // A season usually carries the title of the series, which the column to the left
-    // is already showing.
-    let title = if season.title.is_empty() || season.title == series_title {
-        format!("Season {}", season.season_number)
-    } else {
-        season.title.clone()
-    };
-    let mut spans = vec![theme.text(title)];
+    // is already showing - see [`season_title`], which the narrowing reads a row with.
+    let mut spans = vec![theme.text(season_title(season, series_title))];
     if season.number_of_episodes > 0 {
         spans.push(theme.dim(format!("  {} ep", season.number_of_episodes)));
     }
@@ -256,11 +290,20 @@ fn line(run: &Run) -> Line<'static> {
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
-        Some(query) => vec![(
+        // The two boxes are told apart by the word in front of them, because they are
+        // the two things a box of typing could be doing and only one of them is about
+        // to go to Crunchyroll: `Search:` replaces this column with an answer, and
+        // `Filter Episodes:` leaves a column alone but for the rows it is hiding.
+        Some(editing) => vec![(
             None,
             vec![
-                theme.accent("Search: "),
-                theme.text(query.clone()),
+                theme.accent(match editing {
+                    Editing::Search(_) => "Search: ".to_owned(),
+                    Editing::Narrow { focus, .. } => {
+                        format!("Filter {}: ", column_name(*focus))
+                    }
+                }),
+                theme.text(editing.query().to_owned()),
                 theme.accent("▏"),
             ],
         )],
@@ -589,7 +632,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 20] = [
+const HELP: [(&[Command], &str); 21] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -606,6 +649,10 @@ const HELP: [(&[Command], &str); 20] = [
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
+    (
+        &[Command::Filter],
+        "narrow this column to the rows that match, as you type",
+    ),
     (&[Command::Order], "change the list the catalogue shows"),
     (
         &[Command::Play, Command::PlayRest],
@@ -787,7 +834,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // against it, so the strip runs the whole width - it is a list of episodes from
     // wherever they were queued, not a thing about the series in the poster - and the
     // poster is shaped to the height the columns are actually left with.
-    let queue = downloads_height(body, app.downloads.items.len(), focus == Focus::Downloads);
+    // As tall as the queue is showing, and never shorter than one row while there is a
+    // queue at all: a narrowing that matched nothing needs somewhere to say so, and a
+    // strip that vanished as its last row was hidden would read as a queue that had
+    // emptied itself.
+    let queued = if app.downloads.items.is_empty() {
+        0
+    } else {
+        app.downloads.rows().max(1)
+    };
+    let queue = downloads_height(body, queued, focus == Focus::Downloads);
     let [body, queue_area] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(queue)]).areas(body);
 
@@ -826,25 +882,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(body);
 
-    let items: Vec<ListItem> = if app.series.items.is_empty() {
+    let shown = app.series.shown();
+    let items: Vec<ListItem> = if shown.is_empty() {
         placeholder(
             &theme,
             app.series.loading,
             app.series.error.as_ref(),
-            "Nothing here.",
+            &nothing_shown(&app.series, "Nothing here."),
             tick,
         )
     } else {
-        app.series
-            .items
+        shown
             .iter()
             .map(|series| series_row(&theme, series))
             .collect()
     };
+    let title = pane_title(Focus::Series, &app.series);
     let focused = focus == Focus::Series;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block(&theme, "Series", focused))
+            .block(pane_block(&theme, &title, focused))
             .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
@@ -852,12 +909,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         &mut app.series.state,
     );
 
-    let items: Vec<ListItem> = if app.seasons.items.is_empty() {
+    let shown = app.seasons.shown();
+    let items: Vec<ListItem> = if shown.is_empty() {
         placeholder(
             &theme,
             app.seasons.loading,
             app.seasons.error.as_ref(),
-            "Pick a series.",
+            &nothing_shown(&app.seasons, "Pick a series."),
             tick,
         )
     } else {
@@ -865,16 +923,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .series
             .selected()
             .map_or("", |series| series.title.as_str());
-        app.seasons
-            .items
+        shown
             .iter()
             .map(|season| season_row(&theme, season, series_title))
             .collect()
     };
+    let title = pane_title(Focus::Seasons, &app.seasons);
     let focused = focus == Focus::Seasons;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block(&theme, "Seasons", focused))
+            .block(pane_block(&theme, &title, focused))
             .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
@@ -882,27 +940,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         &mut app.seasons.state,
     );
 
-    let items: Vec<ListItem> = if app.episodes.items.is_empty() {
+    let shown = app.episodes.shown();
+    let items: Vec<ListItem> = if shown.is_empty() {
         placeholder(
             &theme,
             app.episodes.loading,
             app.episodes.error.as_ref(),
-            "Pick a season.",
+            &nothing_shown(&app.episodes, "Pick a season."),
             tick,
         )
     } else {
-        let marked: Vec<bool> = app
-            .episodes
-            .items
+        let marked: Vec<bool> = shown
             .iter()
             .map(|episode| app.marked.contains(&episode.id))
             .collect();
-        // Read off the open list rather than off the set, so a mark carried across a
-        // list that came back without its episode does not open a gutter for a row that
-        // is not there - see [`episode_row`].
+        // Read off the rows that are drawn rather than off the set, so a mark carried
+        // across a list that came back without its episode - or one on a row a
+        // narrowing is hiding - does not open a gutter for a row that is not there. See
+        // [`episode_row`].
         let gutter = marked.contains(&true);
-        app.episodes
-            .items
+        shown
             .iter()
             .zip(marked)
             .map(|(episode, marked)| {
@@ -921,10 +978,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             })
             .collect()
     };
+    let title = pane_title(Focus::Episodes, &app.episodes);
     let focused = focus == Focus::Episodes;
     frame.render_stateful_widget(
         List::new(items)
-            .block(pane_block(&theme, "Episodes", focused))
+            .block(pane_block(&theme, &title, focused))
             .highlight_style(theme.highlight(focused))
             .highlight_symbol("› ")
             .highlight_spacing(HighlightSpacing::Always),
@@ -938,24 +996,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         // Wide enough for the longest title in the queue, and never so wide that the
         // bars are pushed off a narrow terminal - a title cut short is a smaller loss
         // than the state of the download it belongs to.
-        let column = app
-            .downloads
-            .items
+        let shown = app.downloads.shown();
+        let column = shown
             .iter()
             .map(|download| Span::raw(download.title.clone()).width())
             .max()
             .unwrap_or(0)
             .min(usize::from(queue_area.width / 3));
-        let items: Vec<ListItem> = app
-            .downloads
-            .items
-            .iter()
-            .map(|download| download_row(&theme, download, column))
-            .collect();
+        let items: Vec<ListItem> = if shown.is_empty() {
+            placeholder(
+                &theme,
+                false,
+                None,
+                &nothing_shown(&app.downloads, "Nothing queued."),
+                tick,
+            )
+        } else {
+            shown
+                .iter()
+                .map(|download| download_row(&theme, download, column))
+                .collect()
+        };
+        let title = pane_title(Focus::Downloads, &app.downloads);
         let focused = focus == Focus::Downloads;
         frame.render_stateful_widget(
             List::new(items)
-                .block(pane_block(&theme, "Downloads", focused))
+                .block(pane_block(&theme, &title, focused))
                 .highlight_style(theme.highlight(focused))
                 .highlight_symbol("› ")
                 .highlight_spacing(HighlightSpacing::Always),
@@ -2189,12 +2255,147 @@ mod tests {
         assert_eq!(app.focus, Focus::Series, "the click reached a column");
     }
 
+    /// Types a narrowing into the column the keyboard is in, the way a user does it.
+    fn narrow(app: &mut App, query: &str) {
+        press(app, KeyCode::Char('f'));
+        for letter in query.chars() {
+            press(app, KeyCode::Char(letter));
+        }
+    }
+
+    /// A narrowing has to be visible, because the rows it hides are simply not there:
+    /// the box says which column it is narrowing while it is open, and the column's own
+    /// title says what it was narrowed to and how much of it is left once the box has
+    /// gone. A column quietly showing one episode of two is otherwise indistinguishable
+    /// from a client that has lost the season.
+    #[test]
+    fn a_narrowed_column_says_so_in_its_title() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        narrow(&mut app, "journ");
+
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Filter Episodes: journ"),
+            "the box did not say what it was narrowing, or what with"
+        );
+        assert!(
+            !screen.contains("The Priest's Lie"),
+            "a row the narrowing hid was drawn anyway"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Episodes \"journ\" 1/2"),
+            "the column's title said nothing about being narrowed"
+        );
+        assert!(screen.contains("The Journey Ends"));
+        assert!(!screen.contains("Filter"), "the box outlived the return");
+
+        // And the way out of it is in the one sentence the status line gets.
+        assert!(
+            screen.contains("f then esc puts the list back"),
+            "nothing said how to get the rest of the season back"
+        );
+    }
+
+    /// An empty column that has been narrowed to nothing has something to say for
+    /// itself, and it is not the sentence an empty column says. A blank box under a
+    /// title reading `Episodes "zzz" 0/2` would be the interface knowing the answer and
+    /// keeping it.
+    #[test]
+    fn a_column_narrowed_to_nothing_says_what_it_was_looking_for() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        narrow(&mut app, "zzz");
+
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Nothing matches \"zzz\"."));
+        assert!(screen.contains("Episodes \"zzz\" 0/2"));
+        assert!(
+            !screen.contains("Pick a season."),
+            "a season is open, so that is not the problem"
+        );
+        assert!(
+            !screen.contains("The Journey Ends"),
+            "an episode was drawn, or left in the panel under the columns"
+        );
+    }
+
+    /// The other half of the invariant, and the half a pure test of the arithmetic
+    /// cannot reach: a click on the third row of a narrowed column selects the episode
+    /// the third row is showing, and the row the pointer was over is the row the
+    /// keyboard is now on. The list widget is handed the rows the narrowing left and
+    /// writes its offset back in them, so there is one index space on the screen and
+    /// both the pointer and the cursor count in it.
+    #[test]
+    fn a_click_lands_on_the_row_the_narrowing_left() {
+        let mut app = app();
+        several_episodes(&mut app, 20);
+        app.focus = Focus::Episodes;
+        narrow(&mut app, "1");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.episodes.rows(),
+            11,
+            "E1 and E10 to E19 are the episodes with a 1 in the number"
+        );
+
+        let buffer = buffer(120, 30, &mut app);
+        let episodes = app.regions.episodes;
+        let (x, y) = row(episodes, 2);
+        let line: String = (episodes.x..episodes.right())
+            .map(|column| buffer[(column, y)].symbol())
+            .collect();
+        assert!(line.contains("E11"), "the third row reads {line:?}");
+
+        click(&mut app, x, y);
+        assert_eq!(app.episodes.state.selected(), Some(2));
+        assert_eq!(
+            app.episodes.selected().map(|episode| episode.id.clone()),
+            Some("E10".to_owned()),
+            "the click chose an episode other than the one it was drawn on"
+        );
+    }
+
     /// A queue with something in it, put there the way the key puts it there.
     fn with_downloads(app: &mut App, count: usize) {
         app.focus = Focus::Episodes;
         several_episodes(app, count);
         press(app, KeyCode::Char('D'));
         app.focus = Focus::Series;
+    }
+
+    /// The queue narrows like any other column, and the strip keeps a row to say so
+    /// with: one that vanished as its last row was hidden would read as a queue that had
+    /// emptied itself, which is the one thing the panel has to be trusted about. The
+    /// query here carries a capital, which is smart case saying it means it.
+    #[test]
+    fn the_queue_narrows_and_keeps_a_row_to_say_so() {
+        let mut app = app();
+        with_downloads(&mut app, 2);
+        app.focus = Focus::Downloads;
+        narrow(&mut app, "E2");
+        press(&mut app, KeyCode::Enter);
+
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Downloads \"E2\" 1/2"),
+            "the panel said nothing about being narrowed"
+        );
+        assert!(screen.contains("S01E2"));
+        assert!(
+            !screen.contains("S01E1"),
+            "a row the narrowing hid was drawn"
+        );
+
+        narrow(&mut app, "zzz");
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Nothing matches \"zzz\"."),
+            "the strip went away with its last row"
+        );
     }
 
     /// Where the queue is drawn, and what is on a row of it: what the episode is, how
