@@ -387,11 +387,60 @@ pub struct SearchResponse {
     pub data: Vec<SearchGroup>,
 }
 
+/// The words Crunchyroll has for one of its own categories or seasonal tags, in the
+/// locale the list was asked for.
+///
+/// Only the title is read. The description beside it is a paragraph written for the
+/// website's own genre pages, and a row of a list one keypress deep has no room for one.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Localization {
+    #[serde(default, deserialize_with = "null_default")]
+    pub title: String,
+}
+
+/// One of the categories the catalogue can be narrowed to.
+///
+/// `tenant_category` is the slug browse takes - `action`, `slice-of-life` - and it is
+/// the field to read rather than the `slug` beside it, which is the same word for the
+/// categories that have both and absent for the ones that do not. The sub-categories
+/// hanging off each row are left alone: they are slugs of the same shape one level
+/// down, and a flat list of twenty genres is something to read at a glance where a tree
+/// is something to navigate.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Category {
+    #[serde(default, deserialize_with = "null_default", rename = "tenant_category")]
+    pub slug: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub localization: Localization,
+}
+
+/// One anime season, as browse wants it named: an id of the `fall-2024` shape, with the
+/// words for it beside it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SeasonalTag {
+    #[serde(default, deserialize_with = "null_default")]
+    pub id: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub localization: Localization,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CategoriesResponse {
+    #[serde(default)]
+    pub data: Vec<Category>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SeasonalTagsResponse {
+    #[serde(default)]
+    pub data: Vec<SeasonalTag>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Episode, HistoryResponse, PlayheadsResponse, SeasonEpisode, SeasonEpisodesResponse,
-        WatchlistResponse,
+        CategoriesResponse, Episode, HistoryResponse, PlayheadsResponse, SeasonEpisode,
+        SeasonEpisodesResponse, SeasonalTagsResponse, WatchlistResponse,
     };
 
     #[test]
@@ -608,5 +657,43 @@ mod tests {
             playheads[3].playhead, 0,
             "an episode with no position is one at the start of it"
         );
+    }
+
+    /// The two lists the catalogue filters are chosen from, as Crunchyroll sends them.
+    /// A category is asked for by the slug in `tenant_category` and a season by its id,
+    /// and both are shown by the title under `localization` - so a row that arrives
+    /// without one of those two is a row that cannot be offered, which is why the empty
+    /// cases are pinned here rather than discovered in front of a user.
+    #[test]
+    fn reads_the_categories_and_the_seasons_on_offer() {
+        let json = r#"{"total":2,"data":[
+            {"tenant_category":"action","slug":"action","sub_categories":[],
+             "localization":{"title":"Action","description":"Punching.","locale":"en-US"}},
+            {"tenant_category":"slice-of-life",
+             "localization":{"title":"Slice of Life","description":null,"locale":"en-US"}},
+            {"tenant_category":"seinen","localization":null},
+            {"localization":{"title":"Nothing browse can be asked for"}}
+        ]}"#;
+        let categories = serde_json::from_str::<CategoriesResponse>(json)
+            .expect("a list of categories")
+            .data;
+        assert_eq!(categories[0].slug, "action");
+        assert_eq!(categories[0].localization.title, "Action");
+        assert_eq!(categories[1].slug, "slice-of-life");
+        assert_eq!(categories[1].localization.title, "Slice of Life");
+        assert_eq!(categories[2].localization.title, "", "a null localisation");
+        assert_eq!(categories[3].slug, "", "and a row with no slug at all");
+
+        let json = r#"{"total":2,"data":[
+            {"id":"fall-2024","localization":{"title":"Fall 2024","locale":"en-US"}},
+            {"id":"summer-2024","localization":{"title":null}}
+        ]}"#;
+        let seasons = serde_json::from_str::<SeasonalTagsResponse>(json)
+            .expect("a list of seasonal tags")
+            .data;
+        assert_eq!(seasons[0].id, "fall-2024");
+        assert_eq!(seasons[0].localization.title, "Fall 2024");
+        assert_eq!(seasons[1].id, "summer-2024");
+        assert_eq!(seasons[1].localization.title, "");
     }
 }

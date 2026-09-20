@@ -51,9 +51,9 @@ pub enum Target {
     /// A column, wherever in it: a border and a title are part of the column to anyone
     /// aiming a pointer at one.
     Column(Focus),
-    /// Inside the language list.
+    /// Inside whichever list is open over the interface.
     Picker,
-    /// The language list is open and the pointer is somewhere else, which is how it is
+    /// One of those lists is open and the pointer is somewhere else, which is how it is
     /// cancelled.
     Outside,
     /// A word along an edge, which answers by doing what its key does.
@@ -82,7 +82,7 @@ pub struct Regions {
     /// holds something, so an empty queue leaves an empty box here and nothing for a
     /// pointer to land on.
     pub downloads: Rect,
-    /// The language list while it is open, and nothing while it is not.
+    /// The list of values while one is open, and nothing while none is.
     pub picker: Rect,
     /// Every word drawn along the top and bottom edges, and the command it runs. One
     /// list, because they are all the same thing: a word somewhere, that answers.
@@ -102,9 +102,9 @@ impl Regions {
 
     /// What is under `at`.
     ///
-    /// The language list has first refusal, because it is drawn over everything else:
-    /// while it is open, a click that misses it cancels it rather than reaching whatever
-    /// it happened to be covering. The words along the edges come next. Nothing overlaps
+    /// An open list has first refusal, because it is drawn over everything else: while
+    /// one is up, a click that misses it cancels it rather than reaching whatever it
+    /// happened to be covering. The words along the edges come next. Nothing overlaps
     /// in practice - the footer is below the columns and the header above them - but the
     /// order is written down so that a layout which ever does overlap resolves the same
     /// way twice.

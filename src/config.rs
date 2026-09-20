@@ -252,6 +252,7 @@ mpv-args = [\"--fullscreen\", \"--vf=lavfi=[hqdn3d]\"]
 [keys]
 down = \"e\"
 up = \"u\"
+simulcast = \"U\"
 download = [\"d\", \"ctrl-d\"]
 ",
         )

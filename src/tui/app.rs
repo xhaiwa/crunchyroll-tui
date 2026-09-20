@@ -17,7 +17,9 @@ use super::art::Gallery;
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions, Target};
 use super::theme::Theme;
-use super::worker::{Listing, Queued, Request, Response, Update, Worker};
+use super::worker::{
+    Choice, FilterKind, Filters, Listing, Queued, Request, Response, Update, Worker,
+};
 
 /// Which column the keyboard is pointed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +176,15 @@ fn marks_tally(count: usize) -> String {
     }
 }
 
+/// What the status line says about a filter that cannot reach the list in front of it.
+///
+/// One clause for both of the moments it is needed - a filter set from the watchlist,
+/// and the column cycled off the catalogue with one on - because they are the same fact
+/// and hearing it two ways would read as two different rules.
+fn only_the_catalogue(what: &str) -> String {
+    format!("{what} - the filters narrow the catalogue only.")
+}
+
 /// One column: what it holds, where the cursor is, and whether it is still waiting.
 pub struct Pane<T> {
     pub items: Vec<T>,
@@ -315,20 +326,54 @@ impl Paging {
     }
 }
 
-/// The language list while it is open: which of the two settings it is choosing for,
-/// and the locales it is offering.
+/// Which list is open over the interface, and so what choosing a row from it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Picking {
+    Audio,
+    Subtitles,
+    /// One of the two filters that take their value from a list Crunchyroll keeps.
+    Filter(FilterKind),
+}
+
+impl Picking {
+    /// The list `next-column` looks at from this one. The four are two pairs that are
+    /// read together - the two languages, and the two filters - and flipping between a
+    /// pair without going back out first is what that key was doing when there was only
+    /// one pair of them.
+    const fn other(self) -> Self {
+        match self {
+            Self::Audio => Self::Subtitles,
+            Self::Subtitles => Self::Audio,
+            Self::Filter(FilterKind::Genre) => Self::Filter(FilterKind::Season),
+            Self::Filter(FilterKind::Season) => Self::Filter(FilterKind::Genre),
+        }
+    }
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Audio => " Audio language ",
+            Self::Subtitles => " Subtitle language ",
+            Self::Filter(which) => which.title(),
+        }
+    }
+}
+
+/// A list of values while it is open: which list it is, and what it is offering.
+///
+/// It was the language list and is now four lists, because they are the same thing to
+/// look at and the same thing to drive: a column of values with the one in force marked,
+/// the keys of a pane, escape to leave it alone. Each row carries the value that gets
+/// applied beside the words it is shown as, so nothing about the list itself depends on
+/// where its rows came from - a locale this program has a name for, or a category
+/// Crunchyroll named in the account's own language.
 pub struct Picker {
-    pub audio: bool,
-    pub pane: Pane<String>,
+    pub kind: Picking,
+    pub pane: Pane<Choice>,
 }
 
 impl Picker {
-    pub fn title(&self) -> &'static str {
-        if self.audio {
-            " Audio language "
-        } else {
-            " Subtitle language "
-        }
+    pub const fn title(&self) -> &'static str {
+        self.kind.title()
     }
 }
 
@@ -382,9 +427,21 @@ pub struct App {
     pub listing: Listing,
     /// Where the catalogue column has got to in that listing.
     pub paging: Paging,
+    /// What the browse listings are narrowed to. Carried on the interface rather than
+    /// inside the listing, because it survives the column being cycled round the ring
+    /// and put back - see [`App::choose_filter`].
+    pub filters: Filters,
+    /// The values behind the two filters that take one, once they have been asked for.
+    ///
+    /// Kept for the run rather than fetched each time a list is opened. Crunchyroll's
+    /// categories change a few times a year and its seasons four times, which is not
+    /// between two presses of a key, and the list is one a user narrowing a catalogue
+    /// opens, closes and opens again. A list that failed to arrive leaves nothing here,
+    /// so the next press asks afresh rather than offering an empty list for ever.
+    filter_values: HashMap<FilterKind, Vec<Choice>>,
     /// The search box while it is being typed into.
     pub editing: Option<String>,
-    /// The language list while it is open.
+    /// The list of values while one is open.
     pub picker: Option<Picker>,
     pub notice: Option<Notice>,
     /// What the API client would have printed had the interface not owned the screen.
@@ -441,6 +498,8 @@ impl App {
             // when the answer arrives.
             listing: Listing::History,
             paging: Paging::first(),
+            filters: Filters::default(),
+            filter_values: HashMap::new(),
             editing: None,
             picker: None,
             notice: None,
@@ -565,6 +624,7 @@ impl App {
         self.worker.send(Request::Catalog {
             listing: self.listing.clone(),
             start,
+            filters: self.filters.clone(),
         });
     }
 
@@ -681,8 +741,19 @@ impl App {
     ///
     /// Split out of [`App::drain`] so a test can hand the interface an answer without a
     /// worker behind it.
-    fn catalog_arrived(&mut self, listing: Listing, start: usize, result: Result<Page, String>) {
-        if listing != self.listing || self.paging.asked != Some(start) {
+    fn catalog_arrived(
+        &mut self,
+        listing: Listing,
+        start: usize,
+        filters: Filters,
+        result: Result<Page, String>,
+    ) {
+        // Three things have to match, and they are the three the request carried. The
+        // filters are half of what was asked, so they are half of what makes an answer
+        // stale: a page of the whole catalogue arriving after a genre has been chosen is
+        // as much the answer to a question nobody is asking any more as a page of the
+        // watchlist would be. The offset is the other half - see [`Paging::asked`].
+        if listing != self.listing || filters != self.filters || self.paging.asked != Some(start) {
             return;
         }
         self.paging.asked = None;
@@ -737,6 +808,40 @@ impl App {
         }
     }
 
+    /// The values behind one of the two list filters.
+    ///
+    /// Kept whatever is on screen by the time they arrive: the categories are a fact
+    /// about Crunchyroll rather than about the column, and an answer thrown away because
+    /// the list had been closed would only be asked for again the next time it was
+    /// opened. What the answer may not do is reach into a list the user has moved on
+    /// from - the discipline every other answer here keeps - so the open list is
+    /// refilled only where it is the one that asked, and a list since closed, or swapped
+    /// for the other filter, is left exactly as it was found.
+    ///
+    /// A list that failed leaves the popup showing All, which still clears the filter,
+    /// and says why on the status line. The alternative - closing the popup out from
+    /// under the user - would take away the one row it did have to offer. A failure for
+    /// a list nobody is looking at any more is dropped like any other stale answer,
+    /// since there is nothing left on screen for it to explain.
+    fn filter_values_arrived(&mut self, which: FilterKind, result: Result<Vec<Choice>, String>) {
+        let open = self.picker.as_ref().map(|picker| picker.kind) == Some(Picking::Filter(which));
+        match result {
+            Ok(values) => {
+                self.filter_values.insert(which, values);
+                if open {
+                    self.open_picker(Picking::Filter(which));
+                }
+            }
+            Err(error) if open => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.pane.loading = false;
+                }
+                self.complain(error);
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Takes in whatever the worker has finished, and whatever the client wanted to say.
     pub fn drain(&mut self) {
         while let Some(response) = self.worker.try_recv() {
@@ -765,8 +870,10 @@ impl App {
             Response::Catalog {
                 listing,
                 start,
+                filters,
                 result,
-            } => self.catalog_arrived(listing, start, result),
+            } => self.catalog_arrived(listing, start, filters, result),
+            Response::FilterValues { which, result } => self.filter_values_arrived(which, result),
             Response::Seasons { series_id, result } => {
                 if series_id != self.seasons.owner {
                     return;
@@ -1260,16 +1367,73 @@ impl App {
         locales
     }
 
-    /// Opens the language list on the locale in use.
-    fn open_picker(&mut self, audio: bool) {
-        let locales = self.locales(audio);
-        let current = if audio { self.audio() } else { self.subs() };
+    /// Opens one of the four lists, on the value in force.
+    ///
+    /// The two filter lists come off the network, so one whose values have not been
+    /// fetched yet opens holding nothing but All and asks for them. That is the right
+    /// way round: the popup is up the moment the key is pressed, and it fills in a beat
+    /// later, rather than the key doing nothing visible while a request is out.
+    fn open_picker(&mut self, picking: Picking) {
+        let rows = self.picker_rows(picking);
+        let current = self.chosen(picking);
         let mut pane = Pane {
-            pending_cursor: locales.iter().position(|locale| *locale == current),
+            pending_cursor: rows.iter().position(|row| row.value == current),
             ..Pane::default()
         };
-        pane.set(locales);
-        self.picker = Some(Picker { audio, pane });
+        pane.set(rows);
+        if let Picking::Filter(which) = picking
+            && !self.filter_values.contains_key(&which)
+        {
+            pane.loading = true;
+            self.worker.send(Request::FilterValues(which));
+        }
+        self.picker = Some(Picker {
+            kind: picking,
+            pane,
+        });
+    }
+
+    /// What one of the four lists offers.
+    ///
+    /// Both filter lists open with an All row of their own making, at the top where the
+    /// eye lands, because taking a filter off has to be as easy as putting one on and
+    /// there is no other key for it. Its value is the empty string, which is what no
+    /// filter set reads as everywhere else - so All is the row the list opens on and
+    /// marks while nothing is chosen, without anything having to know that it is
+    /// special.
+    fn picker_rows(&self, picking: Picking) -> Vec<Choice> {
+        match picking {
+            Picking::Audio | Picking::Subtitles => self
+                .locales(picking == Picking::Audio)
+                .into_iter()
+                .map(|locale| Choice {
+                    label: language_name(&locale).to_owned(),
+                    value: locale,
+                })
+                .collect(),
+            Picking::Filter(which) => {
+                let mut rows = vec![Choice {
+                    value: String::new(),
+                    label: "All".to_owned(),
+                }];
+                rows.extend(self.filter_values.get(&which).cloned().unwrap_or_default());
+                rows
+            }
+        }
+    }
+
+    /// The value in force for one of the four lists: the row it opens on, and the row it
+    /// marks. A filter nobody has set is the empty string, which is the All row's value.
+    pub fn chosen(&self, picking: Picking) -> String {
+        match picking {
+            Picking::Audio => self.audio(),
+            Picking::Subtitles => self.subs(),
+            Picking::Filter(which) => self
+                .filters
+                .chosen(which)
+                .map(|chosen| chosen.value.clone())
+                .unwrap_or_default(),
+        }
     }
 
     fn cycle_locale(&mut self, audio: bool) {
@@ -1342,6 +1506,82 @@ impl App {
             self.sort = sort;
         }
         self.request_catalog();
+        self.say_filters_are_off_here();
+    }
+
+    /// Puts a filter on the catalogue, or takes it off again when the row chosen is All.
+    ///
+    /// This is where the one decision the whole feature turns on lives. A filter narrows
+    /// the browse listings and nothing else - see [`Filters`] - so one set while the
+    /// column is showing the watchlist, the history or a search would be a word in the
+    /// header about a list it has nothing to do with. Rather than let the header say
+    /// something untrue, or refuse the key and leave the user working out why nothing
+    /// happened, the column goes back to the browse order it was last on and the filter
+    /// shows its effect there at once. That is the move `back` out of a search already
+    /// makes, it is said on the status line as it happens, and it costs one press of
+    /// `order` to undo.
+    fn choose_filter(&mut self, which: FilterKind, chosen: Choice) {
+        let changed = self.chosen(Picking::Filter(which)) != chosen.value;
+        self.filters
+            .set(which, (!chosen.value.is_empty()).then_some(chosen));
+        self.filters_changed(changed);
+    }
+
+    /// The simulcast filter, which is a yes or a no and so has no list to pick from.
+    fn toggle_simulcast(&mut self) {
+        self.filters.simulcast = !self.filters.simulcast;
+        self.filters_changed(true);
+    }
+
+    /// What every change to a filter does once the change itself has been made.
+    ///
+    /// The catalogue is asked for again from the start rather than narrowed where it
+    /// sits: a filtered catalogue is a different hundred series, not the same hundred
+    /// with rows hidden, and Crunchyroll is the only thing that knows which. The status
+    /// line then says what is on screen, filters and all, because the column changing
+    /// under the cursor without a word is the one thing that would read as a glitch.
+    ///
+    /// A row chosen a second time changes nothing and is not asked for again - the
+    /// answer is already in the column - but it is still said, since the key was pressed
+    /// and silence is the same answer a broken key gives.
+    fn filters_changed(&mut self, changed: bool) {
+        let moved = !matches!(self.listing, Listing::Browse(_));
+        if moved {
+            self.listing = Listing::Browse(self.sort);
+        }
+        if changed || moved {
+            self.request_catalog();
+        }
+        let showing = format!("Showing {}", self.showing());
+        self.say(if moved {
+            only_the_catalogue(&showing)
+        } else {
+            format!("{showing}.")
+        });
+    }
+
+    /// The list on screen and what it is narrowed by: `Popular · Genre: Action`.
+    fn showing(&self) -> String {
+        let label = self.listing.label();
+        match self.filters.summary() {
+            summary if summary.is_empty() => label,
+            summary => format!("{label} · {summary}"),
+        }
+    }
+
+    /// Says so when the column has arrived somewhere the filters do not reach.
+    ///
+    /// The header shows them only while a browse listing is on screen, which is the only
+    /// way it can describe what is under it. A word that disappears without anything
+    /// being said reads as a filter that has been forgotten rather than one that is out
+    /// of force for as long as this list is up, so leaving the catalogue says which it
+    /// is. Nothing is said on the way back: the header saying it again is the whole
+    /// news.
+    fn say_filters_are_off_here(&mut self) {
+        if self.filters.any() && !matches!(self.listing, Listing::Browse(_)) {
+            let label = self.listing.label();
+            self.say(only_the_catalogue(&label));
+        }
     }
 
     fn reload(&mut self) {
@@ -1374,6 +1614,7 @@ impl App {
                     Listing::Search(query)
                 };
                 self.request_catalog();
+                self.say_filters_are_off_here();
             }
             KeyCode::Backspace => {
                 if let Some(query) = self.editing.as_mut() {
@@ -1389,10 +1630,13 @@ impl App {
         }
     }
 
-    /// The language list has the keys of a column, plus the one that cycles the columns
-    /// to look at the other list without going back out first. Anything else does
-    /// nothing while it is open, which is what a new command should do here until
-    /// someone decides otherwise.
+    /// An open list has the keys of a column, plus the one that cycles the columns - which
+    /// looks at the other list of the pair without going back out first - and the keys
+    /// that open each of the four, so a list opened by mistake is one key from the right
+    /// one. Anything else does nothing while it is open, `simulcast` included: it is the
+    /// filter with no list behind it, and taking it as a keypress about the catalogue
+    /// from inside a popup about the catalogue would be the one place where a key changed
+    /// what is underneath the thing being looked at.
     fn edit_picker(&mut self, command: Command) {
         let Some(picker) = self.picker.as_mut() else {
             return;
@@ -1406,17 +1650,23 @@ impl App {
             Command::Top => picker.pane.select_edge(false),
             Command::Bottom => picker.pane.select_edge(true),
             Command::NextColumn => {
-                let other = !picker.audio;
+                let other = picker.kind.other();
                 self.open_picker(other);
             }
-            Command::AudioLanguage => self.open_picker(true),
-            Command::SubtitleLanguage => self.open_picker(false),
+            Command::AudioLanguage => self.open_picker(Picking::Audio),
+            Command::SubtitleLanguage => self.open_picker(Picking::Subtitles),
+            Command::Genre => self.open_picker(Picking::Filter(FilterKind::Genre)),
+            Command::AnimeSeason => self.open_picker(Picking::Filter(FilterKind::Season)),
             Command::Open => {
-                let audio = picker.audio;
+                let kind = picker.kind;
                 let chosen = picker.pane.selected().cloned();
                 self.picker = None;
                 if let Some(chosen) = chosen {
-                    self.choose_locale(audio, chosen);
+                    match kind {
+                        Picking::Audio => self.choose_locale(true, chosen.value),
+                        Picking::Subtitles => self.choose_locale(false, chosen.value),
+                        Picking::Filter(which) => self.choose_filter(which, chosen),
+                    }
                 }
             }
             _ => {}
@@ -1504,8 +1754,11 @@ impl App {
             Command::Watchlist => self.toggle_watchlist(),
             Command::MarkWatched => self.mark(true),
             Command::MarkUnwatched => self.mark(false),
-            Command::AudioLanguage => self.open_picker(true),
-            Command::SubtitleLanguage => self.open_picker(false),
+            Command::AudioLanguage => self.open_picker(Picking::Audio),
+            Command::SubtitleLanguage => self.open_picker(Picking::Subtitles),
+            Command::Genre => self.open_picker(Picking::Filter(FilterKind::Genre)),
+            Command::AnimeSeason => self.open_picker(Picking::Filter(FilterKind::Season)),
+            Command::Simulcast => self.toggle_simulcast(),
             Command::NextAudio => self.cycle_locale(true),
             Command::NextSubtitle => self.cycle_locale(false),
             Command::Quality => self.cycle_quality(),
@@ -1662,7 +1915,7 @@ impl App {
         }
     }
 
-    /// The locale under the pointer, while the language list is open.
+    /// The row under the pointer, while a list is open over the interface.
     fn picked_at(&self, at: Position) -> Option<usize> {
         let picker = self.picker.as_ref()?;
         let (offset, len) = picker.pane.window();
@@ -1677,7 +1930,7 @@ impl App {
         }
     }
 
-    /// The columns' rule again: a click chooses a locale, and a click on the one already
+    /// The columns' rule again: a click chooses a row, and a click on the one already
     /// chosen applies it.
     fn click_picker(&mut self, at: Position) {
         let Some(index) = self.picked_at(at) else {
@@ -1706,7 +1959,9 @@ mod tests {
     use crate::tui::art::Gallery;
     use crate::tui::keys::{Bindings, Command};
     use crate::tui::theme::Theme;
-    use crate::tui::worker::{Listing, Request, Response, Update, Worker};
+    use crate::tui::worker::{
+        Choice, FilterKind, Filters, Listing, Request, Response, Update, Worker,
+    };
 
     use super::{
         Action, App, Focus, OnDisk, Page, Pane, SeasonEpisode, State, episode_label, whole_seconds,
@@ -1766,10 +2021,15 @@ mod tests {
 
     /// Hands the interface a catalogue answer the way the worker does, naming the list
     /// and the offset it was asked for - which is what the interface checks it against.
+    /// Hands the interface a page as the worker would have, under the filters the
+    /// interface is holding - which is what every test that is not about the filters
+    /// themselves means by a page arriving.
     fn catalog(app: &mut App, listing: Listing, start: usize, result: Result<Page, String>) {
+        let filters = app.filters.clone();
         app.accept(Response::Catalog {
             listing,
             start,
+            filters,
             result,
         });
     }
@@ -2219,6 +2479,7 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Browse(0),
                 start: 100,
+                filters: Filters::default(),
             }],
             "the end of the loaded list asked for nothing"
         );
@@ -2276,6 +2537,7 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Browse(0),
                 start: 200,
+                filters: Filters::default(),
             }]
         );
     }
@@ -2398,6 +2660,7 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Browse(0),
                 start: 100,
+                filters: Filters::default(),
             }],
             "a page that failed could not be asked for again"
         );
@@ -2440,6 +2703,7 @@ mod tests {
                 vec![Request::Catalog {
                     listing: Listing::Browse(0),
                     start: 12,
+                    filters: Filters::default(),
                 }],
                 "{how} reached the end of the list and asked for nothing"
             );
@@ -2470,6 +2734,7 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Browse(0),
                 start: 0,
+                filters: Filters::default(),
             }]
         );
         assert_eq!(app.paging.next, Some(0));
@@ -2484,6 +2749,7 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Browse(1),
                 start: 0,
+                filters: Filters::default(),
             }]
         );
 
@@ -2494,6 +2760,7 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Search("frieren".to_owned()),
                 start: 0,
+                filters: Filters::default(),
             }]
         );
 
@@ -2503,7 +2770,61 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Browse(1),
                 start: 0,
+                filters: Filters::default(),
             }]
+        );
+    }
+
+    /// Where the two halves of this branch meet: a narrowed catalogue is paged like any
+    /// other, and every page of it has to carry the same filters as the first.
+    ///
+    /// A second page asked for unnarrowed would append a hundred series from the whole
+    /// catalogue to the bottom of a column that says `Genre: Action` at the top, which is
+    /// the one way a pager and a filter can lie to each other. Setting a filter also
+    /// starts the list over: the narrowed catalogue is a different hundred series rather
+    /// than the same hundred with rows taken out, and only Crunchyroll knows which - so
+    /// the offset the column had walked to means nothing under the new question.
+    #[test]
+    fn the_next_page_of_a_narrowed_catalogue_is_narrowed_the_same_way() {
+        let mut app = app();
+        with_catalogue(&mut app, 100, 250);
+        app.run(Command::Bottom);
+        app.sent();
+
+        app.choose_filter(
+            FilterKind::Genre,
+            Choice {
+                value: "action".to_owned(),
+                label: "Action".to_owned(),
+            },
+        );
+        let narrowed = app.filters.clone();
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 0,
+                filters: narrowed.clone(),
+            }],
+            "the filter left the column where the unnarrowed list had got to"
+        );
+
+        app.accept(Response::Catalog {
+            listing: Listing::Browse(0),
+            start: 0,
+            filters: narrowed.clone(),
+            result: page(0, 100, Some(120), Some(100)),
+        });
+        app.sent();
+        app.run(Command::Bottom);
+        assert_eq!(
+            app.sent(),
+            vec![Request::Catalog {
+                listing: Listing::Browse(0),
+                start: 100,
+                filters: narrowed,
+            }],
+            "the second page of a narrowed catalogue was asked for unnarrowed"
         );
     }
 

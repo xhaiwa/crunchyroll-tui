@@ -9,6 +9,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 ## Features
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
+- The catalogue narrowed to one of Crunchyroll's categories, to one anime season, or to what is simulcasting
 - Downloads that run in the background: a queue in a panel of its own, with the catalogue still usable while a season comes down
 - The watchlist and the history kept up to date from the interface: a series added or removed, an episode marked watched or unwatched
 - The episodes you already have marked in the column, so a season you have downloaded says so without being downloaded again
@@ -210,6 +211,8 @@ instead and says so on the status line.
 | `tab` | `next-column` | Cycle the columns: series, seasons, episodes, downloads |
 | `/` | `search` | Search the catalogue. An empty search goes back to browsing |
 | `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
+| `c`, `n` | `genre`, `anime-season` | Narrow the catalogue to one of Crunchyroll's categories or to one anime season, from a list with All at the top of it |
+| `u` | `simulcast` | Show only the series Crunchyroll calls simulcasts, or stop |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
 | `space` | `mark` | Mark the episode under the cursor for downloading, or take the mark off |
 | `d`, `D` | `download`, `download-season` | Put the marked episodes on the download queue, or the episode under the cursor if none are marked, or the whole season |
@@ -253,6 +256,39 @@ watching, and its header says how many series that came to. The watchlist and a 
 page, but neither publishes a count of the same things this column shows - the watchlist
 counts the films on it, which this column drops - so their headers say what is loaded and
 leave it there.
+`c` and `n` narrow the catalogue to one of Crunchyroll's own categories or to a single
+anime season, chosen from a list of what it offers - the same lists the website's genre
+and season menus are drawn from, fetched the first time you open one and kept for the rest
+of the run, since they change a few times a year rather than between two presses of a key.
+`All` sits at the top of both lists, which is how a filter comes off again, and the list
+opens on whatever is in force, marked with a dot, so `All` is never one keypress away by
+accident. `u` is a filter with no list behind it: only the series Crunchyroll calls
+simulcasts.
+
+That last one is a sieve rather than a narrower question. Browse takes a category and a
+season and has nothing at all for simulcasts, so what `u` does is ask for a page and throw
+away what is not one - which means a page that comes back mostly not simulcast is a short
+column, and a page deep into the catalogue can come back empty while the catalogue behind
+it is not. That is the price of having the filter, and it seemed a smaller one than not
+having it. The header drops its count of the whole list while `u` is on, for the same
+reason: the number Crunchyroll publishes counts the rows it sent rather than the ones that
+survived the sieve, and walking to the bottom still asks for the next hundred off the
+wire - not the next hundred simulcasts.
+
+The filters narrow the browse listings and nothing else, because that is the only place
+they can mean anything: the watchlist and the history are the account's own lists, asked
+for by account rather than by question, and a search takes a query instead. So setting one
+while any of those three is up puts the column back on the browse order you were last on,
+narrowed, and says so - `Showing Popular · Genre: Action - the filters narrow the
+catalogue only.` Cycling off the catalogue with a filter on leaves it set but out of
+force, says which it is as it goes - `Watchlist - the filters narrow the catalogue only.`
+- and shows it again the moment you come back. The header carries the filters that are on
+beside the name of the list, and each of those words opens the list it came from, which is
+where a filter is cleared as well as where it was set.
+
+Changing a filter asks Crunchyroll for the catalogue again from the start: a narrowed
+catalogue is a different hundred series rather than the same hundred with rows hidden, and
+only Crunchyroll knows which. The status line says what is on screen afterwards.
 
 `w` acts on the series the catalogue column has selected, whoever has the keyboard: the
 seasons and the episodes on screen are that series' own. `m` and `M` act on the episode
@@ -341,7 +377,8 @@ included.
 | Click a word along an edge | What its key does: `open/play`, `back`, `search`, `download`, `language`, `quality`, `keys`, `quit`, and `audio`, `subs` and `video` at the top right |
 | Click a queue row, then again | Move the cursor there, then take that download out of the queue |
 | Click the listing label | Move on to the next list, or leave a search |
-| Click beside the language list | Cancel it, the way `esc` does |
+| Click a filter in the header | Open the list it came from, where it is cleared as well as set |
+| Click beside an open list | Cancel it, the way `esc` does |
 
 Opening takes a second click rather than a quick double click, so a slow hand and a slow
 link work the same as a fast one - and a first click into a column can only ever choose,
@@ -600,7 +637,8 @@ back = ["n", "left", "esc"]
 down = ["e", "down"]
 up = ["i", "up"]
 open = ["o", "enter", "right"]
-# and somewhere to put the two that `i` and `o` were holding
+# and somewhere to put the three that `n`, `i` and `o` were holding
+anime-season = "N"
 images = "I"
 order = "O"
 ```
@@ -623,6 +661,8 @@ The commands, and the keys they answer to out of the box:
 | `next-column` | `tab` | Cycle the columns |
 | `search` | `/` | Search the catalogue |
 | `order` | `o` | Change the list the catalogue shows |
+| `genre` `anime-season` | `c`, `n` | Narrow the catalogue by category or anime season |
+| `simulcast` | `u` | Show only what is simulcasting, or stop |
 | `reload` | `r` | Reload the current column |
 | `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
 | `mark` | `space` | Mark the episode for downloading, or unmark it |
@@ -646,9 +686,10 @@ A key is a single character, one of `up`, `down`, `left`, `right`, `enter`, `esc
 remapped layout documents itself. Two things stay where they are: `ctrl-c` always quits,
 and the search box takes every letter literally, so `/` then `q` searches for `q`.
 
-The language list uses the same bindings: `up`/`down`/`top`/`bottom` move, `open`
-applies, `next-column` swaps between the audio and subtitle lists, and `back` or `quit`
-closes it.
+The lists that open over the interface use the same bindings: `up`/`down`/`top`/`bottom`
+move, `open` applies, `back` or `quit` closes without applying, and `next-column` swaps
+between the two lists that are read together - the audio and subtitle languages, or the
+genre and the anime season.
 
 The mouse has nothing of its own in here. Every word it can click runs one of the
 commands above, so moving a key moves what the word beside it says and changes nothing

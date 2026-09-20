@@ -13,7 +13,7 @@ use super::app::{App, Download, Focus, Picker, State};
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions};
 use super::theme::Theme;
-use super::worker::Listing;
+use super::worker::{Choice, FilterKind, Listing};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -257,8 +257,9 @@ fn line(run: &Run) -> Line<'static> {
 ///
 /// Where the total is unknown it is left out rather than guessed at. The watchlist, the
 /// history and a search have no figure that counts the same things this column shows -
-/// see [`crate::api::Page`] - and `100 of 100 series` for a list that goes on would be a
-/// worse answer than saying nothing about the length at all.
+/// see [`crate::api::Page`] - and a page the simulcast filter has sieved has thrown away
+/// rows the total still counts, so it arrives without one. `100 of 100 series` for a list
+/// that goes on would be a worse answer than saying nothing about the length at all.
 fn tally(app: &App) -> String {
     let loaded = app.series.items.len();
     match app.paging.total {
@@ -267,12 +268,23 @@ fn tally(app: &App) -> String {
     }
 }
 
-/// The left of the header: what is being listed, and how much of it.
+/// The left of the header: what is being listed, how much of it, and what it is narrowed
+/// by.
 ///
 /// The label is a button, because what it says is exactly what a click on it changes -
 /// `Popular`, `Watchlist` and `Continue watching` alike move on to the next list, and
-/// `Search: frieren` leaves the search. The count beside it is not. While the box is
-/// being typed into, none of it is: a click there closes the box, as escape does.
+/// `Search: frieren` leaves the search. The count beside it is not. The filters that
+/// follow are buttons too, each opening the list it was chosen from, which is where it
+/// is cleared as well as where it is set.
+///
+/// They are drawn only while a browse listing is on screen. The other three lists are
+/// not narrowed by them - see [`Filters`](super::worker::Filters) - and a header is a
+/// description of what is under it, not of what the interface is holding. Leaving the
+/// catalogue with a filter on says so on the status line, so the words do not simply
+/// vanish.
+///
+/// While the box is being typed into, none of it is a button: a click there closes the
+/// box, as escape does.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
@@ -284,16 +296,37 @@ fn listing(app: &App) -> Run {
                 theme.accent("▏"),
             ],
         )],
-        None => vec![
-            (
-                Some(match app.listing {
-                    Listing::Browse(_) | Listing::Watchlist | Listing::History => Command::Order,
-                    Listing::Search(_) => Command::Back,
-                }),
-                vec![theme.strong(app.listing.label())],
-            ),
-            (None, vec![theme.dim(tally(app))]),
-        ],
+        None => {
+            let mut run = vec![
+                (
+                    Some(match app.listing {
+                        Listing::Browse(_) | Listing::Watchlist | Listing::History => {
+                            Command::Order
+                        }
+                        Listing::Search(_) => Command::Back,
+                    }),
+                    vec![theme.strong(app.listing.label())],
+                ),
+                (None, vec![theme.dim(tally(app))]),
+            ];
+            if matches!(app.listing, Listing::Browse(_)) {
+                let filters = [
+                    (Command::Genre, app.filters.word(FilterKind::Genre)),
+                    (Command::AnimeSeason, app.filters.word(FilterKind::Season)),
+                    (
+                        Command::Simulcast,
+                        app.filters.simulcast.then(|| "Simulcast".to_owned()),
+                    ),
+                ];
+                for (command, word) in filters {
+                    if let Some(word) = word {
+                        run.push((None, vec![theme.dim("   ")]));
+                        run.push((Some(command), vec![theme.accent(word)]));
+                    }
+                }
+            }
+            run
+        }
     }
 }
 
@@ -532,8 +565,14 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// The language list: every locale the selection offers, the one in use marked, and its
-/// code beside the name for anyone who thinks in locales rather than in languages.
+/// One of the lists that open over the interface: every row it offers, the one in force
+/// marked, and each row's value beside its words - for anyone who thinks in locales
+/// rather than in languages, or who wants to see that `Slice of Life` is the
+/// `slice-of-life` a URL would carry.
+///
+/// A list whose rows have not arrived yet says so in the hint along the bottom edge
+/// rather than in a row of its own, because a row there would be one the cursor could
+/// land on and apply.
 ///
 /// Gives back the box it drew itself in, which is what tells a click whether it landed
 /// on the list or beside it.
@@ -544,36 +583,31 @@ fn picker_overlay(
     keys: &Bindings,
     picker: &mut Picker,
     current: &str,
+    tick: usize,
 ) -> Rect {
-    let column = picker
-        .pane
-        .items
-        .iter()
-        .map(|locale| Span::raw(language_name(locale)).width())
-        .max()
-        .unwrap_or(0);
+    let width = |row: &Choice| Span::raw(row.label.as_str()).width();
+    let column = picker.pane.items.iter().map(width).max().unwrap_or(0);
     let items: Vec<ListItem> = picker
         .pane
         .items
         .iter()
-        .map(|locale| {
-            let name = language_name(locale);
-            let padding = " ".repeat(column - Span::raw(name).width() + 2);
+        .map(|row| {
+            let padding = " ".repeat(column - width(row) + 2);
             ListItem::new(Line::from(vec![
-                theme.text(if locale == current { "● " } else { "  " }),
-                theme.text(format!("{name}{padding}")),
-                theme.dim(locale.clone()),
+                theme.text(if row.value == current { "● " } else { "  " }),
+                theme.text(format!("{}{padding}", row.label)),
+                theme.dim(row.value.clone()),
             ]))
         })
         .collect();
-    // Wide enough for the longest language name, and never so narrow that the hint
-    // along the bottom edge is cut in half.
+    // Wide enough for the longest name, and never so narrow that the hint along the
+    // bottom edge is cut in half.
     let area = popup(
         area,
         (column as u16 + 20).max(42),
         picker.pane.items.len() as u16 + 2,
     );
-    let hint = [
+    let mut hint = [
         (Command::Open, "apply"),
         (Command::NextColumn, "other list"),
         (Command::Back, "cancel"),
@@ -585,6 +619,9 @@ fn picker_overlay(
     })
     .collect::<Vec<_>>()
     .join(" · ");
+    if picker.pane.loading {
+        hint = format!("{} {hint}", SPINNER[tick % SPINNER.len()]);
+    }
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(
         List::new(items)
@@ -606,7 +643,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 20] = [
+const HELP: [(&[Command], &str); 22] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -624,6 +661,14 @@ const HELP: [(&[Command], &str); 20] = [
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
     (&[Command::Order], "change the list the catalogue shows"),
+    (
+        &[Command::Genre, Command::AnimeSeason],
+        "narrow the catalogue by genre / anime season",
+    ),
+    (
+        &[Command::Simulcast],
+        "show only what is simulcasting, or stop",
+    ),
     (
         &[Command::Play, Command::PlayRest],
         "play the episode / the rest of the season",
@@ -1055,16 +1100,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Read what is in use before the list borrows the app to draw itself.
-    let current = app.picker.as_ref().map(|picker| {
-        if picker.audio {
-            app.audio()
-        } else {
-            app.subs()
-        }
-    });
+    let current = app.picker.as_ref().map(|picker| app.chosen(picker.kind));
     let mut picked = Rect::default();
     if let (Some(current), Some(picker)) = (current, app.picker.as_mut()) {
-        picked = picker_overlay(frame, area, &theme, &app.keys, picker, &current);
+        picked = picker_overlay(frame, area, &theme, &app.keys, picker, &current, tick);
     }
 
     // Everything a pointer can land on, as the frame about to be shown laid it out.
@@ -1103,14 +1142,15 @@ mod tests {
     use crate::model::{
         Artwork, CatalogItem, Images, Playhead, Season, SeasonEpisode, SeriesMetadata,
     };
-    use crate::tui::app::{Action, App, Focus};
+    use crate::tui::app::{Action, App, Focus, Picking};
     use crate::tui::art::Gallery;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
-    use crate::tui::worker::{Listing, Request, Response, Worker};
+    use crate::tui::worker::{Choice, FilterKind, Filters, Listing, Request, Response, Worker};
 
     use super::{
-        HELP, MARK, cells, downloads_height, draw, duration, meter, poster_width, thumbnail_width,
+        HELP, MARK, SPINNER, cells, downloads_height, draw, duration, meter, poster_width,
+        thumbnail_width,
     };
     use crate::tui::app::State;
     use crate::tui::worker::Update;
@@ -1617,7 +1657,11 @@ mod tests {
         // Tab looks at the other list without going back out, and esc changes nothing.
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Tab);
-        assert!(app.picker.as_ref().is_some_and(|picker| picker.audio));
+        assert!(
+            app.picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == Picking::Audio)
+        );
         press(&mut app, KeyCode::Esc);
         assert!(app.picker.is_none(), "esc closes the list");
         assert_eq!(app.audio(), "fr-FR");
@@ -1634,6 +1678,280 @@ mod tests {
         assert!(screen.contains("Deutsch"));
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.audio(), "de-DE", "the list opens on what is in use");
+    }
+
+    /// The rows Crunchyroll answers a request for the categories with, once the worker
+    /// has turned them into something a list can show.
+    fn genres() -> Vec<Choice> {
+        [("action", "Action"), ("comedy", "Comedy")]
+            .iter()
+            .map(|(value, label)| Choice {
+                value: (*value).to_owned(),
+                label: (*label).to_owned(),
+            })
+            .collect()
+    }
+
+    /// Every catalogue page the interface has asked for since it was last asked, and what
+    /// it wanted each one narrowed to.
+    fn catalogue_asked(app: &App) -> Vec<(Listing, Filters)> {
+        app.sent()
+            .into_iter()
+            .filter_map(|request| match request {
+                Request::Catalog {
+                    listing, filters, ..
+                } => Some((listing, filters)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The genres are Crunchyroll's to name, so the list is fetched rather than written
+    /// down here - and the popup is up the moment the key is pressed, holding the one row
+    /// that is ours, rather than the key doing nothing visible while a request is out.
+    /// The answer is then kept for the run: the categories change a few times a year,
+    /// which is not between two presses of a key.
+    #[test]
+    fn the_genre_list_comes_off_the_network_and_is_asked_for_once() {
+        let mut app = app();
+        // The catalogue the interface asks for as it opens is not what is being asked
+        // about here.
+        app.sent();
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.sent(), vec![Request::FilterValues(FilterKind::Genre)]);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Genre"),
+            "the popup is up before the answer is"
+        );
+        assert!(screen.contains("All"));
+        assert!(
+            screen.contains(SPINNER[0]),
+            "a list still waiting for its rows says so along its bottom edge"
+        );
+
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        let screen = rendered(120, 30, &mut app);
+        for expected in ["All", "Action", "action", "Comedy"] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+
+        press(&mut app, KeyCode::Esc);
+        assert!(app.picker.is_none(), "esc closes the list");
+        app.sent();
+        press(&mut app, KeyCode::Char('c'));
+        assert!(
+            app.sent().is_empty(),
+            "the list was asked for a second time"
+        );
+        assert!(rendered(120, 30, &mut app).contains("Action"));
+    }
+
+    /// Choosing a genre is a different catalogue rather than the same one with rows
+    /// hidden, so the list is asked for again from the start - narrowed - and the status
+    /// line says what is now on screen, since the column changing under the cursor
+    /// without a word would read as a glitch.
+    #[test]
+    fn choosing_a_genre_asks_the_catalogue_again_and_says_what_is_showing() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.listing, Listing::Browse(0));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        app.sent();
+
+        // All is the row the list opens on while nothing is chosen, so one step down is
+        // the first genre.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.picker.is_none(), "choosing closes the list");
+        let asked = catalogue_asked(&app);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].0, Listing::Browse(0));
+        assert_eq!(
+            asked[0]
+                .1
+                .chosen(FilterKind::Genre)
+                .map(|genre| genre.value.as_str()),
+            Some("action"),
+            "the catalogue was asked for again without the genre"
+        );
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Showing Popular · Genre: Action."));
+    }
+
+    /// Taking a filter off has to be as easy as putting one on, and there is no second
+    /// key for it: All sits at the top of the same list, where the eye lands. The list
+    /// opens on what is in force, so a filter that is set is not one All is a keypress
+    /// away from by accident.
+    #[test]
+    fn all_at_the_top_of_the_list_takes_the_filter_off_again() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.filters.genre.is_some());
+        app.sent();
+
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(
+            app.picker
+                .as_ref()
+                .and_then(|picker| picker.pane.state.selected()),
+            Some(1),
+            "the list opens on the genre in force rather than at the top"
+        );
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.filters.genre.is_none(), "All did not clear the genre");
+        assert!(!app.filters.any());
+        assert_eq!(
+            catalogue_asked(&app),
+            vec![(Listing::Browse(0), Filters::default())]
+        );
+        assert!(rendered(120, 30, &mut app).contains("Showing Popular."));
+    }
+
+    /// A filter narrows the browse listings and nothing else, so one set while the
+    /// watchlist or the history is up would otherwise be a word in the header about a
+    /// list it has nothing to do with. The column goes back to the catalogue instead and
+    /// the status line says why - the one thing it must not do is take the key and look
+    /// as though nothing happened.
+    #[test]
+    fn a_filter_set_on_a_list_it_cannot_narrow_brings_the_catalogue_back() {
+        let mut app = app();
+        assert_eq!(app.listing, Listing::History, "the interface opens on this");
+        app.sent();
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.filters.simulcast);
+        assert_eq!(app.listing, Listing::Browse(0));
+        let asked = catalogue_asked(&app);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].0, Listing::Browse(0));
+        assert!(asked[0].1.simulcast);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("Showing Popular · Simulcast - the filters narrow the catalogue only."),
+            "the column moved without saying so"
+        );
+
+        // And the same key again takes it off, with the column already where it belongs.
+        press(&mut app, KeyCode::Char('u'));
+        assert!(!app.filters.simulcast);
+        assert!(rendered(120, 30, &mut app).contains("Showing Popular."));
+    }
+
+    /// The header describes what is under it, so the filters show there while a browse
+    /// listing is on screen and not while one of the account's own lists is. Each word
+    /// runs the list it was chosen from, which is where it is cleared as well as where it
+    /// was set - and a filter out of force is out of force rather than forgotten, which
+    /// is what the status line says on the way off the catalogue.
+    #[test]
+    fn the_header_names_the_filters_that_are_on_and_they_answer_to_a_click() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('u'));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Genre: Action"));
+        assert!(screen.contains("Simulcast"));
+
+        let (x, y) = middle(button(&app, Command::Genre));
+        click(&mut app, x, y);
+        assert!(
+            app.picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == Picking::Filter(FilterKind::Genre)),
+            "the word in the header opens the list it came from"
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // Round the ring to the watchlist, which no filter can narrow.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('o'));
+        }
+        assert_eq!(app.listing, Listing::Watchlist);
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            !screen.contains("Genre: Action"),
+            "the header is describing a list the filters do not touch"
+        );
+        assert!(screen.contains("Watchlist - the filters narrow the catalogue only."));
+        assert!(app.filters.any(), "out of force is not forgotten");
+
+        // And on again to the catalogue, where they are in force and shown once more.
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.listing, Listing::Browse(0));
+        assert!(rendered(120, 30, &mut app).contains("Genre: Action"));
+    }
+
+    /// The filters are half of what was asked for, so they are half of what makes an
+    /// answer stale: a page of the whole catalogue that was already on its way when the
+    /// genre was chosen is the answer to a question nobody is asking any more, and
+    /// letting it into the column would leave the header describing a narrowed catalogue
+    /// over a hundred series that are not.
+    #[test]
+    fn a_page_asked_for_before_the_filter_changed_is_dropped() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('c'));
+        app.accept(Response::FilterValues {
+            which: FilterKind::Genre,
+            result: Ok(genres()),
+        });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+
+        let page = vec![CatalogItem {
+            id: "GY8VEQ95Y".to_owned(),
+            kind: "series".to_owned(),
+            title: "Dandadan".to_owned(),
+            ..CatalogItem::default()
+        }];
+        app.accept(Response::Catalog {
+            listing: Listing::Browse(0),
+            start: 0,
+            filters: Filters::default(),
+            result: Ok(Page {
+                items: page.clone(),
+                total: None,
+                next: None,
+            }),
+        });
+        assert!(
+            app.series.items.is_empty(),
+            "the unfiltered page landed in a filtered column"
+        );
+
+        app.accept(Response::Catalog {
+            listing: Listing::Browse(0),
+            start: 0,
+            filters: app.filters.clone(),
+            result: Ok(Page {
+                items: page,
+                total: None,
+                next: None,
+            }),
+        });
+        assert_eq!(app.series.items.len(), 1, "and the right answer is taken");
     }
 
     /// How many cells in `rows` are part of a picture. Half-blocks are what the fallback
@@ -2007,9 +2325,11 @@ mod tests {
             })
             .collect();
         let listing = app.listing.clone();
+        let filters = app.filters.clone();
         app.accept(Response::Catalog {
             listing,
             start: 0,
+            filters,
             result: Ok(Page {
                 items,
                 total,
@@ -2202,6 +2522,7 @@ mod tests {
             vec![Request::Catalog {
                 listing: Listing::Browse(0),
                 start: 12,
+                filters: Filters::default(),
             }],
             "the wheel reached the end of the list and asked for nothing"
         );
@@ -2262,7 +2583,11 @@ mod tests {
 
         let (x, y) = middle(button(&app, Command::AudioLanguage));
         click(&mut app, x, y);
-        assert!(app.picker.as_ref().is_some_and(|picker| picker.audio));
+        assert!(
+            app.picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == Picking::Audio)
+        );
 
         let (bindings, warnings) = toml::from_str::<keys::Settings>("quit = \"ctrl-q\"\n")
             .expect("valid config")
