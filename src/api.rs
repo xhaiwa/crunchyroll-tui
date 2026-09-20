@@ -12,9 +12,10 @@ use uuid::Uuid;
 
 use crate::credentials::Secret;
 use crate::model::{
-    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, HistoryEntry,
-    HistoryResponse, ObjectsResponse, Playhead, PlayheadsResponse, SearchResponse, Season,
-    SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse, WatchlistEntry, WatchlistResponse,
+    BrowseResponse, CatalogItem, CategoriesResponse, Category, Episode, EpisodeInfo,
+    EpisodeMetadataResponse, HistoryEntry, HistoryResponse, ObjectsResponse, Playhead,
+    PlayheadsResponse, SearchResponse, Season, SeasonEpisode, SeasonEpisodesResponse, SeasonalTag,
+    SeasonalTagsResponse, SeasonsResponse, WatchlistEntry, WatchlistResponse,
 };
 
 const USER_AGENT_VALUE: &str =
@@ -219,6 +220,46 @@ fn playhead_urls(account_id: &str, content_ids: &[String]) -> Vec<String> {
             url.into()
         })
         .collect()
+}
+
+/// The browse request, as a URL.
+///
+/// `categories` is a slug the categories endpoint gave out and `seasonal_tag` an id the
+/// seasonal-tags endpoint did, and each is left out of the URL entirely when nothing is
+/// chosen rather than sent empty: `categories=` is a question about the category whose
+/// slug is the empty string, which no series has, and the answer to it is an empty
+/// catalogue.
+///
+/// Split out from the request for the same reason `playhead_urls` is - so that what
+/// actually goes over the wire can be read back without an account and without a
+/// network.
+fn browse_url(
+    sort_by: &str,
+    count: usize,
+    start: usize,
+    categories: Option<&str>,
+    seasonal_tag: Option<&str>,
+) -> String {
+    let mut url = reqwest::Url::parse("https://www.crunchyroll.com/content/v2/discover/browse")
+        .expect("valid browse URL");
+    let mut query = url.query_pairs_mut();
+    query
+        .append_pair("sort_by", sort_by)
+        .append_pair("type", "series")
+        .append_pair("n", &count.to_string())
+        .append_pair("start", &start.to_string())
+        .append_pair("ratings", "true")
+        .append_pair("locale", "en-US");
+    if let Some(categories) = categories.filter(|slug| !slug.is_empty()) {
+        query.append_pair("categories", categories);
+    }
+    if let Some(seasonal_tag) = seasonal_tag.filter(|id| !id.is_empty()) {
+        query.append_pair("seasonal_tag", seasonal_tag);
+    }
+    // The serializer holds the URL borrowed and writes the query as it goes, so it has
+    // to be let go of before the URL can be read back.
+    drop(query);
+    url.into()
 }
 
 impl CrunchyrollClient {
@@ -456,21 +497,39 @@ impl CrunchyrollClient {
     }
 
     /// The catalogue, in whatever order `sort_by` asks for: `popularity`,
-    /// `newly_added` or `alphabetical`.
+    /// `newly_added` or `alphabetical`, narrowed to a category and an anime season where
+    /// either was asked for.
     ///
     /// Only series are asked for. A movie listing has no seasons and no episodes
     /// endpoint, so one in the list would be a dead end for anyone who selected it.
-    pub fn browse(&self, sort_by: &str, count: usize, start: usize) -> Result<Vec<CatalogItem>> {
-        let mut url = reqwest::Url::parse("https://www.crunchyroll.com/content/v2/discover/browse")
-            .expect("valid browse URL");
-        url.query_pairs_mut()
-            .append_pair("sort_by", sort_by)
-            .append_pair("type", "series")
-            .append_pair("n", &count.to_string())
-            .append_pair("start", &start.to_string())
-            .append_pair("ratings", "true")
-            .append_pair("locale", "en-US");
-        Ok(self.get_json::<BrowseResponse>(url.as_str())?.data)
+    pub fn browse(
+        &self,
+        sort_by: &str,
+        count: usize,
+        start: usize,
+        categories: Option<&str>,
+        seasonal_tag: Option<&str>,
+    ) -> Result<Vec<CatalogItem>> {
+        let url = browse_url(sort_by, count, start, categories, seasonal_tag);
+        Ok(self.get_json::<BrowseResponse>(&url)?.data)
+    }
+
+    /// Crunchyroll's own list of categories, which is what the genre filter offers.
+    ///
+    /// Asked for rather than written down here, because the list is Crunchyroll's to
+    /// change and a slug this program had learned by heart would go on being offered for
+    /// months after it stopped meaning anything. It is the same list the website's genre
+    /// menu is drawn from.
+    pub fn categories(&self) -> Result<Vec<Category>> {
+        let url = "https://www.crunchyroll.com/content/v2/discover/categories?locale=en-US";
+        Ok(self.get_json::<CategoriesResponse>(url)?.data)
+    }
+
+    /// And the anime seasons, newest first as Crunchyroll orders them - `fall-2024` and
+    /// the forty or so before it.
+    pub fn seasonal_tags(&self) -> Result<Vec<SeasonalTag>> {
+        let url = "https://www.crunchyroll.com/content/v2/discover/seasonal_tags?locale=en-US";
+        Ok(self.get_json::<SeasonalTagsResponse>(url)?.data)
     }
 
     pub fn search(&self, query: &str, count: usize) -> Result<Vec<CatalogItem>> {
@@ -710,8 +769,8 @@ mod tests {
     use crate::model::{CatalogItem, HistoryResponse, WatchlistResponse};
 
     use super::{
-        Duration, OBJECTS_PER_REQUEST, account_id_from_jwt, build_media_client, in_asked_order,
-        object_batches, playhead_urls, series_watched, watchlist_series,
+        Duration, OBJECTS_PER_REQUEST, account_id_from_jwt, browse_url, build_media_client,
+        in_asked_order, object_batches, playhead_urls, series_watched, watchlist_series,
     };
 
     /// A JWT with `claims` as its payload, signed by nobody: the segments are what is
@@ -899,6 +958,60 @@ mod tests {
             playhead_urls("a1b2c3", &[]).is_empty(),
             "nothing to ask about is nothing to ask"
         );
+    }
+
+    /// What a narrowed catalogue actually asks for. A filter nobody has set has to leave
+    /// no trace in the URL at all: `categories=` is a question about a category whose
+    /// slug is the empty string, and the honest answer to it is an empty catalogue. The
+    /// slugs and the ids both carry hyphens, which have to arrive as part of the value
+    /// rather than as anything the URL means by itself.
+    #[test]
+    fn the_browse_url_carries_only_the_filters_that_are_set() {
+        let pairs = |url: &str| {
+            reqwest::Url::parse(url)
+                .expect("a URL")
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>()
+        };
+        let plain = browse_url("popularity", 100, 0, None, None);
+        assert!(
+            plain.starts_with("https://www.crunchyroll.com/content/v2/discover/browse?"),
+            "{plain}"
+        );
+        let asked = pairs(&plain);
+        assert!(asked.contains(&("sort_by".to_owned(), "popularity".to_owned())));
+        assert!(asked.contains(&("type".to_owned(), "series".to_owned())));
+        assert!(asked.contains(&("n".to_owned(), "100".to_owned())));
+        assert!(asked.contains(&("start".to_owned(), "0".to_owned())));
+        assert!(
+            !asked.iter().any(|(key, _)| key == "categories"),
+            "an unset filter is not a filter set to nothing: {plain}"
+        );
+        assert!(!asked.iter().any(|(key, _)| key == "seasonal_tag"));
+
+        let narrowed = browse_url(
+            "newly_added",
+            100,
+            0,
+            Some("slice-of-life"),
+            Some("fall-2024"),
+        );
+        let asked = pairs(&narrowed);
+        assert!(asked.contains(&("categories".to_owned(), "slice-of-life".to_owned())));
+        assert!(asked.contains(&("seasonal_tag".to_owned(), "fall-2024".to_owned())));
+
+        // The cleared filter is an empty string on its way through the interface, and it
+        // has to read as "no category" here rather than as one nothing belongs to.
+        let cleared = pairs(&browse_url(
+            "popularity",
+            100,
+            0,
+            Some(""),
+            Some("fall-2024"),
+        ));
+        assert!(!cleared.iter().any(|(key, _)| key == "categories"));
+        assert!(cleared.contains(&("seasonal_tag".to_owned(), "fall-2024".to_owned())));
     }
 
     /// Serves one request: the headers for a `promised`-byte body, then `sent` of those

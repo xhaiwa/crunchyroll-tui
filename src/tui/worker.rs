@@ -5,7 +5,7 @@ use std::thread;
 
 use crate::api::CrunchyrollClient;
 use crate::download::{DownloadOptions, Progress, download_episode, episode_info};
-use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Category, Playhead, Season, SeasonEpisode, SeasonalTag};
 
 use super::SORTS;
 
@@ -52,6 +52,169 @@ impl Listing {
     }
 }
 
+/// One row of a list the user picks from: what Crunchyroll is told, and what the user
+/// reads.
+///
+/// The two travel together because the lists behind the filters are localised on
+/// Crunchyroll's side. Nothing here could turn `slice-of-life` back into `Slice of Life`
+/// in the language the account reads in, so the words are kept beside the value from the
+/// moment they arrive - which also means a filter goes on saying what it is in the
+/// header long after the list it was chosen from has been closed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Choice {
+    pub value: String,
+    pub label: String,
+}
+
+/// Which of the two filters that take their value from a list Crunchyroll keeps.
+///
+/// The simulcast filter is not one of them: it is a yes or a no, it has no list behind
+/// it, and nothing is fetched to offer it - see [`Filters::sieve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FilterKind {
+    Genre,
+    Season,
+}
+
+impl FilterKind {
+    /// What the popup that offers the values is called.
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Genre => " Genre ",
+            Self::Season => " Anime season ",
+        }
+    }
+
+    /// And what the header calls the filter, in front of the value chosen for it.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Genre => "Genre",
+            Self::Season => "Season",
+        }
+    }
+}
+
+/// What the catalogue is narrowed by.
+///
+/// These narrow the browse listings and nothing else, because that is the only place
+/// they can mean anything: the watchlist and the history are the account's own lists,
+/// asked for by account rather than by question, and a search takes a query instead. Two
+/// of the three could not be put to them at all - there is no way to ask the watchlist
+/// for the comedies - and the third could, since `is_simulcast` is on every row of every
+/// list. It is not, deliberately: a filter that narrows two of the five lists and leaves
+/// the other three alone is a rule nobody can hold in their head, where one that narrows
+/// the catalogue is a rule that fits in a sentence.
+///
+/// So setting a filter puts the column back on the browse order last in use, and the
+/// header shows the filters only while a browse listing is on screen. The whole of that
+/// decision is written out on `App::choose_filter`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filters {
+    pub genre: Option<Choice>,
+    pub season: Option<Choice>,
+    /// Whether only the series Crunchyroll calls simulcasts are shown.
+    pub simulcast: bool,
+}
+
+impl Filters {
+    pub fn chosen(&self, which: FilterKind) -> Option<&Choice> {
+        match which {
+            FilterKind::Genre => self.genre.as_ref(),
+            FilterKind::Season => self.season.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, which: FilterKind, chosen: Option<Choice>) {
+        match which {
+            FilterKind::Genre => self.genre = chosen,
+            FilterKind::Season => self.season = chosen,
+        }
+    }
+
+    /// Whether anything is narrowing the catalogue at all.
+    pub const fn any(&self) -> bool {
+        self.genre.is_some() || self.season.is_some() || self.simulcast
+    }
+
+    /// What the header prints for one of the two filters that take a value, and nothing
+    /// for one that is not set: a header saying `Genre: All` would be a word spent on
+    /// the absence of a filter.
+    pub fn word(&self, which: FilterKind) -> Option<String> {
+        self.chosen(which)
+            .map(|chosen| format!("{}: {}", which.word(), chosen.label))
+    }
+
+    /// Every filter that is on, in one phrase, for the status line to say what is being
+    /// shown with. Empty when none of them is, which is the caller's cue to say only
+    /// which list it is showing.
+    pub fn summary(&self) -> String {
+        [
+            self.word(FilterKind::Genre),
+            self.word(FilterKind::Season),
+            self.simulcast.then(|| "Simulcast".to_owned()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    }
+
+    /// The simulcast filter, which is a sieve held under the answer rather than part of
+    /// the question.
+    ///
+    /// Browse takes a category and a seasonal tag and has nothing at all for this, so
+    /// the only way to offer it is to ask for a page and throw away what is not a
+    /// simulcast. That costs exactly what it sounds like: a page of a hundred holding
+    /// eleven simulcasts is a column of eleven series rather than the hundred the other
+    /// filters would have left, and a page deep into an alphabetical catalogue can come
+    /// back empty while the catalogue behind it is not. The alternative was not offering
+    /// the filter at all, and a short page is a smaller loss than a filter that would
+    /// have been used every season.
+    pub fn sieve(&self, items: Vec<CatalogItem>) -> Vec<CatalogItem> {
+        if !self.simulcast {
+            return items;
+        }
+        items
+            .into_iter()
+            .filter(|item| item.series_metadata.is_simulcast)
+            .collect()
+    }
+}
+
+/// One row of a filter's value list, or nothing where there can be no row.
+///
+/// A category or a season Crunchyroll names no slug or id for is one browse cannot be
+/// asked about, so it is dropped rather than offered as a row that narrows nothing. One
+/// it has no localised title for keeps its slug as its words: `slice-of-life` reads well
+/// enough to pick out of a list, where a blank row reads as a bug.
+fn offer(value: String, title: String) -> Option<Choice> {
+    (!value.is_empty()).then(|| Choice {
+        label: if title.is_empty() {
+            value.clone()
+        } else {
+            title
+        },
+        value,
+    })
+}
+
+/// The genre list, out of what the categories endpoint answered with.
+fn genre_choices(categories: Vec<Category>) -> Vec<Choice> {
+    categories
+        .into_iter()
+        .filter_map(|category| offer(category.slug, category.localization.title))
+        .collect()
+}
+
+/// And the seasons, kept in the order Crunchyroll listed them rather than sorted here.
+/// Newest first is what that order is, and it is the one the list wants: the season on
+/// the air is the one somebody filtering by season is nearly always after.
+fn season_choices(tags: Vec<SeasonalTag>) -> Vec<Choice> {
+    tags.into_iter()
+        .filter_map(|tag| offer(tag.id, tag.localization.title))
+        .collect()
+}
+
 /// One episode on its way to disk: what to fetch, under what number, and the options to
 /// fetch it with.
 #[derive(Debug)]
@@ -82,7 +245,14 @@ impl Eq for Queued {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
-    Catalog(Listing),
+    /// A page of the catalogue: which list, and what it is narrowed by. The filters
+    /// travel with every one of them, including the lists they do not narrow, so that
+    /// the answer can carry them back and be told apart from the answer to the question
+    /// the user asked before this one.
+    Catalog { listing: Listing, filters: Filters },
+    /// The values one of the two list filters offers. Fetched rather than written down:
+    /// the categories and the seasons are Crunchyroll's to change.
+    FilterValues(FilterKind),
     Seasons {
         series_id: String,
         audio: String,
@@ -130,7 +300,15 @@ pub enum Request {
 pub enum Response {
     Catalog {
         listing: Listing,
+        /// What the page was asked for narrowed to. A filter changed while a page was
+        /// in flight makes this the answer to a question the user has moved on from,
+        /// which is what the interface checks it against.
+        filters: Filters,
         result: Result<Vec<CatalogItem>, String>,
+    },
+    FilterValues {
+        which: FilterKind,
+        result: Result<Vec<Choice>, String>,
     },
     Seasons {
         series_id: String,
@@ -322,15 +500,38 @@ impl Worker {
         thread::spawn(move || {
             for request in inbox {
                 let response = match request {
-                    Request::Catalog(listing) => {
+                    Request::Catalog { listing, filters } => {
+                        // The one place the filters are in force. The other three
+                        // lists are asked for exactly as they were before there were
+                        // any filters at all - see `Filters` for why they are not
+                        // narrowed here instead.
                         let result = match &listing {
-                            Listing::Browse(sort) => client.browse(SORTS[*sort].0, CATALOG_PAGE, 0),
+                            Listing::Browse(sort) => client
+                                .browse(
+                                    SORTS[*sort].0,
+                                    CATALOG_PAGE,
+                                    0,
+                                    filters.genre.as_ref().map(|genre| genre.value.as_str()),
+                                    filters.season.as_ref().map(|season| season.value.as_str()),
+                                )
+                                .map(|items| filters.sieve(items)),
                             Listing::Search(query) => client.search(query, CATALOG_PAGE),
                             Listing::Watchlist => client.watchlist(CATALOG_PAGE),
                             Listing::History => client.history(CATALOG_PAGE),
                         };
                         Response::Catalog {
                             listing,
+                            filters,
+                            result: result.map_err(|error| format!("{error:#}")),
+                        }
+                    }
+                    Request::FilterValues(which) => {
+                        let result = match which {
+                            FilterKind::Genre => client.categories().map(genre_choices),
+                            FilterKind::Season => client.seasonal_tags().map(season_choices),
+                        };
+                        Response::FilterValues {
+                            which,
                             result: result.map_err(|error| format!("{error:#}")),
                         }
                     }
@@ -476,7 +677,12 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::{Listing, SORTS, playhead_notice, watchlist_notice};
+    use crate::model::{Category, Localization, SeasonalTag, SeriesMetadata};
+
+    use super::{
+        CatalogItem, Choice, FilterKind, Filters, Listing, SORTS, genre_choices, playhead_notice,
+        season_choices, watchlist_notice,
+    };
 
     /// What the order key walks through. The browse orders come first and the account's
     /// own lists after them, and the ring closes: the last list leads back to the first
@@ -543,5 +749,139 @@ mod tests {
         );
         assert_eq!(playhead_notice("E4", 1461), "Marked E4 watched");
         assert_eq!(playhead_notice("E4", 0), "Marked E4 unwatched");
+    }
+
+    /// The values Crunchyroll offers, turned into rows the interface can show. A row it
+    /// gives no slug or id for is one browse could not be asked about, and a row with no
+    /// localised title still has its slug to go by - which is a word, where a blank row
+    /// is a bug.
+    #[test]
+    fn a_filter_offers_only_the_values_browse_can_be_asked_for() {
+        let named = |title: &str| Localization {
+            title: title.to_owned(),
+        };
+        let genres = genre_choices(vec![
+            Category {
+                slug: "action".to_owned(),
+                localization: named("Action"),
+            },
+            Category {
+                slug: "slice-of-life".to_owned(),
+                localization: Localization::default(),
+            },
+            Category::default(),
+        ]);
+        assert_eq!(genres.len(), 2, "the row with no slug is not offered");
+        assert_eq!(genres[0].value, "action");
+        assert_eq!(genres[0].label, "Action");
+        assert_eq!(
+            genres[1].label, "slice-of-life",
+            "a row with no title keeps its slug for words"
+        );
+
+        let seasons = season_choices(vec![
+            SeasonalTag {
+                id: "fall-2024".to_owned(),
+                localization: named("Fall 2024"),
+            },
+            SeasonalTag::default(),
+        ]);
+        assert_eq!(seasons.len(), 1);
+        assert_eq!(seasons[0].value, "fall-2024");
+        assert_eq!(seasons[0].label, "Fall 2024");
+    }
+
+    /// The simulcast filter is the one that cannot be part of the question, so it has to
+    /// be right about the answer: everything Crunchyroll calls a simulcast stays, and
+    /// nothing else does. A page that comes back mostly not simulcast is a short column,
+    /// which is the price of the filter and is pinned here so that nobody reads a short
+    /// page as a bug.
+    #[test]
+    fn the_simulcast_filter_sieves_the_page_it_was_given() {
+        let page: Vec<CatalogItem> = ["Frieren", "An Old Favourite", "Dandadan"]
+            .iter()
+            .enumerate()
+            .map(|(index, title)| CatalogItem {
+                id: format!("G{index}"),
+                title: (*title).to_owned(),
+                series_metadata: SeriesMetadata {
+                    is_simulcast: index != 1,
+                    ..SeriesMetadata::default()
+                },
+                ..CatalogItem::default()
+            })
+            .collect();
+
+        let off = Filters::default();
+        assert_eq!(
+            off.sieve(page.clone()).len(),
+            3,
+            "nothing asked, nothing cut"
+        );
+
+        let on = Filters {
+            simulcast: true,
+            ..Filters::default()
+        };
+        let kept: Vec<String> = on
+            .sieve(page)
+            .into_iter()
+            .map(|series| series.title)
+            .collect();
+        assert_eq!(kept, ["Frieren", "Dandadan"]);
+        assert!(
+            on.sieve(Vec::new()).is_empty(),
+            "a page with nothing simulcast in it is an empty column, not an error"
+        );
+    }
+
+    /// What the header and the status line are built out of. Each filter says which one
+    /// it is as well as what it is set to, because `Fall 2024` on its own is a season to
+    /// anyone who knows the seasons and a mystery to anyone who does not - and a filter
+    /// that is off says nothing at all rather than spending a word on its own absence.
+    #[test]
+    fn the_filters_say_which_one_they_are_and_what_they_are_set_to() {
+        let mut filters = Filters::default();
+        assert!(!filters.any());
+        assert_eq!(filters.summary(), "");
+        assert_eq!(filters.word(FilterKind::Genre), None);
+
+        filters.set(
+            FilterKind::Genre,
+            Some(Choice {
+                value: "action".to_owned(),
+                label: "Action".to_owned(),
+            }),
+        );
+        assert!(filters.any());
+        assert_eq!(
+            filters.word(FilterKind::Genre).as_deref(),
+            Some("Genre: Action")
+        );
+        assert_eq!(filters.summary(), "Genre: Action");
+
+        filters.set(
+            FilterKind::Season,
+            Some(Choice {
+                value: "fall-2024".to_owned(),
+                label: "Fall 2024".to_owned(),
+            }),
+        );
+        filters.simulcast = true;
+        assert_eq!(
+            filters.summary(),
+            "Genre: Action · Season: Fall 2024 · Simulcast"
+        );
+
+        // And clearing one takes its words with it.
+        filters.set(FilterKind::Genre, None);
+        assert_eq!(filters.summary(), "Season: Fall 2024 · Simulcast");
+        assert_eq!(filters.chosen(FilterKind::Genre), None);
+        assert_eq!(
+            filters
+                .chosen(FilterKind::Season)
+                .map(|chosen| chosen.value.as_str()),
+            Some("fall-2024")
+        );
     }
 }

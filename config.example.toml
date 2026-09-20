@@ -243,6 +243,15 @@ search = "/"
 order = "o"
 reload = "r"
 
+# Narrowing the catalogue. `genre` and `anime-season` open a list of what
+# Crunchyroll offers, with All at the top of it to take the filter off again;
+# `simulcast` is a yes or a no and needs no list. All three narrow the browse
+# listings only - set one while the watchlist, the history or a search is up and
+# the column goes back to the catalogue, which is the only list they can narrow.
+genre = "c"
+anime-season = "n"
+simulcast = "u"
+
 # Getting an episode. The season forms take everything from the cursor down for
 # playing, and the whole season for the download queue. `mark` covers the case
 # in between: put a mark on as many episodes of the open season as you like and
