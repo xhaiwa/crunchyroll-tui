@@ -6,7 +6,7 @@ pub mod theme;
 mod ui;
 mod worker;
 
-use std::io::{self, Write, stdout};
+use std::io::stdout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -156,15 +156,6 @@ fn event_loop(
                         report(&mut app, outcome, "Playback");
                         break;
                     }
-                    Action::Download(episodes) => {
-                        let options = app.options.clone();
-                        let outcome =
-                            suspend(terminal, mouse, || download(client, &options, &episodes));
-                        app.art.forget();
-                        app.forget_layout();
-                        report(&mut app, outcome, "Download");
-                        break;
-                    }
                 }
                 if !event::poll(Duration::ZERO).context("wait for a key")? {
                     break;
@@ -188,16 +179,19 @@ fn report(app: &mut App, outcome: Result<String>, what: &str) {
     }
 }
 
-/// Hands the terminal back to whatever needs to draw on it - mpv, or a progress bar -
-/// and takes it again afterwards. Whatever had it may have cleared the artwork the
-/// terminal was holding on our behalf, so the caller drops what it had encoded.
+/// Hands the terminal back to mpv and takes it again afterwards. mpv may have cleared
+/// the artwork the terminal was holding on our behalf, so the caller drops what it had
+/// encoded.
+///
+/// Playing is the only thing left that wants the terminal. A download used to take it
+/// too, for an hour of indicatif bars with the whole interface frozen behind them; it
+/// now runs on the queue's own thread and draws into a panel, which is what this exists
+/// to make possible rather than something it has to arrange.
 ///
 /// The pointer stops being reported for the whole of it, and before raw mode goes rather
 /// than after. mpv is given this terminal's stdin so that its own keys work, and an SGR
 /// report is `^[[<0;40;12M` - in which `<` and `>` are mpv's previous and next file. A
-/// mouse merely moved during playback would otherwise skip episodes. The prompt after a
-/// download reads a line off the same stdin, and would be handed escape sequences that
-/// never contain the newline it is waiting for.
+/// mouse merely moved during playback would otherwise skip episodes.
 ///
 /// The panic hook ratatui installs is set up once, by `try_init`, so the screen is
 /// re-entered by hand rather than by initialising a second time.
@@ -251,36 +245,5 @@ fn play(
     Ok(match episodes {
         [single] => format!("Played {}", single.title),
         _ => format!("Played {} episodes", episodes.len()),
-    })
-}
-
-fn download(
-    client: &CrunchyrollClient,
-    options: &DownloadOptions,
-    episodes: &[SeasonEpisode],
-) -> Result<String> {
-    let options = DownloadOptions {
-        play: false,
-        ..options.clone()
-    };
-    let mut failed = 0;
-    for episode in episodes {
-        let info = episode_info(episode);
-        // One episode that cannot be had is not a reason to drop the rest of a season,
-        // which is what the command line does too.
-        if let Err(error) = download_episode(client, &episode.id, &info, &options) {
-            failed += 1;
-            eprintln!(
-                "Failed to download episode {}: {error:#}",
-                episode.episode_number
-            );
-        }
-    }
-    println!("\nPress Enter to go back to the catalogue.");
-    let _ = io::stdout().flush();
-    let _ = io::stdin().read_line(&mut String::new());
-    Ok(match (episodes.len(), failed) {
-        (_, 0) => format!("Downloaded {} episode(s)", episodes.len()),
-        (total, failed) => format!("Downloaded {} of {total} episodes", total - failed),
     })
 }

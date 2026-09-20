@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::api::CrunchyrollClient;
+use crate::download::{DownloadOptions, Progress, download_episode, episode_info};
 use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 
 use super::SORTS;
@@ -49,6 +52,34 @@ impl Listing {
     }
 }
 
+/// One episode on its way to disk: what to fetch, under what number, and the options to
+/// fetch it with.
+#[derive(Debug)]
+pub struct Queued {
+    /// Which download this is. The answers about it arrive long after the request went
+    /// out and name it by this rather than by what it is, because the queue is a list
+    /// the user can take rows out of and titles repeat where numbers do not.
+    pub id: usize,
+    pub episode: SeasonEpisode,
+    /// Taken when the download was asked for rather than read when it starts. The
+    /// interface goes on being used while the queue works through an hour of episodes,
+    /// and the quality and the languages showing along the top by then are the next
+    /// download's, not this one's.
+    pub options: DownloadOptions,
+}
+
+/// Two downloads are the same request when they were queued under the same number,
+/// which is the whole of what identifies one. Written out rather than derived because
+/// the options behind it carry the callbacks a run reports through, and a box holding a
+/// closure has nothing to compare.
+impl PartialEq for Queued {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Queued {}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
     Catalog(Listing),
@@ -87,6 +118,11 @@ pub enum Request {
         season_id: String,
         episode_ids: Vec<String>,
     },
+    /// One episode to write to disk. It leaves through the same `send` as everything
+    /// else and lands on a thread of its own: see [`Worker`]. Boxed because it is much
+    /// the largest thing this enum can hold - an episode and a whole set of options -
+    /// and every other request would otherwise be that size too.
+    Download(Box<Queued>),
 }
 
 /// Answers carry back what was asked for, so an answer to a question the user has
@@ -113,6 +149,29 @@ pub enum Response {
     /// the whole of what the user is told about it and it has to say what happened to
     /// what - which is why the answer carries the words rather than the ids.
     Account { result: Result<String, String> },
+    /// How a queued download is getting on. `id` is the number the request was given,
+    /// because the row it belongs to may have moved or gone by the time this arrives -
+    /// an answer that named the episode would find the wrong one in a queue holding the
+    /// same episode twice.
+    Download { id: usize, update: Update },
+}
+
+/// What becomes of one queued episode, in the order it happens to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Update {
+    /// It has reached the front of the queue and the thread has started on it.
+    Started,
+    /// Which part of the episode is moving and how far it has got, as
+    /// [`Progress::Stage`] gives it.
+    Stage {
+        stage: String,
+        done: u64,
+        total: u64,
+    },
+    /// It is over, one way or the other. A failure carries the reason, because that is
+    /// all the user will ever see of it: the download thread has no terminal to print
+    /// a backtrace to.
+    Finished(Result<(), String>),
 }
 
 /// What the status line says once the watchlist has changed.
@@ -139,22 +198,124 @@ fn playhead_notice(label: &str, seconds: u32) -> String {
 /// How many series one catalogue page holds. Crunchyroll caps `n` at 100.
 const CATALOG_PAGE: usize = 100;
 
+/// The queue: episodes written to disk one after another, on a thread that nothing else
+/// waits on.
+///
+/// Each one runs with the options it was queued with, with two things settled here. It
+/// writes a file rather than playing, whatever the run was started as - the queue is
+/// what `d` means and mpv is what `p` means. And it is given a reporter, which is what
+/// makes a download something that can happen while the interface is on screen: with
+/// one set, nothing in `download.rs` prints a line or draws a bar, and every step of it
+/// arrives here as a [`Progress`] to be passed on as an answer like any other.
+///
+/// A download that fails takes the episode with it and nothing else. The queue is a
+/// list of things the user asked for separately, and an episode Crunchyroll will not
+/// hand over is no reason to drop the nine behind it.
+fn spawn_downloads(
+    client: CrunchyrollClient,
+    outbox: Sender<Response>,
+    abandoned: Arc<Mutex<HashSet<usize>>>,
+) -> Sender<Queued> {
+    let (downloads, queue) = channel::<Queued>();
+    thread::spawn(move || {
+        for job in queue {
+            let Queued {
+                id,
+                episode,
+                options,
+            } = job;
+            // Dropped from the panel while it waited here. Nothing was started, so
+            // nothing is said about it: the row it would have answered to is gone.
+            if abandoned
+                .lock()
+                .expect("abandoned downloads poisoned")
+                .remove(&id)
+            {
+                continue;
+            }
+            if outbox
+                .send(Response::Download {
+                    id,
+                    update: Update::Started,
+                })
+                .is_err()
+            {
+                break;
+            }
+            let reporter = Sender::clone(&outbox);
+            let options = DownloadOptions {
+                play: false,
+                reporter: Some(Arc::new(move |progress| {
+                    // The sentences are written for a terminal being scrolled past -
+                    // every locale asked for, every one that was not there - and the
+                    // queue draws one row per episode, which the stage is a better use
+                    // of. So the words are let go of here and the numbers go on.
+                    if let Progress::Stage { stage, done, total } = progress {
+                        let _ = reporter.send(Response::Download {
+                            id,
+                            update: Update::Stage { stage, done, total },
+                        });
+                    }
+                })),
+                ..options
+            };
+            let info = episode_info(&episode);
+            let result = download_episode(&client, &episode.id, &info, &options)
+                .map_err(|error| format!("{error:#}"));
+            if outbox
+                .send(Response::Download {
+                    id,
+                    update: Update::Finished(result),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    downloads
+}
+
 /// The API client is blocking and the interface has to stay responsive, so every
-/// request runs on this thread and comes back through a channel.
+/// request runs off the interface's thread and comes back through a channel.
+///
+/// Two threads rather than one, because the work is two shapes. Browsing is a string of
+/// short questions - a catalogue page, a season, a set of playheads - which one thread
+/// answers one after another with nothing lost by the ordering. A download is an hour,
+/// and queueing one behind the other kind would be an hour in which no column could be
+/// filled and no language changed. So downloads get a queue of their own, in the order
+/// they were asked for and one episode at a time: a single download is already as
+/// parallel inside as the connection can take, and running two of them at once only
+/// splits the same pipe in half.
+///
+/// Both threads answer down the same channel, since the interface reads it in one place
+/// and every answer says what it was for.
 pub struct Worker {
     requests: Sender<Request>,
+    downloads: Sender<Queued>,
+    /// The numbers of downloads dropped from the panel before they began. A request
+    /// already on the queue's channel cannot be taken off it again, and a message sent
+    /// after it would arrive behind the download it was meant to stop - so what has
+    /// been dropped is written down where the thread looks before it starts the next
+    /// one.
+    abandoned: Arc<Mutex<HashSet<usize>>>,
     responses: Receiver<Response>,
     /// The far end of a detached worker's channel, held open so a test can read back
     /// what the interface asked for. A command that only sends leaves no other trace,
     /// and which item it picked is the whole of what there is to check.
     #[cfg(test)]
     inbox: Option<Receiver<Request>>,
+    /// And the same for the queue, which is the other place a command ends up.
+    #[cfg(test)]
+    queue: Option<Receiver<Queued>>,
 }
 
 impl Worker {
     pub fn spawn(client: CrunchyrollClient) -> Self {
         let (requests, inbox) = channel::<Request>();
         let (outbox, responses) = channel::<Response>();
+        let abandoned = Arc::new(Mutex::new(HashSet::new()));
+        let downloads = spawn_downloads(client.clone(), outbox.clone(), Arc::clone(&abandoned));
         // The thread ends when the app drops its end of the channel, and a request that
         // is still in flight then finishes into a closed channel rather than blocking
         // the quit.
@@ -233,6 +394,10 @@ impl Worker {
                             result: result.map_err(|error| format!("{error:#}")),
                         }
                     }
+                    // Sent, never received: `send` puts these on the download thread's
+                    // channel instead of this one, which is the whole point of there
+                    // being two of them.
+                    Request::Download(_) => continue,
                 };
                 if outbox.send(response).is_err() {
                     break;
@@ -241,9 +406,13 @@ impl Worker {
         });
         Self {
             requests,
+            downloads,
+            abandoned,
             responses,
             #[cfg(test)]
             inbox: None,
+            #[cfg(test)]
+            queue: None,
         }
     }
 
@@ -253,25 +422,51 @@ impl Worker {
     #[cfg(test)]
     pub fn detached() -> Self {
         let (requests, inbox) = channel::<Request>();
+        let (downloads, queue) = channel::<Queued>();
         let (_, responses) = channel::<Response>();
         Self {
             requests,
+            downloads,
+            abandoned: Arc::new(Mutex::new(HashSet::new())),
             responses,
             inbox: Some(inbox),
+            queue: Some(queue),
         }
     }
 
-    /// Everything sent since this was last asked.
+    /// Everything sent since this was last asked, the downloads after the rest. The two
+    /// go down channels of their own, so nothing here can say which came first - and no
+    /// command sends both.
     #[cfg(test)]
     pub fn sent(&self) -> Vec<Request> {
-        match &self.inbox {
+        let mut sent: Vec<Request> = match &self.inbox {
             Some(inbox) => inbox.try_iter().collect(),
             None => Vec::new(),
+        };
+        if let Some(queue) = &self.queue {
+            sent.extend(queue.try_iter().map(|job| Request::Download(Box::new(job))));
         }
+        sent
     }
 
     pub fn send(&self, request: Request) {
-        let _ = self.requests.send(request);
+        match request {
+            Request::Download(job) => {
+                let _ = self.downloads.send(*job);
+            }
+            request => {
+                let _ = self.requests.send(request);
+            }
+        }
+    }
+
+    /// Forgets a download that has not started yet. See `abandoned` above for why it is
+    /// written down rather than sent.
+    pub fn abandon(&self, id: usize) {
+        self.abandoned
+            .lock()
+            .expect("abandoned downloads poisoned")
+            .insert(id);
     }
 
     pub fn try_recv(&self) -> Option<Response> {
