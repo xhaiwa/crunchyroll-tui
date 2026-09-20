@@ -182,6 +182,32 @@ pub struct SeasonEpisodesResponse {
     pub data: Vec<SeasonEpisode>,
 }
 
+/// How far into one episode the account has got, and whether it has seen the end of it.
+///
+/// Crunchyroll keeps this against the account rather than against the device, which is
+/// the whole reason it is worth reading: the number the web player writes when its tab
+/// closes is the number this client opens on, and the number written here while mpv
+/// plays is the one the phone picks up on the train. None of it is local state.
+///
+/// Neither `playhead` nor `fully_watched` can be counted on to be there. Entries come
+/// back with a null in place of one and without the other entirely, which is the same
+/// treatment every other optional field in this file already gets.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Playhead {
+    #[serde(default)]
+    pub content_id: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub playhead: u32,
+    #[serde(default, deserialize_with = "null_default")]
+    pub fully_watched: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlayheadsResponse {
+    #[serde(default)]
+    pub data: Vec<Playhead>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Season {
     pub id: String,
@@ -265,7 +291,7 @@ pub struct SearchResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{Episode, SeasonEpisode, SeasonEpisodesResponse};
+    use super::{Episode, PlayheadsResponse, SeasonEpisode, SeasonEpisodesResponse};
 
     #[test]
     fn accepts_all_playback_error_shapes() {
@@ -340,5 +366,32 @@ mod tests {
         assert_eq!(episodes[0].episode_number, 0);
         assert_eq!(episodes[0].title, "");
         assert_eq!(episodes[1].duration_ms, 1_461_000);
+    }
+
+    /// The answer decides whether a row is marked and where mpv opens, so one odd entry
+    /// in a season must not cost the other twenty-five. An episode nobody has opened
+    /// comes back without a position at all, and `fully_watched` is missing about as
+    /// often as it is null.
+    #[test]
+    fn reads_a_playhead_however_little_of_it_is_there() {
+        let json = r#"{"data":[
+            {"content_id":"GZ7UV8KWZ","playhead":842,"fully_watched":false,
+             "last_modified":"2026-05-01T10:11:12Z"},
+            {"content_id":"G2","playhead":1400,"fully_watched":true},
+            {"content_id":"G3","playhead":12,"fully_watched":null},
+            {"content_id":"G4"}
+        ]}"#;
+        let playheads = serde_json::from_str::<PlayheadsResponse>(json)
+            .unwrap()
+            .data;
+        assert_eq!(playheads[0].content_id, "GZ7UV8KWZ");
+        assert_eq!(playheads[0].playhead, 842);
+        assert!(!playheads[0].fully_watched);
+        assert!(playheads[1].fully_watched);
+        assert!(!playheads[2].fully_watched, "a null is not a yes");
+        assert_eq!(
+            playheads[3].playhead, 0,
+            "an episode with no position is one at the start of it"
+        );
     }
 }

@@ -2,7 +2,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
 use crate::api::CrunchyrollClient;
-use crate::model::{CatalogItem, Season, SeasonEpisode};
+use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 
 use super::SORTS;
 
@@ -35,6 +35,13 @@ pub enum Request {
         audio: String,
         subs: String,
     },
+    /// How far the account has got into each of a season's episodes. The season travels
+    /// with the ids so that the answer can be checked against the column that is open by
+    /// the time it arrives, the way every other answer here is.
+    Playheads {
+        season_id: String,
+        episode_ids: Vec<String>,
+    },
 }
 
 /// Answers carry back what was asked for, so an answer to a question the user has
@@ -51,6 +58,10 @@ pub enum Response {
     Episodes {
         season_id: String,
         result: Result<Vec<SeasonEpisode>, String>,
+    },
+    Playheads {
+        season_id: String,
+        result: Result<Vec<Playhead>, String>,
     },
 }
 
@@ -102,6 +113,16 @@ impl Worker {
                     } => {
                         let result = client.season_episodes(&season_id, &audio, &subs);
                         Response::Episodes {
+                            season_id,
+                            result: result.map_err(|error| format!("{error:#}")),
+                        }
+                    }
+                    Request::Playheads {
+                        season_id,
+                        episode_ids,
+                    } => {
+                        let result = client.playheads(&episode_ids);
+                        Response::Playheads {
                             season_id,
                             result: result.map_err(|error| format!("{error:#}")),
                         }

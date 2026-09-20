@@ -22,7 +22,7 @@ use clap::{ArgGroup, Parser};
 use crate::api::CrunchyrollClient;
 use crate::config::OneOrMany;
 use crate::credentials::Secret;
-use crate::download::{DownloadOptions, download_episode, download_season};
+use crate::download::{DownloadOptions, download_episode, download_season, playing_options};
 use crate::util::{parse_langs, parse_url};
 
 #[derive(Debug, Parser)]
@@ -147,7 +147,19 @@ fn process_url(
 
     if content_type == "watch" {
         let info = client.episode_info(&content_id)?;
-        download_episode(client, &content_id, &info, opts)
+        // The same feature the interface has, on the command line: where to pick the
+        // episode up, and the position reported back while mpv has it. The metadata an
+        // episode URL comes with carries no running time, so the playhead is taken at its
+        // word - see `resume_at`.
+        let episode_options = opts
+            .play
+            .then(|| playing_options(client, opts, &content_id, 0));
+        download_episode(
+            client,
+            &content_id,
+            &info,
+            episode_options.as_ref().unwrap_or(opts),
+        )
     } else {
         let primary_audio = opts
             .audio_langs
@@ -253,6 +265,10 @@ fn run() -> Result<()> {
         } else {
             cli.mpv_arg.clone()
         },
+        // Both of these are about one episode, so they are filled in for each episode
+        // that plays rather than here - see `playing_options`.
+        start_at: None,
+        playhead: None,
     };
     // The terminal can only be asked what it draws once it is not about to be handed to
     // something else, and the interface asks on its own account when it opens, so a run

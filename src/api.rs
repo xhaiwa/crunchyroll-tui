@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::credentials::Secret;
 use crate::model::{
-    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, SearchResponse,
-    Season, SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse,
+    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, Playhead,
+    PlayheadsResponse, SearchResponse, Season, SeasonEpisode, SeasonEpisodesResponse,
+    SeasonsResponse,
 };
 
 const USER_AGENT_VALUE: &str =
@@ -43,6 +44,14 @@ const API_TIMEOUT: Duration = Duration::from_secs(30);
 /// take it as a deadline for the entire body, so media bodies wanted in one piece are
 /// read through `download::read_body` rather than through those.
 const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many content ids one playheads request carries.
+///
+/// The ids are asked for in the query string, and a season of a long-running series is
+/// hundreds of them - more URL than any server promises to read. A hundred keeps a
+/// request well inside what is safe everywhere and still asks about the season anybody
+/// is actually looking at in a single round trip.
+const PLAYHEAD_CHUNK: usize = 100;
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -122,6 +131,31 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The requests one playheads lookup turns into: one per chunk of ids.
+///
+/// The list goes in through `query_pairs_mut` rather than being pasted into the URL by
+/// hand, because a comma written raw is the URL saying something about its own shape
+/// rather than the value saying something about its ids. Escaped, it arrives as the one
+/// separator the endpoint is looking for.
+///
+/// Split out from the request so the chunking can be checked without an account and
+/// without a network.
+fn playhead_urls(account_id: &str, content_ids: &[String]) -> Vec<String> {
+    content_ids
+        .chunks(PLAYHEAD_CHUNK)
+        .map(|chunk| {
+            let mut url = reqwest::Url::parse(&format!(
+                "https://www.crunchyroll.com/content/v2/{account_id}/playheads"
+            ))
+            .expect("valid playheads URL");
+            url.query_pairs_mut()
+                .append_pair("locale", "en-US")
+                .append_pair("content_ids", &chunk.join(","));
+            url.into()
+        })
+        .collect()
+}
+
 impl CrunchyrollClient {
     pub fn new(etp_rt: Secret, debug: bool) -> Result<Self> {
         let client = Self {
@@ -143,6 +177,13 @@ impl CrunchyrollClient {
     pub fn with_notices(mut self, notice: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         self.notice = notice;
         self
+    }
+
+    /// Says something wherever this client's own commentary goes: printed, or collected
+    /// for the status line. What goes wrong reporting a playback position is news of
+    /// exactly that kind, and the thread it goes wrong on has nowhere else to put it.
+    pub fn notice(&self, message: &str) {
+        (self.notice)(message);
     }
 
     fn refresh_access_token(&self) -> Result<()> {
@@ -205,10 +246,6 @@ impl CrunchyrollClient {
     /// An error rather than an empty string: the endpoints that need it put it in the
     /// path, and one built around an empty id asks about an account that does not exist
     /// and comes back with a 404 that says nothing about why.
-    // Nothing calls this yet. It is the piece every account endpoint is addressed by,
-    // and it lands first so the watchlist, the history and the playheads each arrive as
-    // the feature they are rather than dragging their own copy of the login with them.
-    #[allow(dead_code)]
     pub fn account_id(&self) -> Result<String> {
         let account_id = self
             .account_id
@@ -321,6 +358,46 @@ impl CrunchyrollClient {
             "https://www.crunchyroll.com/content/v2/cms/seasons/{id}/episodes?preferred_audio_language={audio_locale}&locale={sub_locale}"
         );
         Ok(self.get_json::<SeasonEpisodesResponse>(&url)?.data)
+    }
+
+    /// Where the account left off in each of `content_ids`.
+    ///
+    /// Not one entry per id: an episode nobody has opened is left out of the answer
+    /// rather than sent back at zero, so this is a lookup to consult about an episode
+    /// and not a list to walk alongside the one it was asked about.
+    pub fn playheads(&self, content_ids: &[String]) -> Result<Vec<Playhead>> {
+        // Before the account is asked for, because a season with no episodes in it is
+        // an ordinary thing to ask about and not a reason to complain about the login.
+        if content_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account_id = self.account_id()?;
+        let mut playheads = Vec::new();
+        for url in playhead_urls(&account_id, content_ids) {
+            playheads.extend(self.get_json::<PlayheadsResponse>(&url)?.data);
+        }
+        Ok(playheads)
+    }
+
+    /// Says how far into an episode the account has got, so that the phone and the web
+    /// player open where this client stopped.
+    ///
+    /// Answered with a 204 and an empty body, so there is nothing to decode and nothing
+    /// to hand back: either Crunchyroll took it or it did not.
+    pub fn set_playhead(&self, content_id: &str, seconds: u32) -> Result<()> {
+        let account_id = self.account_id()?;
+        let url = format!("https://www.crunchyroll.com/content/v2/{account_id}/playheads");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "content_id": content_id,
+            "playhead": seconds,
+        }))
+        .context("encode the playback position")?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        self.send_authed(Method::POST, &url, &headers, Some(&body))?
+            .error_for_status()
+            .context("report the playback position")?;
+        Ok(())
     }
 
     /// The catalogue, in whatever order `sort_by` asks for: `popularity`,
@@ -446,7 +523,7 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use super::{Duration, account_id_from_jwt, build_media_client};
+    use super::{Duration, account_id_from_jwt, build_media_client, playhead_urls};
 
     /// A JWT with `claims` as its payload, signed by nobody: the segments are what is
     /// read here, and a signature this code never checks is not worth faking.
@@ -495,6 +572,48 @@ mod tests {
         ] {
             assert_eq!(account_id_from_jwt(token), None, "{token}");
         }
+    }
+
+    /// The ids travel in the query string, so a season long enough to overrun what a
+    /// server will read has to be asked for in pieces - and the commas between them have
+    /// to arrive as separators rather than as characters inside an id.
+    #[test]
+    fn a_long_list_of_ids_is_asked_for_in_pieces() {
+        let ids: Vec<String> = (0..250).map(|index| format!("G{index}")).collect();
+        let urls = playhead_urls("a1b2c3", &ids);
+
+        let asked_about = |url: &str| {
+            reqwest::Url::parse(url)
+                .expect("a URL")
+                .query_pairs()
+                .find(|(key, _)| key == "content_ids")
+                .map(|(_, value)| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+                .expect("a content_ids pair")
+        };
+        assert_eq!(urls.len(), 3);
+        assert_eq!(asked_about(&urls[0]).len(), 100);
+        assert_eq!(asked_about(&urls[1])[0], "G100");
+        assert_eq!(
+            asked_about(&urls[2]).len(),
+            50,
+            "the last piece is a short one"
+        );
+        assert!(
+            urls[0].starts_with("https://www.crunchyroll.com/content/v2/a1b2c3/playheads?"),
+            "{}",
+            urls[0]
+        );
+        assert!(urls[0].contains("locale=en-US"));
+        assert!(
+            !urls[0].contains(','),
+            "a raw comma is the URL's own punctuation, not the list's: {}",
+            urls[0]
+        );
+
+        assert!(
+            playhead_urls("a1b2c3", &[]).is_empty(),
+            "nothing to ask about is nothing to ask"
+        );
     }
 
     /// Serves one request: the headers for a `promised`-byte body, then `sent` of those

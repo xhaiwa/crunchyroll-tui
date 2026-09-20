@@ -18,7 +18,7 @@ use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use crate::api::CrunchyrollClient;
 use crate::config::Config;
-use crate::download::{DownloadOptions, download_episode, episode_info};
+use crate::download::{DownloadOptions, download_episode, episode_info, playing_options};
 use crate::model::SeasonEpisode;
 
 use app::{Action, App};
@@ -241,8 +241,12 @@ fn play(
             "Playing S{:02}E{:02} - {}",
             info.episode_metadata.season_number, info.episode_metadata.episode_number, info.title
         );
+        // Asked for here rather than taken from the row that was drawn: the column may
+        // have been painted an hour ago, or before the episode was watched half through
+        // on the phone, and this is the moment the answer is acted on.
+        let episode_options = playing_options(client, &options, &episode.id, episode.duration_ms);
         // Quitting mpv ends one episode normally, so the list carries on to the next.
-        download_episode(client, &episode.id, &info, &options)?;
+        download_episode(client, &episode.id, &info, &episode_options)?;
     }
     Ok(match episodes {
         [single] => format!("Played {}", single.title),
