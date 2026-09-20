@@ -14,6 +14,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - The watchlist and the history kept up to date from the interface: a series added or removed, an episode marked watched or unwatched
 - The episodes you already have marked in the column, so a season you have downloaded says so without being downloaded again
 - Several episodes of a season marked and queued together, in the order the season lists them
+- Any column narrowed as you type, fzf style, without a request going anywhere: a season, a watchlist or the download queue cut down to the rows that match
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
@@ -209,7 +210,8 @@ instead and says so on the status line.
 | `⏎`, `→`, `l` | `open` | Open the selection, play the episode under the cursor, drop a row of the queue |
 | `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns: series, seasons, episodes, downloads |
-| `/` | `search` | Search the catalogue. An empty search goes back to browsing |
+| `/` | `search` | Search the catalogue: asks Crunchyroll, and replaces the Series column with the answer. An empty search goes back to browsing |
+| `f` | `filter` | Narrow the column the cursor is in to the rows that match what you type. Asks nobody anything, and hides nothing anywhere else |
 | `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
 | `c`, `n` | `genre`, `anime-season` | Narrow the catalogue to one of Crunchyroll's categories or to one anime season, from a list with All at the top of it |
 | `u` | `simulcast` | Show only the series Crunchyroll calls simulcasts, or stop |
@@ -342,6 +344,36 @@ against rows, so they come off when the column moves to another season and survi
 or a change of language, which are the same season asked for again. They also stay on
 after the episodes are queued, so a mark you want gone is one you take off yourself.
 
+`/` and `f` are the two halves of finding something, and they are not the same half. `/`
+is a question for Crunchyroll: it waits for `⏎`, sends what you typed, and replaces the
+Series column with whatever came back. `f` asks nobody anything. It opens a box like the
+search one and narrows the column the cursor is in as each letter lands, leaving the rows
+that hold what you have typed and hiding the rest - a twenty-four episode season down to
+the two you meant, eighty series on a watchlist down to four, or a download queue down to
+one series. `⏎` keeps the narrowing and closes the box, `esc` puts the whole list back,
+and backspace widens it a letter at a time. Pressing `f` again opens an empty box, so `f`
+`esc` is how a narrowing you have kept is taken off.
+
+Matching is a plain substring against what the row shows - the title, an episode's number,
+a queue row's series - so every row left is visibly one that holds what you typed. It is
+not fzf's scattered-letters match, which is worth having only when the matches can be
+sorted by how well they matched, and these lists cannot be reordered: a season is numbered
+and the queue is the order things were asked for. Case is ignored until you type a
+capital, the way vim's smartcase works: `ed` finds `Ed` and `wanted` alike, and `Ed` finds
+only the first.
+
+Each column keeps its own narrowing, so walking between them with `tab` carries nothing
+along. The column's title says what it is narrowed to and how much of it is left -
+`Episodes "journ" 2/24` - and a narrowing that matches nothing says so where the rows
+would have been rather than leaving an empty box. The cursor can only ever be on a row you
+can see, and so can the mouse: what is played, queued or marked is what is on the screen.
+`P` and `D`, which mean the rest of the column and the whole of it, take the rows that are
+showing - a screen with three episodes on it does not hand mpv twenty-one more. Marks are
+the exception, and deliberately: a mark is something you put on an episode by hand, so
+narrowing the column neither takes it off nor takes it out of what `d` queues. A column
+that is filled again comes back whole - another season, `r`, a change of language - since
+what you typed was about the rows that were on the screen at the time.
+
 The languages offered by `a` and `s` are the ones the selected season lists, falling back
 to the series, then to what was asked for on the command line, then to every locale
 Crunchyroll publishes - so the list follows whatever the series actually has. The locale
@@ -408,6 +440,8 @@ included.
 | Click the listing label | Move on to the next list, or leave a search |
 | Click a filter in the header | Open the list it came from, where it is cleared as well as set |
 | Click beside an open list | Cancel it, the way `esc` does |
+| Click beside the language list | Cancel it, the way `esc` does |
+| Click while a box is open | Close it: the search is left, and a narrowing is kept the way `⏎` keeps it |
 
 Opening takes a second click rather than a quick double click, so a slow hand and a slow
 link work the same as a fast one - and a first click into a column can only ever choose,
