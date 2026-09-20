@@ -9,11 +9,13 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 ## Features
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
+- Downloads that run in the background: a queue in a panel of its own, with the catalogue still usable while a season comes down
 - The watchlist and the history kept up to date from the interface: a series added or removed, an episode marked watched or unwatched
 - The episodes you already have marked in the column, so a season you have downloaded says so without being downloaded again
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
+- Downloads a later run can pick up: the finished name appears only once the episode is whole, and what a killed run did fetch is kept for the next one
 - Playback with mpv while the stream downloads, instead of writing a file
 - Resume where you left off, and the position written back to your account while you watch, so this client, the phone and the web player stay in step
 - `--in-terminal`: the video drawn in the terminal itself, protocol and mpv options worked out for you
@@ -129,6 +131,60 @@ cargo run --release -- --url EPISODE_URL \
   --audio-lang all --subs-lang all --cc-lang all
 ```
 
+### Picking a download up again
+
+Episodes land in a directory named after the series, as
+`Series S01E01 - Title [1080p].mkv`. That name belongs to finished episodes only: while
+the download runs, ffmpeg writes to `Series S01E01 - Title [1080p].mkv.part`, and the
+file is renamed onto the real name the moment ffmpeg says it is happy. So an MKV you can
+see is an MKV you can watch, and the "already downloaded, skipping" check can never be
+fooled by half of one.
+
+Beside it, `Series S01E01 - Title [1080p].mkv.part.json` records what has already been
+fetched. Each audio, video and subtitle track is buffered to a hidden `.crdl-` file in
+the same directory, and a run that does not finish leaves those files where they are
+instead of deleting them. Run the same command again and it fetches what is missing:
+
+- A track that came out whole last time is muxed as it is, and its playback session is
+  never opened - so a season interrupted eight episodes in costs eight episodes and not
+  the ninth's audio as well.
+- A video or audio track that was still arriving is carried on from the byte it stopped
+  at, when the episode's manifest is the single-file on-demand kind. Those arrive as one
+  long ranged response, so the length of the buffer says exactly which byte to ask for
+  next.
+- A track from a segmented manifest starts again. Its buffer ends somewhere inside a
+  segment rather than between two of them, and there is no honest way to tell where from
+  a byte count, so the partial buffer is swept up rather than guessed at.
+- Subtitles, which are small, are kept and reused the same way.
+
+What is on disk is only reused when it is certainly the right thing. A run asking for a
+different video or audio quality, for different audio, subtitle or caption locales, or
+even for the same audio locales in a different order - the first is the default track in
+the MKV - throws the lot away and starts again, as does a track file whose size has
+changed since it was written, and a buffer that does not begin with exactly the
+initialization segment this run just fetched. Every one of those refusals costs a
+download; letting one through would cost an MKV that looks finished and is not the
+episode you asked for.
+
+A download that finishes deletes its `.part`, its `.part.json` and every buffer they
+name. One you abandon keeps them, which is the point. To throw one away by hand, delete
+both files under the episode's name:
+
+```shell
+rm "Some Series/Some Series S01E01 - Title [1080p].mkv.part"*
+```
+
+That leaves the hidden `.crdl-` buffers it named, since nothing points at them any more;
+when no other download is running, `rm "Some Series"/.crdl-*` clears those too.
+
+None of this cares where the download came from. An episode queued in the interface is
+written by the same code as one asked for on the command line, so quitting mid-download -
+which the interface warns you about - leaves that episode's work where the next run will
+find it. See [The download queue](#the-download-queue).
+
+`--play` has none of this. It writes no file and keeps nothing, so there is nothing to
+come back to.
+
 ### Browsing the catalogue
 
 `--tui` opens a terminal interface instead of taking a URL: three columns for series,
@@ -148,13 +204,13 @@ instead and says so on the status line.
 | `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
 | `pgup` `pgdn` | `page-up`, `page-down` | Move a page at a time |
 | `home` `end`, `g` `G` | `top`, `bottom` | Jump to the first or last item |
-| `⏎`, `→`, `l` | `open` | Open the selection, and play the episode under the cursor |
+| `⏎`, `→`, `l` | `open` | Open the selection, play the episode under the cursor, drop a row of the queue |
 | `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
-| `tab` | `next-column` | Cycle the columns |
+| `tab` | `next-column` | Cycle the columns: series, seasons, episodes, downloads |
 | `/` | `search` | Search the catalogue. An empty search goes back to browsing |
 | `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
-| `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
+| `d`, `D` | `download`, `download-season` | Put the episode, or the whole season, on the download queue |
 | `w` | `watchlist` | Put the selected series on the watchlist, or take it off if it is already there |
 | `m`, `M` | `mark-watched`, `mark-unwatched` | Mark the episode under the cursor watched, or unwatched again |
 | `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
@@ -196,8 +252,8 @@ option keeps the value it was given on the command line or in the config file, s
 `--audio-lang`, `--subs-lang`, `--cc-lang` and `--audio-quality` still set what the
 interface starts with.
 
-Playing hands the terminal to mpv and takes it back when mpv quits; downloading does the
-same with the progress bars.
+Playing hands the terminal to mpv and takes it back when mpv quits. Downloading does
+not: see [The download queue](#the-download-queue) below.
 
 The Episodes column says what your account has already made of each one: a check for an
 episode you have finished, and the time to pick it up from for one you left partway
@@ -206,15 +262,22 @@ rather than a column of its own, so the titles stay where they are on a narrow t
 See [Picking up where you left off](#picking-up-where-you-left-off).
 
 It also says what is already on this disk, in two cells of its own ahead of that: a
-filled circle `●` for an episode whose MKV is here, a half-filled `◐` for a download that
-was cut off and left part of one behind. What you have and what you have watched are
-different things - an episode can be downloaded and never watched, or watched on the
-phone and never downloaded - so they are drawn side by side rather than sharing a slot.
+filled circle `●` for an episode whose MKV is here, a half-filled `◐` for one that has
+been started and not finished - a download running now, or the `.part` and `.part.json`
+a run that stopped left behind, which is exactly what the next run would pick up. What
+you have and what you have watched are different things - an episode can be downloaded
+and never watched, or watched on the phone and never downloaded - so they are drawn side
+by side rather than sharing a slot.
+
 The files are looked for where downloading would write them, under the directory you
-started the program in, and the quality is part of the file name, so `v` changes the
-answer and the column is asked again. Nothing looks while a download is running: an
-episode downloaded from the interface shows its marker once the column has been opened
-again or reloaded with `r`.
+started the program in. The disk is asked when a season is opened, when `v` changes the
+quality - the quality is part of the file name, so it is a different file - and at the
+moments a queued download changes what is there, so an episode you queue turns half-filled
+once it is properly under way and filled as it lands, without the column being reloaded.
+It is not asked once per frame:
+that would be a couple of hundred questions a second about files that change twice an
+hour. An episode downloaded outside the program, or by a run that was going while this
+one sat open, shows up the next time the season is opened or reloaded with `r`.
 
 #### With a mouse
 
@@ -229,6 +292,7 @@ included.
 | Wheel | Scroll the column under the pointer, leaving the keyboard where it is |
 | Right click | Go back out of the column it was pressed on |
 | Click a word along an edge | What its key does: `open/play`, `back`, `search`, `download`, `language`, `quality`, `keys`, `quit`, and `audio`, `subs` and `video` at the top right |
+| Click a queue row, then again | Move the cursor there, then take that download out of the queue |
 | Click the listing label | Move on to the next list, or leave a search |
 | Click beside the language list | Cancel it, the way `esc` does |
 
@@ -275,6 +339,41 @@ inside the terminal:
 ```shell
 cargo run --release -- --tui --in-terminal
 ```
+
+### The download queue
+
+`d` and `D` do not take the terminal away any more. The episode goes on a queue, the
+queue is worked by a thread of its own, and the catalogue stays where it is: look
+something else up, change the subtitle language, queue another season, all while an
+episode is being written.
+
+`tab` reaches the Downloads panel, which appears under the three columns as soon as
+there is anything in it and takes nothing from them while there is not. One row per
+episode - what it is, and whether it is queued, downloading with a bar and a
+percentage, done, or failed with the reason. The bar names the part of the episode
+being waited on: the subtitles, the video, one audio track per locale, then the mux.
+The Details panel underneath says the whole of a failure, which rarely fits on a row.
+
+Episodes are downloaded one at a time, in the order they were asked for. A single
+download is already as parallel inside as the connection will take - ten segment
+workers, three audio versions - so running two of them at once would only split the
+same pipe in half. An episode that fails takes itself and nothing else: the queue
+carries on to the next one, and the status line says what went wrong.
+
+The options a download runs with are the ones that were in force when it was queued.
+Change the quality or the audio language afterwards and the episodes already on the
+queue keep what they were asked for - only the ones queued from then on get the new
+setting.
+
+`⏎` on a row of the panel takes it out of the queue, as does a second click on it.
+Anything but the episode that is currently downloading can go: that one is inside an
+hour of segments on a thread of its own and there is no calling it back, so it says so
+and stays. Quitting while a download is running asks a second time for the same reason,
+since leaving ends the thread with everything else. `ctrl-c` never argues.
+
+What that episode had already fetched is not thrown away when you go, and the next run
+carries on rather than starting it over: see
+[Picking a download up again](#picking-a-download-up-again).
 
 ### Playing instead of downloading
 
@@ -472,14 +571,14 @@ The commands, and the keys they answer to out of the box:
 | `up` `down` | `↑` `k`, `↓` `j` | Move the cursor |
 | `page-up` `page-down` | `pgup`, `pgdn` | Move it ten rows |
 | `top` `bottom` | `home` `g`, `end` `G` | Jump to the first or last item |
-| `open` | `enter` `right` `l` | Open the selection, and play an episode |
+| `open` | `enter` `right` `l` | Open the selection, play an episode, drop a download |
 | `back` | `left` `h` `esc` | Go back a column, and leave a search |
 | `next-column` | `tab` | Cycle the columns |
 | `search` | `/` | Search the catalogue |
 | `order` | `o` | Change the list the catalogue shows |
 | `reload` | `r` | Reload the current column |
 | `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
-| `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
+| `download` `download-season` | `d`, `D` | Queue the episode, or the whole season, for download |
 | `watchlist` | `w` | Put the series on the watchlist, or take it off |
 | `mark-watched` `mark-unwatched` | `m`, `M` | Mark the episode watched, or unwatched |
 | `audio-language` `subtitle-language` | `a`, `s` | Open the language list |

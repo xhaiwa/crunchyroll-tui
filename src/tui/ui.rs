@@ -9,7 +9,7 @@ use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode};
 use crate::play::resume_at;
 use crate::util::language_name;
 
-use super::app::{App, Focus, Picker};
+use super::app::{App, Download, Focus, Picker, State};
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions};
 use super::theme::Theme;
@@ -111,10 +111,11 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
 /// What is on this disk cannot share that slot, because it is a different fact: an
 /// episode can be downloaded and never watched, or watched on the phone and never
 /// downloaded, and a row has to be able to say both at once. It gets two cells ahead of
-/// the time - a filled circle for the whole episode, a half-filled one for what a
-/// cut-off download left behind - and it is spent whether there is a file or not, since
-/// a marker that appeared only when it had something to report would shift every title
-/// in the column as the eye ran down it.
+/// the time - a filled circle for the whole episode, a half-filled one for an episode
+/// that has been started and not finished, whether it is being written now or was left
+/// that way by a run that stopped - and the two cells are spent whether there is a file
+/// or not, since a marker that appeared only when it had something to report would shift
+/// every title in the column as the eye ran down it.
 fn episode_row(
     theme: &Theme,
     episode: &SeasonEpisode,
@@ -142,6 +143,56 @@ fn episode_row(
         spans.push(theme.dim(format!("{:>6}  ", duration(episode.duration_ms))));
     }
     spans.push(theme.text(episode.title.clone()));
+    ListItem::new(Line::from(spans))
+}
+
+/// A bar drawn out of the characters the command line's own progress bars use, so a
+/// download looks like a download wherever this program shows one. A fraction with no
+/// number behind it yet - a subtitle fetch, a mux, a track whose server would not say
+/// how long the file is - is an empty track rather than a full one, which is the honest
+/// reading of not knowing.
+fn meter(fraction: Option<f64>, width: u16) -> String {
+    let width = usize::from(width);
+    let filled = fraction.map_or(0.0, |fraction| fraction.clamp(0.0, 1.0) * width as f64) as usize;
+    let mut bar = "=".repeat(filled);
+    if filled < width {
+        // The arrow is the head of the bar rather than part of what is done, so it only
+        // appears once something has been.
+        bar.push(if filled > 0 { '>' } else { ' ' });
+        bar.push_str(&" ".repeat(width - filled - 1));
+    }
+    format!("[{bar}]")
+}
+
+/// How wide the bar in the queue is. Wide enough to read a tenth off, narrow enough to
+/// leave the titles the width they had.
+const METER_WIDTH: u16 = 20;
+
+/// One queued episode: which episode it is, and what has become of it.
+///
+/// The titles are padded out to `column` so that the bars under one another line up -
+/// the queue is read down the state rather than across one row of it, and a column of
+/// bars each starting somewhere else is a list nobody can scan. The colours say the
+/// same thing the words do, since a row that has failed is the one worth finding first.
+fn download_row(theme: &Theme, download: &Download, column: usize) -> ListItem<'static> {
+    let mut spans = vec![theme.accent(format!("{:<7}", download.number))];
+    let title = Span::raw(download.title.clone()).width();
+    spans.push(theme.text(download.title.clone()));
+    spans.push(theme.text(" ".repeat(column.saturating_sub(title) + 2)));
+    match &download.state {
+        State::Queued => spans.push(theme.dim("queued")),
+        State::Running => {
+            let (stage, fraction) = download.stage().unwrap_or(("starting", None));
+            spans.push(theme.accent(meter(fraction, METER_WIDTH)));
+            spans.push(theme.accent(match fraction {
+                Some(fraction) => format!(" {:>3}%", (fraction * 100.0) as u16),
+                None => "     ".to_owned(),
+            }));
+            spans.push(theme.dim(format!("  {stage}")));
+        }
+        State::Done => spans.push(theme.dim("done")),
+        State::Failed(error) => spans.push(theme.error(format!("failed: {error}"))),
+    }
     ListItem::new(Line::from(spans))
 }
 
@@ -310,6 +361,28 @@ fn details(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::from(theme.dim(facts.join(" · "))));
             lines.push(Line::from(theme.text(episode.description.clone())));
         }
+        // The panel is one line per episode and a failure is a sentence out of
+        // anyhow's chain, so this is the only place with room to say what went wrong.
+        Focus::Downloads => {
+            let Some(download) = app.downloads.selected() else {
+                return lines;
+            };
+            lines.push(Line::from(theme.strong(download.title.clone())));
+            let mut facts = vec![download.number.clone()];
+            if !download.series.is_empty() {
+                facts.push(download.series.clone());
+            }
+            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            lines.push(Line::from(match &download.state {
+                State::Queued => theme.dim("Waiting for the episode in front of it."),
+                State::Running => match download.stage() {
+                    Some((stage, _)) => theme.text(format!("Downloading: {stage}.")),
+                    None => theme.text("Starting."),
+                },
+                State::Done => theme.dim("Downloaded."),
+                State::Failed(error) => theme.error(error.clone()),
+            }));
+        }
     }
     lines
 }
@@ -358,6 +431,37 @@ fn thumbnail_width(inner: Rect, cell: Size, enabled: bool) -> u16 {
     match wanted.min(inner.width / 3) {
         0..=7 => 0,
         width => width,
+    }
+}
+
+/// How many rows the queue gets out of the body: none at all while it is empty, and
+/// otherwise a row per episode plus the border, within what the body can spare.
+///
+/// A strip under the three columns rather than a fourth column beside them. A fourth
+/// column would take a quarter of the width off the lists for the whole of a run, and
+/// most of a run has nothing downloading; a strip that is not drawn at all while the
+/// queue is empty costs the columns nothing, which is the state the interface spends
+/// most of its time in. A queue also reads across rather than down - an episode, a bar,
+/// a percentage - so a wide short box fits it and a tall narrow one does not.
+///
+/// It may take half the body while it has the keyboard, because that is when someone is
+/// reading it, and a third of it otherwise, which is enough to keep an eye on. Either
+/// way the columns keep the rest: the queue is a thing to glance at, not the interface.
+fn downloads_height(body: Rect, queued: usize, focused: bool) -> u16 {
+    if queued == 0 {
+        return 0;
+    }
+    let share = if focused {
+        body.height / 2
+    } else {
+        body.height / 3
+    };
+    let wanted = u16::try_from(queued).unwrap_or(u16::MAX).saturating_add(2);
+    // A box with no room for a row of its own is worse than none: it is a border
+    // sitting where a list could have been.
+    match wanted.min(share) {
+        0..=2 => 0,
+        height => height,
     }
 }
 
@@ -472,7 +576,10 @@ const HELP: [(&[Command], &str); 19] = [
         &[Command::Top, Command::Bottom],
         "jump to the first or last item",
     ),
-    (&[Command::Open], "open the selection, and play an episode"),
+    (
+        &[Command::Open],
+        "open the selection, play an episode, drop a download",
+    ),
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
@@ -483,7 +590,7 @@ const HELP: [(&[Command], &str); 19] = [
     ),
     (
         &[Command::Download, Command::DownloadSeason],
-        "download the episode / the whole season",
+        "queue the episode / the whole season for download",
     ),
     (
         &[Command::Watchlist],
@@ -580,7 +687,16 @@ fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, keys: &Bindings) {
             ])
         })
         .collect();
-    let popup = popup(area, column as u16 + 54, lines.len() as u16 + 2);
+    // And the box is as wide as the widest line it holds - the key column, the space
+    // either side of it, the longest description and the two the border takes - rather
+    // than a number chosen once and quietly outgrown by a description added later. A
+    // popup that cuts its own last word off is worse than one that is a little wide.
+    let widest = rows
+        .iter()
+        .map(|(_, what)| Span::raw(*what).width())
+        .max()
+        .unwrap_or(0);
+    let popup = popup(area, (column + widest) as u16 + 5, lines.len() as u16 + 2);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(theme.bordered(true).title(theme.title(" Keys "))),
@@ -639,6 +755,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         bar.left(),
         &widths(&listing(app)),
     ));
+
+    // The queue comes off the bottom of the body before anything else is measured
+    // against it, so the strip runs the whole width - it is a list of episodes from
+    // wherever they were queued, not a thing about the series in the poster - and the
+    // poster is shaped to the height the columns are actually left with.
+    let queue = downloads_height(body, app.downloads.items.len(), focus == Focus::Downloads);
+    let [body, queue_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(queue)]).areas(body);
 
     // The poster takes a column off the left of the body and the three lists share what
     // is left, in the proportions they had the whole width in.
@@ -744,7 +868,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .items
             .iter()
             .map(|episode| {
-                let held = app.downloaded.get(&episode.id).copied().unwrap_or_default();
+                let held = app
+                    .downloaded
+                    .get(&episode.id)
+                    .copied()
+                    .unwrap_or(OnDisk::Missing);
                 episode_row(&theme, episode, app.playheads.get(&episode.id), held)
             })
             .collect()
@@ -759,6 +887,38 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         right,
         &mut app.episodes.state,
     );
+
+    // Nothing at all while the queue is empty, which is what keeps the three columns
+    // the size they were before any of this existed.
+    if !queue_area.is_empty() {
+        // Wide enough for the longest title in the queue, and never so wide that the
+        // bars are pushed off a narrow terminal - a title cut short is a smaller loss
+        // than the state of the download it belongs to.
+        let column = app
+            .downloads
+            .items
+            .iter()
+            .map(|download| Span::raw(download.title.clone()).width())
+            .max()
+            .unwrap_or(0)
+            .min(usize::from(queue_area.width / 3));
+        let items: Vec<ListItem> = app
+            .downloads
+            .items
+            .iter()
+            .map(|download| download_row(&theme, download, column))
+            .collect();
+        let focused = focus == Focus::Downloads;
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(pane_block(&theme, "Downloads", focused))
+                .highlight_style(theme.highlight(focused))
+                .highlight_symbol("› ")
+                .highlight_spacing(HighlightSpacing::Always),
+            queue_area,
+            &mut app.downloads.state,
+        );
+    }
 
     if details_height > 0 {
         let block = theme.bordered(false).title(theme.dim(" Details "));
@@ -855,6 +1015,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         series: left,
         seasons: middle,
         episodes: right,
+        downloads: queue_area,
         picker: picked,
         buttons,
     };
@@ -886,7 +1047,11 @@ mod tests {
     use crate::tui::theme::{self, Theme};
     use crate::tui::worker::{Listing, Request, Response, Worker};
 
-    use super::{HELP, cells, draw, duration, poster_width, thumbnail_width};
+    use super::{
+        HELP, cells, downloads_height, draw, duration, meter, poster_width, thumbnail_width,
+    };
+    use crate::tui::app::State;
+    use crate::tui::worker::Update;
 
     #[test]
     fn formats_a_running_time() {
@@ -941,6 +1106,7 @@ mod tests {
             mpv_args: Vec::new(),
             start_at: None,
             playhead: None,
+            reporter: None,
         };
         let mut app = App::new(
             Worker::detached(),
@@ -980,6 +1146,7 @@ mod tests {
                 episode: "1".to_owned(),
                 episode_number: 1,
                 season_number: 1,
+                series_title: "Frieren".to_owned(),
                 title: "The Journey Ends".to_owned(),
                 duration_ms: 1_461_000,
                 images: Images {
@@ -993,6 +1160,7 @@ mod tests {
                 episode: "2".to_owned(),
                 episode_number: 2,
                 season_number: 1,
+                series_title: "Frieren".to_owned(),
                 title: "The Priest's Lie".to_owned(),
                 duration_ms: 1_420_000,
                 ..SeasonEpisode::default()
@@ -1148,6 +1316,14 @@ mod tests {
             screen.contains("ctrl-q quit"),
             "the bottom edge still offers q for quit"
         );
+        // The box grows to what it holds, so a line added to the table is not a line
+        // with its last word cut off.
+        for (_, what) in HELP {
+            assert!(
+                screen.contains(what),
+                "the popup cut {what:?} off at its own edge"
+            );
+        }
     }
 
     /// A remapped key has to do the thing it was remapped to, not only be advertised.
@@ -1904,6 +2080,201 @@ mod tests {
         click(&mut app, x, y);
         assert!(app.editing.is_none());
         assert_eq!(app.focus, Focus::Series, "the click reached a column");
+    }
+
+    /// A queue with something in it, put there the way the key puts it there.
+    fn with_downloads(app: &mut App, count: usize) {
+        app.focus = Focus::Episodes;
+        several_episodes(app, count);
+        press(app, KeyCode::Char('D'));
+        app.focus = Focus::Series;
+    }
+
+    /// Where the queue is drawn, and what is on a row of it: what the episode is, how
+    /// far it has got and which part of it is moving. A bar and a percentage are the
+    /// whole point of the exercise - the interface took them away from indicatif and
+    /// has to put them back somewhere.
+    #[test]
+    fn the_queue_draws_a_bar_and_a_percentage() {
+        let mut app = app();
+        with_downloads(&mut app, 2);
+        app.downloads.items[0].state = State::Running;
+        app.downloads.items[0].stages = vec![("video".to_owned(), 1, 4)];
+
+        let screen = rendered(120, 30, &mut app);
+        for expected in [
+            "Downloads",
+            "S01E1",
+            "The Journey Ends",
+            "25%",
+            "video",
+            "queued",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+        assert!(screen.contains("[====="), "no bar was drawn");
+
+        // And what became of it, in the words the panel has room for.
+        app.downloads.items[0].state = State::Failed("Crunchyroll said no".to_owned());
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("failed: Crunchyroll said no"));
+    }
+
+    /// The panel is not there at all until something is in it, so the three columns are
+    /// exactly the size they were before any of this existed - which is most of a run.
+    #[test]
+    fn an_empty_queue_takes_nothing_from_the_columns() {
+        let mut app = app();
+        let _ = buffer(120, 30, &mut app);
+        let columns = [
+            app.regions.series,
+            app.regions.seasons,
+            app.regions.episodes,
+        ];
+        assert!(
+            !rendered(120, 30, &mut app).contains("Downloads"),
+            "a panel with nothing in it"
+        );
+        assert!(app.regions.downloads.is_empty(), "and nothing to click on");
+
+        with_downloads(&mut app, 1);
+        let _ = buffer(120, 30, &mut app);
+        assert!(!app.regions.downloads.is_empty(), "the panel was not drawn");
+        for (before, after) in columns.iter().zip([
+            app.regions.series,
+            app.regions.seasons,
+            app.regions.episodes,
+        ]) {
+            assert_eq!(
+                before.width, after.width,
+                "the columns were squeezed sideways"
+            );
+            assert!(after.height < before.height, "the strip came from nowhere");
+        }
+
+        // Emptying it gives the rows straight back.
+        app.downloads.items.clear();
+        let _ = buffer(120, 30, &mut app);
+        assert_eq!(app.regions.series, columns[0]);
+    }
+
+    /// The queue is worked like the columns beside it: a click puts the keyboard on it
+    /// and the cursor on a row, and a second click on that row takes it out of the
+    /// list. Nothing here is a gesture of its own - it is the columns' own rule, read
+    /// through the one command the panel answers to.
+    #[test]
+    fn the_queue_can_be_worked_by_pointer() {
+        let mut app = app();
+        with_downloads(&mut app, 3);
+        let _ = buffer(120, 30, &mut app);
+        let panel = app.regions.downloads;
+        assert!(!panel.is_empty());
+
+        let (x, y) = row(panel, 1);
+        assert!(matches!(click(&mut app, x, y), Action::None));
+        assert_eq!(app.focus, Focus::Downloads, "the click went to the panel");
+        assert_eq!(app.downloads.state.selected(), Some(1));
+        assert_eq!(app.downloads.items.len(), 3, "a first click dropped a row");
+
+        click(&mut app, x, y);
+        assert_eq!(app.downloads.items.len(), 2, "the second click did nothing");
+
+        // The wheel looks without taking the keyboard, the way it does everywhere else.
+        app.focus = Focus::Series;
+        let _ = buffer(120, 30, &mut app);
+        let (x, y) = middle(app.regions.downloads);
+        wheel(&mut app, x, y, true);
+        assert_eq!(app.focus, Focus::Series, "the wheel took the keyboard away");
+    }
+
+    /// The panel says what one row has no room for: the whole of a failure, which is an
+    /// anyhow chain rather than a phrase, and which series an episode queued an hour ago
+    /// came from.
+    #[test]
+    fn the_details_panel_explains_the_selected_download() {
+        let mut app = app();
+        with_downloads(&mut app, 1);
+        app.focus = Focus::Downloads;
+        app.downloads.items[0].state = State::Failed(
+            "get Widevine license for ja-JP: the device provision was refused".to_owned(),
+        );
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("the device provision was refused"));
+        assert!(
+            screen.contains("S01E1 · Frieren"),
+            "which episode of what, which one row of the queue has no space for"
+        );
+    }
+
+    /// The strip takes what the body can spare and never the three rows the columns
+    /// need, and it is worth more room while someone is reading it than while it is
+    /// only being kept an eye on.
+    #[test]
+    fn the_queue_takes_what_the_body_can_spare() {
+        let body = Rect::new(0, 3, 120, 24);
+        assert_eq!(downloads_height(body, 0, true), 0, "nothing to show");
+        assert_eq!(downloads_height(body, 2, false), 4, "two rows and a border");
+        assert_eq!(downloads_height(body, 20, false), 8, "a third of the body");
+        assert_eq!(downloads_height(body, 20, true), 12, "half of it, focused");
+        // And a terminal with nothing to spare keeps its columns: a border with no room
+        // for a row inside it is worse than no panel at all.
+        assert_eq!(downloads_height(Rect::new(0, 3, 120, 6), 4, false), 0);
+        assert_eq!(downloads_height(Rect::new(0, 3, 120, 3), 4, true), 0);
+    }
+
+    /// The bar is the one the command line draws, in the characters indicatif uses for
+    /// it. A part whose size nothing knows yet is an empty track rather than a full one,
+    /// which is the honest reading of not knowing.
+    #[test]
+    fn the_bar_reads_as_a_progress_bar() {
+        assert_eq!(meter(Some(0.5), 10), "[=====>    ]");
+        assert_eq!(meter(Some(1.0), 10), "[==========]");
+        assert_eq!(meter(Some(0.0), 10), "[          ]");
+        assert_eq!(meter(None, 10), "[          ]");
+        // Nothing a downloader says can draw outside the bar.
+        assert_eq!(meter(Some(4.0), 4), "[====]");
+        assert_eq!(meter(Some(-1.0), 4), "[    ]");
+    }
+
+    /// A panel that is only drawn sometimes is a panel that has to survive being drawn
+    /// on a terminal with no room for it - including one too small for the columns it
+    /// shares the body with.
+    #[test]
+    fn the_queue_survives_a_cramped_terminal() {
+        let mut app = app();
+        with_downloads(&mut app, 12);
+        app.downloads.items[0].state = State::Running;
+        app.downloads.items[0].stages = vec![("Japanese audio".to_owned(), 3, 7)];
+        for focus in [Focus::Series, Focus::Downloads] {
+            app.focus = focus;
+            for (width, height) in [(120, 30), (120, 14), (40, 10), (20, 6), (8, 4), (1, 1)] {
+                let screen = rendered(width, height, &mut app);
+                assert!(!screen.is_empty(), "{width}x{height}");
+                let panel = app.regions.downloads;
+                assert!(
+                    panel.is_empty() || panel.intersection(Rect::new(0, 0, width, height)) == panel,
+                    "the panel was given a box off the edge of a {width}x{height} screen"
+                );
+            }
+        }
+    }
+
+    /// An answer about a row that has been dropped names nothing, and a queue that let
+    /// one of those put a download back on screen would be a panel nobody could clear.
+    #[test]
+    fn an_answer_for_a_row_that_has_gone_is_dropped() {
+        let mut app = app();
+        with_downloads(&mut app, 1);
+        let id = app.downloads.items[0].id;
+        app.downloads.items.clear();
+        // The sentence that said it had been queued is not what is being looked for.
+        app.notice = None;
+        app.accept(Response::Download {
+            id,
+            update: Update::Started,
+        });
+        assert!(app.downloads.items.is_empty());
+        assert!(app.notice.is_none(), "it said something about nothing");
     }
 
     /// The language list follows the columns' rule, and a click that misses it is how it

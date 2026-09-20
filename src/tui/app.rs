@@ -16,7 +16,7 @@ use super::art::Gallery;
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions, Target};
 use super::theme::Theme;
-use super::worker::{Listing, Request, Response, Worker};
+use super::worker::{Listing, Queued, Request, Response, Update, Worker};
 
 /// Which column the keyboard is pointed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,16 +24,105 @@ pub enum Focus {
     Series,
     Seasons,
     Episodes,
+    /// The queue, which is a list like the other three and is worked like one.
+    Downloads,
 }
 
 /// What the event loop has to leave the interface to do, because it needs the terminal
-/// back: mpv draws over it, and a download prints progress bars.
+/// back: mpv draws over it.
 pub enum Action {
     None,
     Quit,
     /// Played one after another, so quitting mpv moves on to the next episode.
     Play(Vec<SeasonEpisode>),
-    Download(Vec<SeasonEpisode>),
+}
+
+/// Where one episode in the queue has got to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum State {
+    /// Waiting its turn. One episode is downloaded at a time.
+    Queued,
+    Running,
+    Done,
+    /// Given up on, with the reason, which is the only account of it anyone will get:
+    /// the download thread has no terminal to print one to.
+    Failed(String),
+}
+
+/// One row of the queue.
+///
+/// What it is, rather than which episode it is: the row has to keep reading as itself
+/// long after the episode column has moved on to another season, so it carries its own
+/// words rather than an index into a list that will not hold still.
+pub struct Download {
+    /// The number the request was queued under, which is how an answer finds this row
+    /// again. Titles repeat and numbers do not.
+    pub id: usize,
+    /// `S01E01`, the way the episode column numbers it.
+    pub number: String,
+    pub title: String,
+    pub series: String,
+    pub state: State,
+    /// Each part of the episode the downloader has mentioned - subtitles, video, one
+    /// audio track per locale, muxing - in the order it first mentioned them, with how
+    /// far each has got. A total of zero is a part whose size nothing knows.
+    pub stages: Vec<(String, u64, u64)>,
+}
+
+impl Download {
+    /// What the row says about a download that is running: the part of the episode it
+    /// is still waiting on, and how far that part has got, where anything knows.
+    ///
+    /// The first unfinished part rather than the one that spoke last. The video and the
+    /// first audio track come down side by side, and a row showing whichever of them
+    /// reported most recently would jump between two percentages that have nothing to
+    /// do with each other. Taking them in the order they were first heard from means
+    /// the bar crosses one part, then the next, and only ever forwards.
+    pub fn stage(&self) -> Option<(&str, Option<f64>)> {
+        self.stages
+            .iter()
+            .find(|(_, done, total)| *total == 0 || done < total)
+            .map(|(stage, done, total)| {
+                let fraction = (*total > 0).then(|| *done as f64 / *total as f64);
+                (stage.as_str(), fraction)
+            })
+    }
+
+    /// Takes in one answer about this download.
+    fn update(&mut self, update: Update) {
+        match update {
+            Update::Started => self.state = State::Running,
+            Update::Stage { stage, done, total } => {
+                // Found by name rather than appended, so a part that reports a thousand
+                // times is one row of this and not a thousand.
+                match self.stages.iter_mut().find(|(named, ..)| *named == stage) {
+                    Some(known) => *known = (stage, done, total),
+                    None => self.stages.push((stage, done, total)),
+                }
+            }
+            Update::Finished(Ok(())) => {
+                self.state = State::Done;
+                // Nothing is waiting on anything any more, and a part left at ninety
+                // per cent under a row that says `done` reads as a contradiction.
+                self.stages.clear();
+            }
+            Update::Finished(Err(error)) => self.state = State::Failed(error),
+        }
+    }
+
+    /// Whether the thread is inside this one now. It has temporary files open and a
+    /// playback session held at Crunchyroll, so it is the one row that cannot be
+    /// dropped and the one reason quitting asks twice.
+    pub const fn running(&self) -> bool {
+        matches!(self.state, State::Running)
+    }
+
+    /// Whether this row may be taken out of the queue. Anything but the download in
+    /// flight: that one is an hour of segments on a thread of its own and there is no
+    /// calling it back, so it stays until it is over.
+    pub const fn droppable(&self) -> bool {
+        !self.running()
+    }
 }
 
 pub struct Notice {
@@ -53,17 +142,22 @@ fn whole_seconds(duration_ms: u64) -> u32 {
     u32::try_from(duration_ms / 1000).unwrap_or(u32::MAX)
 }
 
-/// What a notice calls an episode: the number Crunchyroll prints on it - which is "SP"
-/// or "1.5" as often as it is a number - behind the E the episode column shows. The
-/// title would be truer to the episode, but it is the number the user just moved the
-/// cursor onto, and a sentence on the status line has no room for both.
-fn episode_label(episode: &SeasonEpisode) -> String {
-    let number = if episode.episode.is_empty() {
+/// The number Crunchyroll prints on an episode, which is "SP" or "1.5" as often as it
+/// is a number. The numeric field has nothing useful to say about either, so it is only
+/// the fallback.
+fn episode_number(episode: &SeasonEpisode) -> String {
+    if episode.episode.is_empty() {
         episode.episode_number.to_string()
     } else {
         episode.episode.clone()
-    };
-    format!("E{number}")
+    }
+}
+
+/// What a notice calls an episode: the number above, behind the E the episode column
+/// shows. The title would be truer to the episode, but it is the number the user just
+/// moved the cursor onto, and a sentence on the status line has no room for both.
+fn episode_label(episode: &SeasonEpisode) -> String {
+    format!("E{}", episode_number(episode))
 }
 
 /// One column: what it holds, where the cursor is, and whether it is still waiting.
@@ -187,6 +281,14 @@ pub struct App {
     pub series: Pane<CatalogItem>,
     pub seasons: Pane<Season>,
     pub episodes: Pane<SeasonEpisode>,
+    /// The queue, oldest first. A pane like the other three, so the cursor, the wheel
+    /// and the arithmetic that turns a row of the screen into an index are the ones the
+    /// columns already use.
+    pub downloads: Pane<Download>,
+    /// The number the next download is queued under. It only ever goes up, so a row
+    /// dropped and another queued in its place cannot be taken for it by an answer that
+    /// was already on its way.
+    next_download: usize,
     /// How far the account has got into each episode of the open season, by content id.
     /// It arrives after the episodes do and belongs to them, so it is emptied whenever
     /// they are: a marker held over from the last season would be painted onto whichever
@@ -195,8 +297,8 @@ pub struct App {
     /// Which episodes of the open season are already on this disk, by content id. Only
     /// the ones that are: a row with no entry here is a row with no file. Emptied with
     /// the episodes for the same reason the playheads are, and looked up again whenever
-    /// the answer could have changed - which includes a change of quality, since the
-    /// quality is part of the file name.
+    /// the answer could have changed - a change of quality, since the quality is part of
+    /// the file name, and the moments a queued download changes what is on the disk.
     pub downloaded: HashMap<String, OnDisk>,
     pub listing: Listing,
     /// The search box while it is being typed into.
@@ -223,6 +325,9 @@ pub struct App {
     /// afterwards is a deliberate thing to do, and it then shows what it has - which is
     /// also what stops the fallback from being something that could fire twice.
     gave_up_on_history: bool,
+    /// Whether quit was the last thing asked for. Leaving takes the download thread
+    /// with it, so quit asks twice while an episode is in flight - see [`App::run`].
+    leaving: bool,
 }
 
 impl App {
@@ -244,6 +349,8 @@ impl App {
             series: Pane::default(),
             seasons: Pane::default(),
             episodes: Pane::default(),
+            downloads: Pane::default(),
+            next_download: 0,
             playheads: HashMap::new(),
             downloaded: HashMap::new(),
             // The most useful first screen a video client has is the thing that was
@@ -261,6 +368,7 @@ impl App {
             tick: 0,
             sort: 0,
             gave_up_on_history: false,
+            leaving: false,
         };
         app.request_catalog();
         app
@@ -321,12 +429,14 @@ impl App {
 
     /// Asks the disk which of the episodes now in the column are already here.
     ///
-    /// Once per list rather than once per row per frame. The answer is a `stat` for each
-    /// episode, the interface redraws ten times a second, and a row that asked as it was
-    /// drawn would put a few hundred of them a second between the user and a screen that
-    /// says the same thing every time. It is asked again whenever the question changes
-    /// instead: a new season, and a change of quality, since the quality is written into
-    /// the file name and a 720p copy is not the 1080p one the downloader would write.
+    /// Once per list rather than once per row per frame. The answer is two `stat` calls
+    /// for each episode, the interface redraws ten times a second, and a row that asked
+    /// as it was drawn would put a few hundred of them a second between the user and a
+    /// screen that says the same thing every time. It is asked again at the moments the
+    /// answer can change instead: a season arriving, a change of quality - the quality is
+    /// written into the file name, and a 720p copy is not the 1080p one the downloader
+    /// would write - and a queued download getting somewhere, which `download_moved`
+    /// decides the moments of.
     fn look_on_disk(&mut self) {
         let quality = &self.options.video_quality;
         self.downloaded = self
@@ -510,6 +620,66 @@ impl App {
                 Ok(message) => self.say(message),
                 Err(error) => self.complain(error),
             },
+            Response::Download { id, update } => self.download_moved(id, update),
+        }
+    }
+
+    /// One answer about a queued download.
+    ///
+    /// The row is found by the number the request carried rather than by the episode,
+    /// since the queue may hold the same episode twice and rows are dropped out of the
+    /// middle of it. An answer about a row that has been dropped names nothing and is
+    /// let go of.
+    ///
+    /// Only the two ends of a download are worth a sentence on the status line. The
+    /// steps in between are what the panel is drawn from, and a status line repainted
+    /// several times a second with the percentage of a track would leave no room for
+    /// anything else the interface has to say.
+    ///
+    /// The disk changes under the episodes column while this is going on, though, and
+    /// without asking it again the marker would be telling the truth about the moment the
+    /// season was opened and nothing since: an episode queued here would sit unmarked
+    /// until the column was reloaded, which is the reload this whole feature exists to
+    /// save. Three of these answers are worth the question. The end of a download leaves
+    /// the episode under its finished name. `Started` is sent as the thread takes the
+    /// episode up, before a byte has been written, so it catches what an earlier run left
+    /// and nothing else - but the first part to report has got far enough to have written
+    /// the state file, which is what makes a download that began from nothing read as
+    /// partial while it runs. Every report after that is the same file under the same
+    /// name getting bigger, and they arrive several times a second.
+    ///
+    /// The whole of the open season is asked again rather than the one episode. The queue
+    /// outlives the column it was filled from - a row carries what it is rather than which
+    /// episode it is, on purpose - so finding the one row would mean an episode id on the
+    /// queue, paid for in the queue's own design to save a season's worth of `stat` calls
+    /// three times per download. An episode downloaded from a season nobody is looking at
+    /// finds nothing of itself in the column, which is the right answer rather than a
+    /// missing one.
+    fn download_moved(&mut self, id: usize, update: Update) {
+        let Some(download) = self
+            .downloads
+            .items
+            .iter_mut()
+            .find(|download| download.id == id)
+        else {
+            return;
+        };
+        let finished = match &update {
+            Update::Finished(result) => Some((download.number.clone(), result.clone())),
+            _ => None,
+        };
+        let touched_the_disk = match &update {
+            Update::Started | Update::Finished(_) => true,
+            Update::Stage { .. } => download.stages.is_empty(),
+        };
+        download.update(update);
+        if touched_the_disk {
+            self.look_on_disk();
+        }
+        match finished {
+            Some((number, Ok(()))) => self.say(format!("Downloaded {number}")),
+            Some((number, Err(error))) => self.complain(format!("{number} failed: {error}")),
+            None => {}
         }
     }
 
@@ -518,6 +688,7 @@ impl App {
             Focus::Series => self.series.move_by(delta),
             Focus::Seasons => self.seasons.move_by(delta),
             Focus::Episodes => self.episodes.move_by(delta),
+            Focus::Downloads => self.downloads.move_by(delta),
         }
     }
 
@@ -532,6 +703,7 @@ impl App {
             Focus::Series => self.series.window(),
             Focus::Seasons => self.seasons.window(),
             Focus::Episodes => self.episodes.window(),
+            Focus::Downloads => self.downloads.window(),
         }
     }
 
@@ -540,6 +712,7 @@ impl App {
             Focus::Series => self.series.state.selected(),
             Focus::Seasons => self.seasons.state.selected(),
             Focus::Episodes => self.episodes.state.selected(),
+            Focus::Downloads => self.downloads.state.selected(),
         }
     }
 
@@ -548,6 +721,7 @@ impl App {
             Focus::Series => self.series.select(index),
             Focus::Seasons => self.seasons.select(index),
             Focus::Episodes => self.episodes.select(index),
+            Focus::Downloads => self.downloads.select(index),
         }
     }
 
@@ -563,6 +737,7 @@ impl App {
             Focus::Series => self.series.select_edge(last),
             Focus::Seasons => self.seasons.select_edge(last),
             Focus::Episodes => self.episodes.select_edge(last),
+            Focus::Downloads => self.downloads.select_edge(last),
         }
     }
 
@@ -577,11 +752,20 @@ impl App {
                 Action::None
             }
             Focus::Episodes => self.play(false),
+            // There is nothing behind a queue row to open, and taking one out of the
+            // list is the one thing the panel has to be asked for. Putting it on `open`
+            // is what gives the pointer the same thing without a gesture of its own: a
+            // second click on the row the cursor is already on.
+            Focus::Downloads => {
+                self.drop_download();
+                Action::None
+            }
         }
     }
 
     fn ascend(&mut self) {
         match self.focus {
+            Focus::Downloads => self.focus = Focus::Episodes,
             Focus::Episodes => self.focus = Focus::Seasons,
             Focus::Seasons => self.focus = Focus::Series,
             // Leaving the leftmost column means leaving the search behind.
@@ -672,7 +856,14 @@ impl App {
         Action::Play(episodes)
     }
 
-    fn download(&mut self, whole_season: bool) -> Action {
+    /// Puts the selection on the queue.
+    ///
+    /// The options travel with each episode rather than being read when its turn comes.
+    /// The queue may be an hour deep and the interface goes on being used the whole
+    /// time, so the quality and the languages that were along the top when the key was
+    /// pressed are the ones the user meant - not whatever is up there by the time the
+    /// thread reaches the request.
+    fn queue_downloads(&mut self, whole_season: bool) {
         let episodes = if whole_season {
             if self.episodes.items.is_empty() {
                 self.complain("Open a season first.");
@@ -682,9 +873,64 @@ impl App {
             self.selection(false)
         };
         if episodes.is_empty() {
-            return Action::None;
+            return;
         }
-        Action::Download(episodes)
+        let queued = episodes.len();
+        for episode in episodes {
+            let id = self.next_download;
+            self.next_download += 1;
+            self.downloads.items.push(Download {
+                id,
+                number: format!("S{:02}E{}", episode.season_number, episode_number(&episode)),
+                title: episode.title.clone(),
+                series: episode.series_title.clone(),
+                state: State::Queued,
+                stages: Vec::new(),
+            });
+            self.worker.send(Request::Download(Box::new(Queued {
+                id,
+                episode,
+                options: self.options.clone(),
+            })));
+        }
+        // A panel with a list in it and no cursor anywhere has nothing the arrow keys
+        // could move, so the first row queued takes one.
+        if self.downloads.state.selected().is_none() {
+            self.downloads.state.select(Some(0));
+        }
+        self.say(match queued {
+            1 => "Queued 1 episode for download".to_owned(),
+            queued => format!("Queued {queued} episodes for download"),
+        });
+    }
+
+    /// Takes the row under the cursor out of the queue.
+    ///
+    /// Anything but the download that is running, which is inside an hour of segments
+    /// on a thread of its own and cannot be called back. One that has not started is
+    /// dropped at both ends: the row goes, and the number goes to the worker so that
+    /// the thread passes over the request when it reaches it.
+    fn drop_download(&mut self) {
+        let Some(index) = self.downloads.state.selected() else {
+            return;
+        };
+        let Some(download) = self.downloads.items.get(index) else {
+            return;
+        };
+        if !download.droppable() {
+            self.complain("That one is already downloading.");
+            return;
+        }
+        if download.state == State::Queued {
+            self.worker.abandon(download.id);
+        }
+        self.downloads.items.remove(index);
+        // The row the cursor was on has gone, so it lands on whatever took its place -
+        // or on the last row, where it was the last row that went.
+        let left = self.downloads.items.len();
+        self.downloads
+            .state
+            .select((left > 0).then(|| index.min(left - 1)));
     }
 
     /// The locales worth offering for the current selection, most specific first: what
@@ -836,6 +1082,9 @@ impl App {
                 self.request_episodes();
                 self.episodes.pending_cursor = cursor;
             }
+            // The queue is not a list anything answers with: it is what this run has
+            // asked for, and there is nowhere to ask for it again.
+            Focus::Downloads => {}
         }
     }
 
@@ -937,8 +1186,23 @@ impl App {
     /// does cannot drift away from what the keyboard does - and the help popup stays the
     /// whole list of what the interface can be asked for.
     fn run(&mut self, command: Command) -> Action {
+        // Whether quit was the last thing asked for, cleared by anything else. Leaving
+        // ends the process, and the download thread goes with it: an episode half
+        // written is an hour of segments thrown away and a scratch file left behind.
+        // So the first quit during one says so and the second is taken at its word,
+        // which is a great deal less in the way than a dialogue box and costs a
+        // keypress only while something is actually running. ctrl-c is not part of
+        // this: it is how a terminal program is left, and it is not ours to argue with.
+        let confirmed = std::mem::take(&mut self.leaving);
         match command {
-            Command::Quit => return Action::Quit,
+            Command::Quit => {
+                if !confirmed && self.downloads.items.iter().any(Download::running) {
+                    self.leaving = true;
+                    self.complain("A download is still running. Ask again to leave anyway.");
+                    return Action::None;
+                }
+                return Action::Quit;
+            }
             Command::Help => self.show_help = true,
             Command::Search => self.editing = Some(String::new()),
             Command::Up => self.focused_pane_move(-1),
@@ -953,13 +1217,14 @@ impl App {
                 self.focus = match self.focus {
                     Focus::Series => Focus::Seasons,
                     Focus::Seasons => Focus::Episodes,
-                    Focus::Episodes => Focus::Series,
+                    Focus::Episodes => Focus::Downloads,
+                    Focus::Downloads => Focus::Series,
                 }
             }
             Command::Play => return self.play(false),
             Command::PlayRest => return self.play(true),
-            Command::Download => return self.download(false),
-            Command::DownloadSeason => return self.download(true),
+            Command::Download => self.queue_downloads(false),
+            Command::DownloadSeason => self.queue_downloads(true),
             Command::Watchlist => self.toggle_watchlist(),
             Command::MarkWatched => self.mark(true),
             Command::MarkUnwatched => self.mark(false),
@@ -1165,9 +1430,11 @@ mod tests {
     use crate::tui::art::Gallery;
     use crate::tui::keys::{Bindings, Command};
     use crate::tui::theme::Theme;
-    use crate::tui::worker::{Listing, Worker};
+    use crate::tui::worker::{Listing, Request, Response, Update, Worker};
 
-    use super::{App, OnDisk, Pane, SeasonEpisode, episode_label, whole_seconds};
+    use super::{
+        Action, App, Focus, OnDisk, Pane, SeasonEpisode, State, episode_label, whole_seconds,
+    };
 
     /// An interface with nothing behind it: the worker swallows every request and never
     /// answers one, so the only answers it sees are those a test hands it directly.
@@ -1184,6 +1451,7 @@ mod tests {
                 mpv_args: Vec::new(),
                 start_at: None,
                 playhead: None,
+                reporter: None,
             },
             Theme::default(),
             Bindings::default(),
@@ -1198,6 +1466,291 @@ mod tests {
             kind: "series".to_owned(),
             ..CatalogItem::default()
         }
+    }
+
+    /// An open season, so that the download keys have something to act on. The catalogue
+    /// the interface asked for as it opened is taken off the worker's hands here too,
+    /// since none of these tests is about that.
+    fn with_episodes(app: &mut App, count: usize) {
+        app.episodes.set(
+            (1..=count)
+                .map(|number| SeasonEpisode {
+                    id: format!("E{number}"),
+                    episode: number.to_string(),
+                    episode_number: number as i32,
+                    season_number: 1,
+                    series_title: "Frieren".to_owned(),
+                    title: format!("Episode {number}"),
+                    ..SeasonEpisode::default()
+                })
+                .collect(),
+        );
+        app.focus = Focus::Episodes;
+        app.sent();
+    }
+
+    /// One answer about a download, as the queue's thread sends them.
+    fn answer(app: &mut App, index: usize, update: Update) {
+        let id = app.downloads.items[index].id;
+        app.accept(Response::Download { id, update });
+    }
+
+    /// The whole life of one queued episode, which is all the account of it anyone
+    /// gets: the panel is where a download's progress bar went, and the status line is
+    /// its last word. Without this a row could sit at `queued` for the hour the file
+    /// was being written, or read as still downloading long after it was there.
+    #[test]
+    fn a_download_walks_from_queued_to_done() {
+        let mut app = app();
+        with_episodes(&mut app, 1);
+        app.run(Command::Download);
+
+        assert_eq!(app.downloads.items.len(), 1);
+        assert_eq!(app.downloads.items[0].state, State::Queued);
+        assert_eq!(
+            app.downloads.state.selected(),
+            Some(0),
+            "the panel has a list in it and nothing the arrow keys could move"
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("Queued")),
+            "nothing said the episode had been queued"
+        );
+
+        answer(&mut app, 0, Update::Started);
+        assert_eq!(app.downloads.items[0].state, State::Running);
+
+        answer(
+            &mut app,
+            0,
+            Update::Stage {
+                stage: "video".to_owned(),
+                done: 3,
+                total: 12,
+            },
+        );
+        assert_eq!(app.downloads.items[0].stage(), Some(("video", Some(0.25))));
+
+        answer(&mut app, 0, Update::Finished(Ok(())));
+        assert_eq!(app.downloads.items[0].state, State::Done);
+        assert_eq!(
+            app.downloads.items[0].stage(),
+            None,
+            "a download that is over is still waiting on a part of itself"
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("Downloaded S01E1") && !notice.error)
+        );
+    }
+
+    /// An episode Crunchyroll will not hand over is no reason to drop the ones behind
+    /// it: the queue is a list of things asked for one at a time, and the command line
+    /// has always carried on through a season the same way. The reason is kept on the
+    /// row, since the download thread has no terminal to have printed it to.
+    #[test]
+    fn a_failure_takes_one_episode_and_not_the_queue() {
+        let mut app = app();
+        with_episodes(&mut app, 2);
+        app.run(Command::DownloadSeason);
+        assert_eq!(app.downloads.items.len(), 2);
+
+        answer(&mut app, 0, Update::Started);
+        answer(
+            &mut app,
+            0,
+            Update::Finished(Err("playback error: 420 Enhance Your Calm".to_owned())),
+        );
+        assert_eq!(
+            app.downloads.items[0].state,
+            State::Failed("playback error: 420 Enhance Your Calm".to_owned())
+        );
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.error && notice.text.contains("Enhance Your Calm"))
+        );
+
+        // And the next one goes ahead exactly as it would have done.
+        answer(&mut app, 1, Update::Started);
+        answer(&mut app, 1, Update::Finished(Ok(())));
+        assert_eq!(app.downloads.items[1].state, State::Done);
+        assert_eq!(
+            app.downloads.items[0].state,
+            State::Failed("playback error: 420 Enhance Your Calm".to_owned()),
+            "the failure was painted over by the answer for another row"
+        );
+    }
+
+    /// The options a download runs with are the ones that were in force when it was
+    /// asked for. A queue can be an hour deep and the interface goes on being used the
+    /// whole time, so reading the quality when the episode's turn came would write a
+    /// file at whatever had been cycled to since - and the two episodes of one season
+    /// queued a minute apart would come out at different sizes.
+    #[test]
+    fn a_download_keeps_the_options_it_was_queued_with() {
+        let mut app = app();
+        with_episodes(&mut app, 1);
+        app.run(Command::Download);
+        app.run(Command::Quality);
+        assert_eq!(app.options.video_quality, "720p");
+
+        let sent = app.sent();
+        let [Request::Download(job)] = sent.as_slice() else {
+            panic!("the episode was not queued: {sent:?}");
+        };
+        assert_eq!(job.episode.id, "E1");
+        assert_eq!(job.options.video_quality, "1080p");
+        assert_eq!(job.options.audio_langs, ["ja-JP"]);
+    }
+
+    /// The bar crosses one part of the episode at a time, in the order the downloader
+    /// first mentioned them. The video and the first audio track come down side by
+    /// side, so a row showing whichever of them reported most recently would jump
+    /// between two percentages that have nothing to do with each other.
+    #[test]
+    fn the_bar_follows_the_part_still_being_waited_on() {
+        let mut app = app();
+        with_episodes(&mut app, 1);
+        app.run(Command::Download);
+        answer(&mut app, 0, Update::Started);
+
+        // Subtitles come down whole, so they are a part with no size to speak of until
+        // they are over - which they say by reporting one out of one.
+        let stage = |stage: &str, done, total| Update::Stage {
+            stage: stage.to_owned(),
+            done,
+            total,
+        };
+        answer(&mut app, 0, stage("subtitles", 0, 0));
+        assert_eq!(app.downloads.items[0].stage(), Some(("subtitles", None)));
+        answer(&mut app, 0, stage("subtitles", 1, 1));
+
+        answer(&mut app, 0, stage("video", 1, 10));
+        answer(&mut app, 0, stage("Japanese audio", 8, 10));
+        assert_eq!(
+            app.downloads.items[0].stage(),
+            Some(("video", Some(0.1))),
+            "the audio ran ahead and took the bar with it"
+        );
+
+        answer(&mut app, 0, stage("video", 10, 10));
+        assert_eq!(
+            app.downloads.items[0].stage(),
+            Some(("Japanese audio", Some(0.8))),
+            "the bar stayed on a part that has finished"
+        );
+        assert_eq!(
+            app.downloads.items[0].stages.len(),
+            3,
+            "a part that reports a thousand times is one row of the panel, not a thousand"
+        );
+    }
+
+    /// A queue is not much use if nothing can be taken out of it: a season queued by
+    /// mistake is ten rows and ten downloads to sit through. Everything but the episode
+    /// that is already running can go - that one is inside an hour of segments on a
+    /// thread of its own, and a row that vanished while the file went on being written
+    /// would be a lie.
+    #[test]
+    fn a_row_can_be_dropped_unless_it_is_the_one_downloading() {
+        let mut app = app();
+        with_episodes(&mut app, 3);
+        app.run(Command::DownloadSeason);
+        app.focus = Focus::Downloads;
+        answer(&mut app, 0, Update::Started);
+
+        app.run(Command::Open);
+        assert_eq!(app.downloads.items.len(), 3, "the running episode was cut");
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.text.contains("already downloading"))
+        );
+
+        // The two behind it have not been started, so they go - and the queue is told,
+        // since the request is already on its channel and cannot be taken off it.
+        app.run(Command::Down);
+        app.run(Command::Open);
+        assert_eq!(app.downloads.items.len(), 2);
+        assert_eq!(app.downloads.state.selected(), Some(1));
+
+        app.run(Command::Open);
+        assert_eq!(app.downloads.items.len(), 1);
+        assert_eq!(
+            app.downloads.state.selected(),
+            Some(0),
+            "the cursor was left past the end of what is left"
+        );
+
+        // And a row that is over goes the same way.
+        answer(&mut app, 0, Update::Finished(Ok(())));
+        app.run(Command::Open);
+        assert!(app.downloads.items.is_empty());
+        assert_eq!(app.downloads.state.selected(), None);
+    }
+
+    /// Leaving takes the download thread with it, so the episode being written is an
+    /// hour of segments thrown away and a scratch file left in the series directory. A
+    /// second ask is cheap and only ever happens while something is running; nothing
+    /// stands between anyone and the door the rest of the time.
+    #[test]
+    fn quitting_during_a_download_asks_twice() {
+        let mut app = app();
+        with_episodes(&mut app, 2);
+        app.run(Command::DownloadSeason);
+
+        // Nothing has started, so nothing is in the way.
+        assert!(matches!(app.run(Command::Quit), Action::Quit));
+
+        answer(&mut app, 0, Update::Started);
+        assert!(matches!(app.run(Command::Quit), Action::None));
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|notice| notice.error && notice.text.contains("still running"))
+        );
+        assert!(matches!(app.run(Command::Quit), Action::Quit));
+
+        // And asking for anything else in between is taking it back.
+        answer(&mut app, 0, Update::Started);
+        assert!(matches!(app.run(Command::Quit), Action::None));
+        app.run(Command::Down);
+        assert!(matches!(app.run(Command::Quit), Action::None));
+
+        // A download that is over is not one to be held up by.
+        answer(&mut app, 0, Update::Finished(Ok(())));
+        assert!(matches!(app.run(Command::Quit), Action::Quit));
+    }
+
+    /// The panel is a stop on the ring rather than somewhere only the mouse can reach,
+    /// and the ring closes: holding the key down can only go round.
+    #[test]
+    fn the_columns_cycle_through_the_downloads_panel() {
+        let mut app = app();
+        let mut visited = Vec::new();
+        for _ in 0..5 {
+            visited.push(app.focus);
+            app.run(Command::NextColumn);
+        }
+        assert_eq!(
+            visited,
+            [
+                Focus::Series,
+                Focus::Seasons,
+                Focus::Episodes,
+                Focus::Downloads,
+                Focus::Series
+            ]
+        );
+
+        // And `back` leaves it the way it leaves any other column: one to the left.
+        app.focus = Focus::Downloads;
+        app.run(Command::Back);
+        assert_eq!(app.focus, Focus::Episodes);
     }
 
     /// The interface opens on what was being watched last, and an account that has
@@ -1385,14 +1938,7 @@ mod tests {
     #[test]
     fn a_change_of_quality_asks_the_disk_again() {
         let mut app = app();
-        app.episodes.set(vec![SeasonEpisode {
-            id: "E1".to_owned(),
-            series_title: "Frieren".to_owned(),
-            season_number: 1,
-            episode_number: 1,
-            title: "The Journey Ends".to_owned(),
-            ..SeasonEpisode::default()
-        }]);
+        with_episodes(&mut app, 1);
         // Nothing of this series is anywhere near the directory the tests run in, so
         // whatever the column was told before, the answer now is that there is no file.
         app.downloaded.insert("E1".to_owned(), OnDisk::Complete);
@@ -1402,6 +1948,49 @@ mod tests {
         assert!(
             app.downloaded.is_empty(),
             "the marker outlived the quality it was looked up for"
+        );
+    }
+
+    /// The queue is what makes the marker worth having while the program is open: an
+    /// episode downloaded from the interface has to show as downloaded without the season
+    /// being fetched again, since that reload is the thing this saves. Three answers move
+    /// the disk and are asked about - the episode being taken up, the first part of it
+    /// reporting, and the end - and the hundreds of percentages in between are not.
+    #[test]
+    fn a_download_moves_the_marker_without_the_season_being_reloaded() {
+        let mut app = app();
+        with_episodes(&mut app, 1);
+        app.run(Command::Download);
+
+        let stage = |done| Update::Stage {
+            stage: "video".to_owned(),
+            done,
+            total: 12,
+        };
+        // Nothing of this series is anywhere near the directory the tests run in, so a
+        // column that was asked again is a column with nothing left in it.
+        for update in [Update::Started, stage(3)] {
+            app.downloaded.insert("E1".to_owned(), OnDisk::Complete);
+            answer(&mut app, 0, update);
+            assert!(
+                app.downloaded.is_empty(),
+                "the column kept an answer from before the download changed the disk"
+            );
+        }
+
+        app.downloaded.insert("E1".to_owned(), OnDisk::Complete);
+        answer(&mut app, 0, stage(9));
+        assert_eq!(
+            app.downloaded.len(),
+            1,
+            "a percentage is the same file getting bigger, and the panel draws hundreds"
+        );
+
+        app.downloaded.insert("E1".to_owned(), OnDisk::Complete);
+        answer(&mut app, 0, Update::Finished(Ok(())));
+        assert!(
+            app.downloaded.is_empty(),
+            "the episode landed and the column was never asked"
         );
     }
 }
