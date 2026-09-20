@@ -269,6 +269,10 @@ fn run() -> Result<()> {
         // that plays rather than here - see `playing_options`.
         start_at: None,
         playhead: None,
+        // The command line owns the terminal it was typed at, so it keeps the printing
+        // and the progress bars. The interface fills this in for the downloads it
+        // queues, since it is drawing over the same screen.
+        reporter: None,
     };
     // The terminal can only be asked what it draws once it is not about to be handed to
     // something else, and the interface asks on its own account when it opens, so a run

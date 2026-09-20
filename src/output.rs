@@ -107,6 +107,9 @@ pub fn build_mux_command(
     command
 }
 
+/// Muxes the tracks into the MKV, and says nothing about having done it: the caller
+/// knows whether anyone is watching the terminal, and the interface has a download
+/// thread whose lines would land in the middle of the catalogue.
 pub fn merge_everything(
     video: &MediaTrack,
     audio_tracks: &[MediaTrack],
@@ -126,9 +129,5 @@ pub fn merge_everything(
         );
     }
 
-    println!(
-        "\nDownload finished! Output file: {}\n",
-        output_file.display()
-    );
     Ok(())
 }

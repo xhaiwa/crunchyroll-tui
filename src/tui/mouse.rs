@@ -78,6 +78,10 @@ pub struct Regions {
     pub series: Rect,
     pub seasons: Rect,
     pub episodes: Rect,
+    /// The queue, while there is one. It is drawn under the columns and only when it
+    /// holds something, so an empty queue leaves an empty box here and nothing for a
+    /// pointer to land on.
+    pub downloads: Rect,
     /// The language list while it is open, and nothing while it is not.
     pub picker: Rect,
     /// Every word drawn along the top and bottom edges, and the command it runs. One
@@ -92,6 +96,7 @@ impl Regions {
             Focus::Series => self.series,
             Focus::Seasons => self.seasons,
             Focus::Episodes => self.episodes,
+            Focus::Downloads => self.downloads,
         }
     }
 
@@ -117,10 +122,15 @@ impl Regions {
         if let Some((command, _)) = self.buttons.iter().find(|(_, area)| area.contains(at)) {
             return Target::Button(*command);
         }
-        [Focus::Series, Focus::Seasons, Focus::Episodes]
-            .into_iter()
-            .find(|focus| self.column(*focus).contains(at))
-            .map_or(Target::Nothing, Target::Column)
+        [
+            Focus::Series,
+            Focus::Seasons,
+            Focus::Episodes,
+            Focus::Downloads,
+        ]
+        .into_iter()
+        .find(|focus| self.column(*focus).contains(at))
+        .map_or(Target::Nothing, Target::Column)
     }
 }
 
@@ -341,6 +351,7 @@ mod tests {
                 ..COLUMN
             },
             episodes: Rect { x: 50, ..COLUMN },
+            downloads: Rect::default(),
             picker: Rect::default(),
             buttons: vec![(
                 Command::Quit,

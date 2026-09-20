@@ -110,6 +110,147 @@ pub struct DownloadOptions {
     /// Where the position mpv is at goes while it plays, so the account stays in step
     /// with the phone and the web player. `None` on a run with nobody to tell.
     pub playhead: Option<Arc<dyn Fn(u32) + Send + Sync>>,
+    /// Who is watching this download, when it is not the terminal.
+    ///
+    /// The command line leaves this empty and gets what it has always had: sentences on
+    /// stdout and indicatif's bars underneath them. The interface sets it, because it
+    /// owns the screen - a line printed from a download thread lands in the middle of
+    /// the catalogue - and because it would rather have the numbers than a picture of
+    /// them, having a row of its own to draw. So with a reporter nothing at all reaches
+    /// stdout or stderr, every bar is a hidden one, and everything the run would have
+    /// said or drawn goes through here instead.
+    pub reporter: Option<Reporter>,
+}
+
+/// Where a download's commentary goes when the terminal is not ours.
+///
+/// Shared and callable from anywhere, like `playhead` above it: the tracks come down on
+/// threads of their own and each of them has something to say about how far it has got.
+pub type Reporter = Arc<dyn Fn(Progress) + Send + Sync>;
+
+/// What a download has to say for itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Progress {
+    /// A sentence the run would have printed, had it owned the terminal.
+    Note(String),
+    /// Which part of the episode is moving, and how far it has got: `done` out of
+    /// `total`. A `total` of zero is a part whose size nothing knows yet - a subtitle
+    /// fetch, or an on-demand track whose server has not said how long the file is - so
+    /// it is a bar that cannot be drawn rather than one that is finished. A part that
+    /// ends without ever knowing its size says so by reporting one out of one.
+    Stage {
+        stage: String,
+        done: u64,
+        total: u64,
+    },
+}
+
+impl DownloadOptions {
+    /// Says something, wherever this run's words go: to stdout for a command line that
+    /// owns the terminal, and to the reporter for a caller that is drawing over it.
+    fn say(&self, message: impl Into<String>) {
+        match &self.reporter {
+            Some(reporter) => reporter(Progress::Note(message.into())),
+            None => println!("{}", message.into()),
+        }
+    }
+
+    /// The same, for what the run has always put on stderr. The two are kept apart so
+    /// that a run with no reporter behind it writes exactly what it wrote before, down
+    /// to which stream each line went out on.
+    fn warn(&self, message: impl Into<String>) {
+        match &self.reporter {
+            Some(reporter) => reporter(Progress::Note(message.into())),
+            None => eprintln!("{}", message.into()),
+        }
+    }
+
+    /// Where a part of the episode has got to. Nothing at all without a reporter: the
+    /// command line is watching indicatif draw the same numbers.
+    fn report(&self, stage: &str, done: u64, total: u64) {
+        if let Some(reporter) = &self.reporter {
+            reporter(Progress::Stage {
+                stage: stage.to_owned(),
+                done,
+                total,
+            });
+        }
+    }
+}
+
+/// Who is watching one track come down, and what they want to see of it.
+///
+/// Three callers and one type, because the three are exclusive. The command line owns
+/// the terminal and gets the bar it has always had. Playback owns nothing - mpv has the
+/// screen - and gets no bar and no printing. The interface owns the screen itself and
+/// wants the numbers rather than a picture of them, so it gets neither the bar nor the
+/// printing and is handed every step through its reporter.
+struct Watch<'a> {
+    /// What the bar is titled: `Downloading video`, `Downloading Japanese audio`.
+    title: &'a str,
+    /// What the reporter calls this part of the episode. Shorter than the title,
+    /// because it is drawn on a row beside a bar rather than in front of one.
+    stage: &'a str,
+    /// Whether anything may be drawn on the terminal at all.
+    drawn: bool,
+    reporter: Option<&'a Reporter>,
+    /// How far along this track was when it last said so, in thousandths. A track is
+    /// read in sixty-four kilobyte pieces and a 1080p episode is tens of thousands of
+    /// them, while nobody can see a bar move by a tenth of a percent - so a report only
+    /// goes out when the number someone could read has changed. A track whose size
+    /// nothing knows reports itself once and then keeps quiet until it does.
+    reported: AtomicU64,
+}
+
+impl<'a> Watch<'a> {
+    fn new(title: &'a str, stage: &'a str, reporter: Option<&'a Reporter>) -> Self {
+        Self {
+            title,
+            stage,
+            drawn: reporter.is_none(),
+            reporter,
+            reported: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// A track nobody is watching: mpv has the terminal, and the run has nobody to tell.
+    const fn unwatched() -> Self {
+        Self {
+            title: "",
+            stage: "",
+            drawn: false,
+            reporter: None,
+            reported: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// The bar this track draws with, which draws nothing unless the terminal is ours.
+    fn bar(&self, total: u64, label: &str) -> ProgressBar {
+        if self.drawn {
+            ProgressBar::new(self.title, total, label)
+        } else {
+            ProgressBar::hidden()
+        }
+    }
+
+    /// Where this track has got to, for whoever is drawing their own bar.
+    fn at(&self, done: u64, total: u64) {
+        let Some(reporter) = self.reporter else {
+            return;
+        };
+        let permille = if total == 0 {
+            0
+        } else {
+            done.saturating_mul(1000) / total
+        };
+        if self.reported.swap(permille, Ordering::Relaxed) != permille {
+            reporter(Progress::Stage {
+                stage: self.stage.to_owned(),
+                done,
+                total,
+            });
+        }
+    }
 }
 
 /// Written out rather than derived, because a boxed callback is not something that can be
@@ -127,6 +268,7 @@ impl fmt::Debug for DownloadOptions {
             .field("mpv_args", &self.mpv_args)
             .field("start_at", &self.start_at)
             .field("playhead", &self.playhead.as_ref().map(|_| "set"))
+            .field("reporter", &self.reporter.as_ref().map(|_| "set"))
             .finish()
     }
 }
@@ -494,17 +636,16 @@ fn stream_on_demand(
     client: &CrunchyrollClient,
     url: &str,
     start: u64,
-    title: &str,
-    quiet: bool,
+    watch: &Watch<'_>,
     writer: &mut impl Write,
 ) -> Result<()> {
     let (response, mut total) = open_on_demand(client, url, start, start)?;
-    let bar = if quiet {
-        ProgressBar::hidden()
-    } else {
-        let known = total.or_else(|| response.content_length().map(|length| start + length));
-        ProgressBar::new(title, known.unwrap_or_default(), "")
-    };
+    let known = total.or_else(|| response.content_length().map(|length| start + length));
+    let bar = watch.bar(known.unwrap_or_default(), "");
+    // Before a byte has moved, so that whoever is drawing this knows the track exists
+    // and is waiting on it. A server that would not say how long the file is leaves a
+    // zero here, which is a part with no size rather than a part that is finished.
+    watch.at(start, known.unwrap_or_default());
     let streamed = (|| {
         let mut position = start;
         let mut failures = 0_u32;
@@ -527,6 +668,7 @@ fn stream_on_demand(
                                 position += count as u64;
                                 failures = 0;
                                 bar.update(position);
+                                watch.at(position, total.unwrap_or_default());
                             }
                             Err(error) => break Some(anyhow::Error::new(error)),
                         }
@@ -640,13 +782,12 @@ impl<'a> TrackSource<'a> {
         }
     }
 
-    /// Streams everything after the initialization segment into `writer`. `quiet`
-    /// suppresses the progress bar for playback, where mpv owns the terminal.
+    /// Streams everything after the initialization segment into `writer`. `watch` says
+    /// who is following it along: see [`Watch`].
     fn body(
         &self,
         client: &CrunchyrollClient,
-        title: &str,
-        quiet: bool,
+        watch: &Watch<'_>,
         writer: &mut impl Write,
     ) -> Result<()> {
         match self {
@@ -669,16 +810,17 @@ impl<'a> TrackSource<'a> {
                         )
                     })
                     .collect();
-                let bar = if quiet {
-                    ProgressBar::hidden()
-                } else {
-                    ProgressBar::new(title, urls.len() as u64, "segments")
-                };
+                let segments = urls.len() as u64;
+                let bar = watch.bar(segments, "segments");
+                watch.at(0, segments);
                 let streamed = stream_segments(
                     writer,
                     &urls,
                     |url| download_part(client, url),
-                    |count| bar.update(count),
+                    |count| {
+                        bar.update(count);
+                        watch.at(count, segments);
+                    },
                 );
                 bar.finish();
                 streamed
@@ -688,14 +830,7 @@ impl<'a> TrackSource<'a> {
                 representation,
             } => {
                 let (index_start, _) = parse_byte_range(&segment_base.index_range)?;
-                stream_on_demand(
-                    client,
-                    &representation.base_url,
-                    index_start,
-                    title,
-                    quiet,
-                    writer,
-                )
+                stream_on_demand(client, &representation.base_url, index_start, watch, writer)
             }
         }
     }
@@ -714,7 +849,7 @@ enum Destination<'a> {
 fn fetch_to_file(
     client: &CrunchyrollClient,
     scratch: &Path,
-    title: &str,
+    watch: &Watch<'_>,
     source: &TrackSource<'_>,
     is_video: bool,
     keys: &[Key],
@@ -734,7 +869,7 @@ fn fetch_to_file(
         let mut file = File::create(&encrypted).context("create encrypted temporary media")?;
         file.write_all(&init_data)
             .context("write initialization segment")?;
-        source.body(client, title, false, &mut file)?;
+        source.body(client, watch, &mut file)?;
         drop(file);
         decrypt_mp4(&init_data, &encrypted, &output, keys)?;
         Ok(output.clone())
@@ -769,7 +904,7 @@ fn fetch_to_pipe(
     let result = pipe
         .write_all(&init_data)
         .context("write initialization segment")
-        .and_then(|()| source.body(client, "", true, &mut pipe));
+        .and_then(|()| source.body(client, &Watch::unwatched(), &mut pipe));
     match result {
         Err(error) if is_broken_pipe(&error) => Ok(()),
         other => other,
@@ -784,6 +919,9 @@ struct TrackRequest<'a> {
     keys: &'a [Key],
     /// Index this track occupies in the live pipe set, ignored for file downloads.
     slot: usize,
+    /// Who to tell how this track is getting on, carried down from the options so that
+    /// the one place that knows what a track is called is the one that names it.
+    reporter: Option<&'a Reporter>,
 }
 
 /// Returns the finished track for a file download, and nothing for playback, where the
@@ -814,15 +952,22 @@ fn fetch_track(
 
     match destination {
         Destination::Files(scratch) => {
-            let title = if request.is_video {
-                "Downloading video".to_owned()
+            // Two names for the same track: the sentence a bar of its own is titled
+            // with, and the word a row beside a bar has room for.
+            let (title, stage) = if request.is_video {
+                ("Downloading video".to_owned(), "video".to_owned())
             } else {
-                format!("Downloading {} audio", language_name(&locale))
+                let language = language_name(&locale);
+                (
+                    format!("Downloading {language} audio"),
+                    format!("{language} audio"),
+                )
             };
+            let watch = Watch::new(&title, &stage, request.reporter);
             let file = fetch_to_file(
                 client,
                 scratch,
-                &title,
+                &watch,
                 &source,
                 request.is_video,
                 request.keys,
@@ -886,6 +1031,7 @@ fn fetch_version(
         is_video: false,
         keys: &keys,
         slot: index + 1,
+        reporter: options.reporter.as_ref(),
     };
     let mut tracks = VersionTracks::default();
     if index == 0 {
@@ -896,6 +1042,7 @@ fn fetch_version(
             is_video: true,
             keys: &keys,
             slot: 0,
+            reporter: options.reporter.as_ref(),
         };
         thread::scope(|scope| {
             let video = scope.spawn(|| fetch_track(client, &video_request, destination));
@@ -925,9 +1072,8 @@ fn fetch_version(
 
     match client.delete_stream(content_id, &episode.token) {
         Ok(true) => {}
-        Ok(false) | Err(_) => eprintln!(
-            "Failed to remove the player stream; later episodes may be temporarily blocked."
-        ),
+        Ok(false) | Err(_) => options
+            .warn("Failed to remove the player stream; later episodes may be temporarily blocked."),
     }
     active_streams
         .lock()
@@ -1222,6 +1368,7 @@ fn requested_or_all(requested: &[String], available: &HashMap<String, Subtitle>)
 }
 
 fn filter_available(
+    options: &DownloadOptions,
     requested: Vec<String>,
     available: &HashMap<String, Subtitle>,
     kind: &str,
@@ -1232,9 +1379,9 @@ fn filter_available(
         .filter(|locale| {
             let present = available.get(locale).is_some_and(|item| !item.url.is_empty());
             if !present {
-                println!(
+                options.say(format!(
                     "! {kind} locale {locale} is not available for episode {episode_number}, skipping it."
-                );
+                ));
             }
             present
         })
@@ -1262,10 +1409,10 @@ pub fn download_episode(
         )))
     };
     if output_file.as_ref().is_some_and(|file| file.exists()) {
-        println!(
+        options.say(format!(
             "Episode {} is already downloaded, skipping...",
             info.episode_metadata.episode_number
-        );
+        ));
         return Ok(());
     }
 
@@ -1294,10 +1441,10 @@ pub fn download_episode(
             if let Some(guid) = guid_by_locale.get(locale) {
                 Some((locale.clone(), guid.clone()))
             } else {
-                println!(
+                options.say(format!(
                     "! Audio locale {locale} is not available for episode {}, skipping it.",
                     info.episode_metadata.episode_number
-                );
+                ));
                 None
             }
         })
@@ -1309,7 +1456,7 @@ pub fn download_episode(
         );
     }
 
-    println!(
+    options.say(format!(
         "{}: {} (S{:02}E{:02}) from {}",
         if options.play {
             "Playing"
@@ -1320,7 +1467,7 @@ pub fn download_episode(
         info.episode_metadata.season_number,
         info.episode_metadata.episode_number,
         info.episode_metadata.series_title
-    );
+    ));
     let first_episode = client.episode(&versions[0].1)?;
     let active_streams = Arc::new(Mutex::new(HashMap::<String, String>::from([(
         versions[0].1.clone(),
@@ -1329,23 +1476,25 @@ pub fn download_episode(
 
     let result = (|| -> Result<()> {
         let subtitles_langs = filter_available(
+            options,
             requested_or_all(&options.subtitles_langs, &first_episode.subtitles),
             &first_episode.subtitles,
             "Subtitle",
             info.episode_metadata.episode_number,
         );
         let cc_langs = filter_available(
+            options,
             requested_or_all(&options.cc_langs, &first_episode.captions),
             &first_episode.captions,
             "Closed caption",
             info.episode_metadata.episode_number,
         );
-        println!(
+        options.say(format!(
             "Audio locales: {} | Subtitle locales: {} | CC locales: {}",
             audio_langs.join(", "),
             subtitles_langs.join(", "),
             cc_langs.join(", ")
-        );
+        ));
 
         let mut sub_jobs = Vec::new();
         for locale in subtitles_langs {
@@ -1356,9 +1505,16 @@ pub fn download_episode(
             let caption = first_episode.captions[&locale].clone();
             sub_jobs.push((locale, true, caption));
         }
+        // Subtitles are small files fetched whole, so there is no fraction to report
+        // along the way: the stage stands as a part with no size until it is over, and
+        // one out of one is how it says it is.
+        if !sub_jobs.is_empty() {
+            options.report("subtitles", 0, 0);
+        }
         let subtitle_tracks = fetch_subtitles(client, &scratch, &sub_jobs)?;
         if !subtitle_tracks.is_empty() {
-            println!("Downloaded subtitles!");
+            options.report("subtitles", 1, 1);
+            options.say("Downloaded subtitles!");
         }
 
         let outcome = match &output_file {
@@ -1371,7 +1527,16 @@ pub fn download_episode(
                 &active_streams,
             )
             .and_then(|(video, audio)| {
-                let merged = merge_everything(&video, &audio, &subtitle_tracks, output_file, info);
+                // ffmpeg is handed everything at once and says nothing until it is
+                // finished, so this is a part with no size for the whole of its length.
+                options.report("muxing", 0, 0);
+                let merged = merge_everything(&video, &audio, &subtitle_tracks, output_file, info)
+                    .inspect(|()| {
+                        options.say(format!(
+                            "\nDownload finished! Output file: {}\n",
+                            output_file.display()
+                        ));
+                    });
                 remove_track(Some(&video));
                 for track in &audio {
                     let _ = fs::remove_file(&track.file);
@@ -1394,7 +1559,7 @@ pub fn download_episode(
         outcome
     })();
 
-    println!("Cleaning up playback sessions...");
+    options.say("Cleaning up playback sessions...");
     let remaining = std::mem::take(&mut *active_streams.lock().expect("active streams poisoned"));
     for (content_id, stream_token) in remaining {
         let _ = client.delete_stream(&content_id, &stream_token);
