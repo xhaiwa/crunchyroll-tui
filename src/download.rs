@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,6 +25,7 @@ use crate::model::{Episode, EpisodeInfo, EpisodeMetadata, SeasonEpisode, Subtitl
 use crate::output::{MediaTrack, merge_everything};
 use crate::play::{LivePipes, Playback, play, resume_at};
 use crate::progress::ProgressBar;
+use crate::resume::{PickUp, Resume, Run, Track, part_path, state_path};
 use crate::util::{language_name, sanitize_filename};
 
 const MAX_WORKERS: usize = 10;
@@ -172,6 +173,68 @@ pub fn playing_options(
             }
         })),
         ..options.clone()
+    }
+}
+
+/// Where an episode's MKV goes: a directory named after the series, and inside it the
+/// series, the season and episode numbers, the episode title and the video quality.
+///
+/// It is a function rather than three lines inside the downloader because more than the
+/// downloader needs the answer now. The episodes column marks what is already on disk
+/// and the resume has to find the `.part` of an episode it never started itself, and a
+/// second copy of this format string in either of them would drift the first time
+/// somebody renamed anything.
+///
+/// The path is relative, as it has always been: episodes land under the directory the
+/// program was started in.
+pub fn output_path(info: &EpisodeInfo, video_quality: &str) -> PathBuf {
+    output_in(Path::new(""), info, video_quality)
+}
+
+/// `output_path` against some other directory, which is what lets a test look at real
+/// files without moving the whole process - and every test running beside it - into a
+/// temporary directory.
+fn output_in(base: &Path, info: &EpisodeInfo, video_quality: &str) -> PathBuf {
+    let series_title = sanitize_filename(&info.episode_metadata.series_title);
+    let episode_title = sanitize_filename(&info.title);
+    let name = format!(
+        "{series_title} S{:02}E{:02} - {episode_title} [{video_quality}].mkv",
+        info.episode_metadata.season_number, info.episode_metadata.episode_number,
+    );
+    base.join(series_title).join(name)
+}
+
+/// What an episode amounts to on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDisk {
+    Missing,
+    Partial,
+    Complete,
+}
+
+/// Whether an episode has been downloaded, half downloaded, or not downloaded.
+///
+/// `Complete` is the finished name and nothing else, which is what makes it safe to skip
+/// an episode on: a download in progress writes to `<name>.mkv.part` and only renames it
+/// once ffmpeg has succeeded, so a file under the finished name is a whole episode.
+/// `Partial` is either that `.part` or the state file beside it - the `.part` exists only
+/// for the length of the mux, while the state file is there from the first track that
+/// arrives, so it is the state file that answers for most of a download.
+///
+/// This only ever looks. It creates no directory and no file, so the interface can ask it
+/// about every episode of a season it is merely drawing.
+pub fn on_disk(info: &EpisodeInfo, video_quality: &str) -> OnDisk {
+    on_disk_in(Path::new(""), info, video_quality)
+}
+
+fn on_disk_in(base: &Path, info: &EpisodeInfo, video_quality: &str) -> OnDisk {
+    let output = output_in(base, info, video_quality);
+    if output.exists() {
+        OnDisk::Complete
+    } else if part_path(&output).exists() || state_path(&output).exists() {
+        OnDisk::Partial
+    } else {
+        OnDisk::Missing
     }
 }
 
@@ -483,7 +546,16 @@ fn open_on_demand(
     }
 }
 
-/// Streams `url` from byte `start` to the end of the file into `writer`.
+/// Streams `url` from byte `from` to the end of the file into `writer`, where `origin`
+/// is the first byte of the body.
+///
+/// The two are the same byte on a track that starts here and differ when a buffer a
+/// previous run left is being carried on, which is the whole of why they are separate
+/// arguments. A server that ignores a byte range answers with the file from the top, and
+/// that is a fresh start rather than a continuation: appending one to a buffer would
+/// splice the beginning of the track into the middle of it, and the MKV would mux
+/// without complaint. So the "did the range survive" check downstream measures against
+/// `origin`, and anything past it has to come back as a real ranged response.
 ///
 /// One response covers the whole track, and it is read at the speed the consumer drains
 /// it: during playback that is real time, so twenty minutes on a connection the CDN is
@@ -493,20 +565,21 @@ fn open_on_demand(
 fn stream_on_demand(
     client: &CrunchyrollClient,
     url: &str,
-    start: u64,
+    origin: u64,
+    from: u64,
     title: &str,
     quiet: bool,
     writer: &mut impl Write,
 ) -> Result<()> {
-    let (response, mut total) = open_on_demand(client, url, start, start)?;
+    let (response, mut total) = open_on_demand(client, url, origin, from)?;
     let bar = if quiet {
         ProgressBar::hidden()
     } else {
-        let known = total.or_else(|| response.content_length().map(|length| start + length));
+        let known = total.or_else(|| response.content_length().map(|length| from + length));
         ProgressBar::new(title, known.unwrap_or_default(), "")
     };
     let streamed = (|| {
-        let mut position = start;
+        let mut position = from;
         let mut failures = 0_u32;
         let mut opened = Ok((response, total));
         loop {
@@ -559,7 +632,7 @@ fn stream_on_demand(
                 });
             }
             thread::sleep(retry_gap(failures));
-            opened = open_on_demand(client, url, start, position);
+            opened = open_on_demand(client, url, origin, position);
         }
     })();
     bar.finish();
@@ -573,6 +646,23 @@ fn download_range(client: &CrunchyrollClient, url: &str, start: u64, end: u64) -
         Some(format!("bytes={start}-{end}")),
     )?)
     .context("read ranged media response")
+}
+
+/// How long the whole of `url` is, asked with a one-byte range so that the answer costs
+/// a header rather than a track.
+///
+/// `None` when the server declined to say, which a resumed download treats as a refusal:
+/// without a length there is nothing to check a buffer against, and a buffer that turns
+/// out to be longer than the file it belongs to would have every later request answered
+/// 416. An error is something else again and is handed back rather than read as a
+/// refusal - the buffer may be perfectly good, and a connection that dropped in this one
+/// second is no reason to throw a gigabyte away.
+fn remote_length(client: &CrunchyrollClient, url: &str) -> Result<Option<u64>> {
+    with_retries(PART_ATTEMPTS, retry_gap, || {
+        let response = media_request(client, url, Some("bytes=0-0".to_owned()))?;
+        Ok(content_range(&response).and_then(|(_, total)| total))
+    })
+    .with_context(|| format!("ask how long {url} is"))
 }
 
 /// The two shapes a DASH representation comes in: numbered segments listed in a
@@ -640,14 +730,35 @@ impl<'a> TrackSource<'a> {
         }
     }
 
-    /// Streams everything after the initialization segment into `writer`. `quiet`
-    /// suppresses the progress bar for playback, where mpv owns the terminal.
+    /// The file an on-demand track is one long range of, and the first byte of its body.
+    ///
+    /// A segmented track has neither, which is what the `None` says and what decides
+    /// whether a buffer of this track can be carried on across runs at all: one ranged
+    /// response has a length that tells a later run exactly which byte to ask for next,
+    /// while a pile of segments has only a byte count that falls between two of them.
+    fn on_demand(&self) -> Result<Option<(&str, u64)>> {
+        match self {
+            Self::Segmented { .. } => Ok(None),
+            Self::OnDemand {
+                segment_base,
+                representation,
+            } => {
+                let (index_start, _) = parse_byte_range(&segment_base.index_range)?;
+                Ok(Some((representation.base_url.as_str(), index_start)))
+            }
+        }
+    }
+
+    /// Streams everything after the initialization segment into `writer`, from byte
+    /// `from` of the remote file when a buffer is being carried on rather than started.
+    /// `quiet` suppresses the progress bar for playback, where mpv owns the terminal.
     fn body(
         &self,
         client: &CrunchyrollClient,
         title: &str,
         quiet: bool,
         writer: &mut impl Write,
+        from: Option<u64>,
     ) -> Result<()> {
         match self {
             Self::Segmented {
@@ -692,6 +803,7 @@ impl<'a> TrackSource<'a> {
                     client,
                     &representation.base_url,
                     index_start,
+                    from.unwrap_or(index_start),
                     title,
                     quiet,
                     writer,
@@ -701,49 +813,141 @@ impl<'a> TrackSource<'a> {
     }
 }
 
+/// How much of a track's body there is left to fetch.
+enum Body {
+    /// All of it, from wherever the manifest says the body begins.
+    Whole,
+    /// From this byte of the remote file on, carrying a buffer an earlier run left.
+    From(u64),
+    /// None of it: the buffer already holds the whole body and only the decryption was
+    /// missed, which is what a run killed after the last byte leaves behind.
+    Done,
+}
+
+/// Where a file download buffers, and what an earlier run of it already managed.
+struct FileTarget<'a> {
+    scratch: &'a Path,
+    resume: &'a Resume,
+}
+
 /// Where a media track ends up once it has been pulled off the CDN.
 enum Destination<'a> {
     /// Buffer it on disk in the given directory, decrypt it into a temporary MP4
     /// there and mux later.
-    Files(&'a Path),
+    Files(&'a FileTarget<'a>),
     /// Feed it into a named pipe and let ffmpeg decrypt it on the fly for mpv.
     Pipes(&'a LivePipes),
 }
 
 /// Buffers the encrypted track on disk, then decrypts it into a temporary MP4.
+///
+/// The buffer is where a run that is killed leaves its work, so it is written down
+/// before the first byte of the body goes into it rather than cleaned up quietly at the
+/// end: a `kill -9` runs nothing, and a gigabyte of scratch nothing has a name for is
+/// worse than one the next run knows to either carry on or sweep away.
 fn fetch_to_file(
     client: &CrunchyrollClient,
-    scratch: &Path,
+    target: &FileTarget<'_>,
+    track: &Track,
     title: &str,
     source: &TrackSource<'_>,
     is_video: bool,
     keys: &[Key],
 ) -> Result<PathBuf> {
     let init_data = source.initialization(client)?;
-    let output = temp_path(
-        scratch,
-        if is_video {
-            ".crdl-video-"
-        } else {
-            ".crdl-audio-"
-        },
-        ".mp4",
-    )?;
-    let encrypted = encrypted_path(&output);
-    let result = (|| {
-        let mut file = File::create(&encrypted).context("create encrypted temporary media")?;
-        file.write_all(&init_data)
-            .context("write initialization segment")?;
-        source.body(client, title, false, &mut file)?;
-        drop(file);
-        decrypt_mp4(&init_data, &encrypted, &output, keys)?;
-        Ok(output.clone())
-    })();
-    let _ = fs::remove_file(&encrypted);
-    if result.is_err() {
-        let _ = fs::remove_file(&output);
+    let on_demand = source.on_demand()?;
+    // The length is asked for only when there is a buffer to measure against it, since
+    // it costs a request of its own, and it is asked for now rather than remembered from
+    // the run that wrote the buffer: a number measured against the file being downloaded
+    // this minute is worth more than one a previous run wrote down.
+    let picked_up = match on_demand.filter(|_| target.resume.has_buffer(track)) {
+        Some((url, index)) => {
+            let total = remote_length(client, url)?;
+            target.resume.pick_up(track, &init_data, index, total)
+        }
+        None => None,
+    };
+
+    let (output, encrypted, mut file, body, buffered) = match picked_up {
+        Some(picked) => {
+            let file = OpenOptions::new()
+                .append(true)
+                .open(&picked.buffer)
+                .with_context(|| format!("open {} to carry it on", picked.buffer.display()))?;
+            println!(
+                "{title}: carrying on from byte {} of the last run.",
+                picked.from
+            );
+            let body = if picked.complete {
+                Body::Done
+            } else {
+                Body::From(picked.from)
+            };
+            (picked.file, picked.buffer, file, body, picked.buffered)
+        }
+        None => {
+            let output = temp_path(
+                target.scratch,
+                if is_video {
+                    ".crdl-video-"
+                } else {
+                    ".crdl-audio-"
+                },
+                ".mp4",
+            )?;
+            let encrypted = encrypted_path(&output);
+            let mut file = File::create(&encrypted).context("create encrypted temporary media")?;
+            file.write_all(&init_data)
+                .context("write initialization segment")?;
+            target.resume.starting(
+                track,
+                encrypted.clone(),
+                output.clone(),
+                on_demand.map(|(_, index)| PickUp {
+                    init: init_data.len() as u64,
+                    index,
+                }),
+            );
+            (output, encrypted, file, Body::Whole, 0)
+        }
+    };
+
+    let streamed = match body {
+        Body::Whole => source.body(client, title, false, &mut file, None),
+        Body::From(from) => source.body(client, title, false, &mut file, Some(from)),
+        Body::Done => Ok(()),
+    };
+    drop(file);
+    if let Err(error) = streamed {
+        // A pick-up that was refused outright - a range the CDN would not serve, a file
+        // that has moved on - leaves the buffer exactly as long as it was and would fail
+        // the same way on every run from here to the end of time, so it is thrown away
+        // and the track starts clean next time. One that stopped after delivering
+        // something is an ordinary broken connection, and the bytes it did deliver are
+        // worth keeping. A segmented buffer is thrown away either way, since nothing can
+        // be done with it afterwards.
+        let refused =
+            buffered > 0 && fs::metadata(&encrypted).is_ok_and(|meta| meta.len() == buffered);
+        if refused || on_demand.is_none() {
+            target.resume.forget(track);
+        }
+        return Err(error);
     }
-    result
+
+    let decrypted = decrypt_mp4(&init_data, &encrypted, &output, keys);
+    let _ = fs::remove_file(&encrypted);
+    match decrypted {
+        Ok(()) => {
+            target.resume.arrived(track, &output);
+            Ok(output)
+        }
+        Err(error) => {
+            // The buffer has just been deleted, so there is nothing left to carry on
+            // from and the whole track starts again next time.
+            target.resume.forget(track);
+            Err(error)
+        }
+    }
 }
 
 /// Streams the still-encrypted track into a named pipe, publishing the pipe and its key
@@ -769,7 +973,7 @@ fn fetch_to_pipe(
     let result = pipe
         .write_all(&init_data)
         .context("write initialization segment")
-        .and_then(|()| source.body(client, "", true, &mut pipe));
+        .and_then(|()| source.body(client, "", true, &mut pipe, None));
     match result {
         Err(error) if is_broken_pipe(&error) => Ok(()),
         other => other,
@@ -784,6 +988,34 @@ struct TrackRequest<'a> {
     keys: &'a [Key],
     /// Index this track occupies in the live pipe set, ignored for file downloads.
     slot: usize,
+}
+
+/// Which of an episode's tracks this is, as the state file names it.
+fn media_track(is_video: bool, locale: &str) -> Track {
+    if is_video {
+        Track::Video
+    } else {
+        Track::Audio {
+            locale: locale.to_owned(),
+        }
+    }
+}
+
+/// What to call a track on screen. One function, because the progress bar and the line
+/// that says a track is being kept rather than fetched should not disagree about which
+/// track they mean.
+fn track_label(is_video: bool, locale: &str) -> String {
+    if is_video {
+        "video".to_owned()
+    } else {
+        format!("{} audio", language_name(locale))
+    }
+}
+
+/// Says that a track is not being downloaded, which without a word would look like a
+/// download that has stalled at nothing.
+fn say_kept(label: &str) {
+    println!("Keeping the {label} an earlier run had already finished.");
 }
 
 /// Returns the finished track for a file download, and nothing for playback, where the
@@ -813,16 +1045,18 @@ fn fetch_track(
     let locale = request.locale.unwrap_or_default().to_owned();
 
     match destination {
-        Destination::Files(scratch) => {
-            let title = if request.is_video {
-                "Downloading video".to_owned()
-            } else {
-                format!("Downloading {} audio", language_name(&locale))
-            };
+        Destination::Files(target) => {
+            let track = media_track(request.is_video, &locale);
+            let label = track_label(request.is_video, &locale);
+            if let Some(file) = target.resume.finished(&track) {
+                say_kept(&label);
+                return Ok(Some(MediaTrack::media(file, locale, None)));
+            }
             let file = fetch_to_file(
                 client,
-                scratch,
-                &title,
+                target,
+                &track,
+                &format!("Downloading {label}"),
                 &source,
                 request.is_video,
                 request.keys,
@@ -842,6 +1076,29 @@ struct VersionTracks {
     audio: Option<MediaTrack>,
 }
 
+/// Everything this version would fetch, when an earlier run already fetched all of it.
+///
+/// Worth asking before anything else happens: opening a playback session and taking out
+/// a Widevine license are two network round trips and one of Crunchyroll's few
+/// concurrent streams, and a version with nothing left to download has no business
+/// spending either. A version that is only partly here says nothing and goes through the
+/// usual path, where each track asks again for itself.
+fn already_fetched(resume: &Resume, index: usize, locale: &str) -> Option<VersionTracks> {
+    let audio = resume.finished(&media_track(false, locale))?;
+    let video = match index {
+        0 => Some(resume.finished(&Track::Video)?),
+        _ => None,
+    };
+    if video.is_some() {
+        say_kept(&track_label(true, locale));
+    }
+    say_kept(&track_label(false, locale));
+    Some(VersionTracks {
+        video: video.map(|file| MediaTrack::media(file, String::new(), None)),
+        audio: Some(MediaTrack::media(audio, locale.to_owned(), None)),
+    })
+}
+
 /// Opens one audio locale's playback session and pulls its tracks. The first version
 /// also pulls the video, which every locale shares.
 #[allow(clippy::too_many_arguments)]
@@ -855,6 +1112,11 @@ fn fetch_version(
     active_streams: &Mutex<HashMap<String, String>>,
     destination: &Destination<'_>,
 ) -> Result<VersionTracks> {
+    if let Destination::Files(target) = destination
+        && let Some(tracks) = already_fetched(target.resume, index, locale)
+    {
+        return Ok(tracks);
+    }
     let episode: Episode = if index == 0 {
         first_episode.clone()
     } else {
@@ -903,20 +1165,16 @@ fn fetch_version(
             let video = video
                 .join()
                 .map_err(|_| anyhow::anyhow!("video download thread panicked"))?;
+            // Whichever of the two came out whole stays where it is. It is written down
+            // in the state file, and a run started again after this one failed has no
+            // reason to fetch a gigabyte of video a second time because the audio beside
+            // it lost its connection.
             match (audio, video) {
                 (Ok(audio), Ok(video)) => {
                     tracks = VersionTracks { video, audio };
                     Ok(())
                 }
-                (Err(error), Ok(video)) => {
-                    remove_track(video.as_ref());
-                    Err(error)
-                }
-                (Ok(audio), Err(error)) => {
-                    remove_track(audio.as_ref());
-                    Err(error)
-                }
-                (Err(error), Err(_)) => Err(error),
+                (Err(error), _) | (_, Err(error)) => Err(error),
             }
         })?;
     } else {
@@ -967,10 +1225,16 @@ fn download_subtitle(
 
 /// Subtitles are small and ffmpeg wants them as complete files, so they all come down
 /// before any media starts moving.
+///
+/// `resume` is what a download has and playback has not. With one, a subtitle already on
+/// disk is kept and a new one written down, and a failure leaves every file where it is
+/// for the next run; without one there is nothing to come back to, so a failure takes
+/// the files with it rather than leaving them in the system temporary directory.
 fn fetch_subtitles(
     client: &CrunchyrollClient,
     scratch: &Path,
     jobs: &[(String, bool, Subtitle)],
+    resume: Option<&Resume>,
 ) -> Result<Vec<MediaTrack>> {
     let mut tracks: Vec<Option<MediaTrack>> = vec![None; jobs.len()];
     let mut first_error = None;
@@ -980,9 +1244,22 @@ fn fetch_subtitles(
             .enumerate()
             .map(|(index, (locale, is_cc, subtitle))| {
                 scope.spawn(move || -> Result<(usize, MediaTrack)> {
-                    let file = download_subtitle(client, scratch, subtitle).with_context(|| {
-                        format!("download subtitles for {}", language_name(locale))
-                    })?;
+                    let track = Track::Subtitles {
+                        locale: locale.clone(),
+                        cc: *is_cc,
+                    };
+                    let file = match resume.and_then(|resume| resume.finished(&track)) {
+                        Some(file) => file,
+                        None => {
+                            let file = download_subtitle(client, scratch, subtitle).with_context(
+                                || format!("download subtitles for {}", language_name(locale)),
+                            )?;
+                            if let Some(resume) = resume {
+                                resume.arrived(&track, &file);
+                            }
+                            file
+                        }
+                    };
                     Ok((
                         index,
                         MediaTrack {
@@ -1008,8 +1285,10 @@ fn fetch_subtitles(
         }
     });
     if let Some(error) = first_error {
-        for track in tracks.iter().flatten() {
-            let _ = fs::remove_file(&track.file);
+        if resume.is_none() {
+            for track in tracks.iter().flatten() {
+                let _ = fs::remove_file(&track.file);
+            }
         }
         return Err(error);
     }
@@ -1034,7 +1313,7 @@ struct MediaResults {
 fn download_media(
     client: &CrunchyrollClient,
     options: &DownloadOptions,
-    scratch: &Path,
+    target: &FileTarget<'_>,
     versions: &[(String, String)],
     first_episode: &Episode,
     active_streams: &Mutex<HashMap<String, String>>,
@@ -1061,7 +1340,7 @@ fn download_media(
                             content_id,
                             first_episode,
                             active_streams,
-                            &Destination::Files(scratch),
+                            &Destination::Files(target),
                         );
                         let mut results = results.lock().expect("download results poisoned");
                         match outcome {
@@ -1097,10 +1376,9 @@ fn download_media(
         error: first_error,
     } = results.into_inner().expect("download results poisoned");
     if let Some(error) = first_error {
-        remove_track(video.as_ref());
-        for track in audio.iter().flatten() {
-            let _ = fs::remove_file(&track.file);
-        }
+        // The tracks that did arrive stay on disk and in the state file. That is the
+        // point of both: a season download interrupted three versions into an episode
+        // picks up at the fourth rather than at the first.
         return Err(error);
     }
     let video = video.context("video download produced no file")?;
@@ -1247,26 +1525,26 @@ pub fn download_episode(
     info: &EpisodeInfo,
     options: &DownloadOptions,
 ) -> Result<()> {
-    let series_title = sanitize_filename(&info.episode_metadata.series_title);
     let output_file = if options.play {
         None
     } else {
-        let episode_title = sanitize_filename(&info.title);
-        fs::create_dir_all(&series_title)
-            .with_context(|| format!("create output directory {series_title}"))?;
-        Some(Path::new(&series_title).join(format!(
-            "{series_title} S{:02}E{:02} - {episode_title} [{}].mkv",
-            info.episode_metadata.season_number,
-            info.episode_metadata.episode_number,
-            options.video_quality
-        )))
+        Some(output_path(info, &options.video_quality))
     };
-    if output_file.as_ref().is_some_and(|file| file.exists()) {
-        println!(
-            "Episode {} is already downloaded, skipping...",
-            info.episode_metadata.episode_number
-        );
-        return Ok(());
+    // The same question the episodes column asks, asked the same way, so the two cannot
+    // come to different answers about the same episode. Only the finished name counts as
+    // downloaded: a half-written MKV waits under `.mkv.part` and never gets this far.
+    if let Some(output_file) = &output_file {
+        if on_disk(info, &options.video_quality) == OnDisk::Complete {
+            println!(
+                "Episode {} is already downloaded, skipping...",
+                info.episode_metadata.episode_number
+            );
+            return Ok(());
+        }
+        if let Some(directory) = output_file.parent() {
+            fs::create_dir_all(directory)
+                .with_context(|| format!("create output directory {}", directory.display()))?;
+        }
     }
 
     let scratch = scratch_dir(output_file.as_deref());
@@ -1347,6 +1625,22 @@ pub fn download_episode(
             cc_langs.join(", ")
         );
 
+        // What a state file left beside this episode has to agree with before a single
+        // byte of it is reused. It is built here rather than earlier because two thirds
+        // of it - which subtitle and caption locales this episode actually has - is only
+        // known once Crunchyroll has been asked.
+        let run = Run {
+            episode_id: base_content_id.to_owned(),
+            video_quality: options.video_quality.clone(),
+            audio_quality: options.audio_quality.clone(),
+            audio_locales: versions.iter().map(|(locale, _)| locale.clone()).collect(),
+            subtitle_locales: subtitles_langs.clone(),
+            caption_locales: cc_langs.clone(),
+        };
+        let resume = output_file
+            .as_ref()
+            .map(|output_file| Resume::open(output_file, run));
+
         let mut sub_jobs = Vec::new();
         for locale in subtitles_langs {
             let subtitle = first_episode.subtitles[&locale].clone();
@@ -1356,42 +1650,68 @@ pub fn download_episode(
             let caption = first_episode.captions[&locale].clone();
             sub_jobs.push((locale, true, caption));
         }
-        let subtitle_tracks = fetch_subtitles(client, &scratch, &sub_jobs)?;
+        let subtitle_tracks = fetch_subtitles(client, &scratch, &sub_jobs, resume.as_ref())?;
         if !subtitle_tracks.is_empty() {
             println!("Downloaded subtitles!");
         }
 
-        let outcome = match &output_file {
-            Some(output_file) => download_media(
-                client,
-                options,
-                &scratch,
-                &versions,
-                &first_episode,
-                &active_streams,
-            )
-            .and_then(|(video, audio)| {
-                let merged = merge_everything(&video, &audio, &subtitle_tracks, output_file, info);
-                remove_track(Some(&video));
-                for track in &audio {
+        match (&output_file, &resume) {
+            (Some(output_file), Some(resume)) => {
+                let target = FileTarget {
+                    scratch: &scratch,
+                    resume,
+                };
+                download_media(
+                    client,
+                    options,
+                    &target,
+                    &versions,
+                    &first_episode,
+                    &active_streams,
+                )
+                .and_then(|(video, audio)| {
+                    // The mux writes under a name no other part of this program will
+                    // mistake for a finished episode, and only a rename that comes after
+                    // ffmpeg has said it is happy gives it the real one. Renaming within
+                    // a directory is atomic, so there is no moment at which the finished
+                    // name exists and is half an episode.
+                    let part = part_path(output_file);
+                    merge_everything(&video, &audio, &subtitle_tracks, &part, info)?;
+                    fs::rename(&part, output_file).with_context(|| {
+                        format!("move {} onto {}", part.display(), output_file.display())
+                    })?;
+                    // The episode is whole under its own name, so there is nothing left
+                    // for a later run to pick up and every scratch file is now waste.
+                    remove_track(Some(&video));
+                    for track in audio.iter().chain(&subtitle_tracks) {
+                        let _ = fs::remove_file(&track.file);
+                    }
+                    resume.clear();
+                    println!(
+                        "\nDownload finished! Output file: {}\n",
+                        output_file.display()
+                    );
+                    Ok(())
+                })
+            }
+            _ => {
+                let played = play_media(
+                    client,
+                    options,
+                    &versions,
+                    &first_episode,
+                    &active_streams,
+                    &subtitle_tracks,
+                    info,
+                );
+                // Playback keeps nothing and has nowhere to come back to, so its
+                // subtitles go whether it went well or badly.
+                for track in &subtitle_tracks {
                     let _ = fs::remove_file(&track.file);
                 }
-                merged
-            }),
-            None => play_media(
-                client,
-                options,
-                &versions,
-                &first_episode,
-                &active_streams,
-                &subtitle_tracks,
-                info,
-            ),
-        };
-        for track in &subtitle_tracks {
-            let _ = fs::remove_file(&track.file);
+                played
+            }
         }
-        outcome
     })();
 
     println!("Cleaning up playback sessions...");
@@ -1467,6 +1787,87 @@ pub fn download_season(
 mod tests {
     use super::*;
     use crate::model::DubVersion;
+
+    fn episode(series: &str, season: i32, number: i32, title: &str) -> EpisodeInfo {
+        EpisodeInfo {
+            episode_metadata: EpisodeMetadata {
+                series_title: series.to_owned(),
+                season_number: season,
+                episode_number: number,
+                ..Default::default()
+            },
+            title: title.to_owned(),
+        }
+    }
+
+    /// The name is now worked out in one place and read in three - the downloader, the
+    /// resume and the episodes column - so it is worth pinning to the letter. Anything
+    /// that changes it renames every episode anybody has already downloaded, and the
+    /// "already downloaded, skipping" check stops recognising a library it wrote itself.
+    #[test]
+    fn an_output_path_is_the_name_the_downloader_has_always_built() {
+        assert_eq!(
+            output_path(&episode("Some Series", 1, 1, "Title"), "1080p"),
+            Path::new("Some Series/Some Series S01E01 - Title [1080p].mkv")
+        );
+        // The numbers keep their two digits, and a title that cannot be a file name is
+        // put through the same sieve on the directory as on the file.
+        assert_eq!(
+            output_path(
+                &episode(
+                    "Frieren: Beyond Journey's End",
+                    2,
+                    12,
+                    "Aura the Guillotine"
+                ),
+                "720p"
+            ),
+            Path::new(
+                "Frieren_ Beyond Journey_s End/Frieren_ Beyond Journey_s End S02E12 - Aura the Guillotine [720p].mkv"
+            )
+        );
+    }
+
+    /// The one thing that must never happen is a half-written MKV sitting under the name
+    /// of a finished one, where the skip check would sail past it and the user would be
+    /// handed an episode that stops halfway through. So only the finished name counts as
+    /// downloaded, and everything a run in progress leaves is partial.
+    #[test]
+    fn a_part_file_is_not_a_finished_episode() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let base = directory.path();
+        let info = episode("Some Series", 1, 3, "Title");
+        let output = output_in(base, &info, "1080p");
+        fs::create_dir_all(output.parent().expect("a series directory"))
+            .expect("the temporary directory is writable");
+        let written =
+            |path: &Path| fs::write(path, b"not a whole episode").expect("a writable file");
+
+        assert_eq!(on_disk_in(base, &info, "1080p"), OnDisk::Missing);
+
+        written(&part_path(&output));
+        assert_eq!(on_disk_in(base, &info, "1080p"), OnDisk::Partial);
+
+        // The `.part` is only there for the length of the mux; for the half hour before
+        // it, the state file is what says an episode has been started.
+        fs::remove_file(part_path(&output)).expect("the temporary directory is writable");
+        written(&state_path(&output));
+        assert_eq!(on_disk_in(base, &info, "1080p"), OnDisk::Partial);
+
+        written(&output);
+        assert_eq!(on_disk_in(base, &info, "1080p"), OnDisk::Complete);
+
+        // And asking about an episode nothing has touched leaves the disk as it found
+        // it, since the episodes column asks about every row it draws.
+        let untouched = episode("Some Series", 1, 4, "Another");
+        assert_eq!(on_disk_in(base, &untouched, "1080p"), OnDisk::Missing);
+        assert!(!output_in(base, &untouched, "1080p").exists());
+        assert_eq!(
+            fs::read_dir(base).expect("a readable directory").count(),
+            1,
+            "asking about an episode created something"
+        );
+    }
 
     /// A 1080p episode buffers twice its own size, three versions at a time, so the
     /// temporaries belong on the disk the MKV is going to rather than in RAM-backed

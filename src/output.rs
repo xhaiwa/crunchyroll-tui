@@ -107,6 +107,13 @@ pub fn build_mux_command(
     command
 }
 
+/// Muxes everything into `output_file`, which is not the name the episode ends up under.
+///
+/// The caller hands this a `.part` and renames it once this has returned successfully,
+/// so nothing here announces a finished download: what ffmpeg has written is an MKV, but
+/// an MKV only becomes a downloaded episode when it is wearing the name the rest of the
+/// program looks for. A failed mux takes its own half-written output with it, since
+/// there is no picking up where ffmpeg left off.
 pub fn merge_everything(
     video: &MediaTrack,
     audio_tracks: &[MediaTrack],
@@ -125,10 +132,5 @@ pub fn merge_everything(
             String::from_utf8_lossy(&result.stderr).trim()
         );
     }
-
-    println!(
-        "\nDownload finished! Output file: {}\n",
-        output_file.display()
-    );
     Ok(())
 }

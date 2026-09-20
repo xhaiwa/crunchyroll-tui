@@ -8,6 +8,7 @@ mod model;
 mod output;
 mod play;
 mod progress;
+mod resume;
 mod terminal;
 mod tui;
 mod util;
