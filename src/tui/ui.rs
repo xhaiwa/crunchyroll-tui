@@ -141,9 +141,9 @@ fn line(run: &Run) -> Line<'static> {
 /// The left of the header: what is being listed, and how much of it.
 ///
 /// The label is a button, because what it says is exactly what a click on it changes -
-/// `Popular` and `Watchlist` alike move on to the next list, and `Search: frieren`
-/// leaves the search. The count beside it is not. While the box is being typed into,
-/// none of it is: a click there closes the box, as escape does.
+/// `Popular`, `Watchlist` and `Continue watching` alike move on to the next list, and
+/// `Search: frieren` leaves the search. The count beside it is not. While the box is
+/// being typed into, none of it is: a click there closes the box, as escape does.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
@@ -158,7 +158,7 @@ fn listing(app: &App) -> Run {
         None => vec![
             (
                 Some(match app.listing {
-                    Listing::Browse(_) | Listing::Watchlist => Command::Order,
+                    Listing::Browse(_) | Listing::Watchlist | Listing::History => Command::Order,
                     Listing::Search(_) => Command::Back,
                 }),
                 vec![theme.strong(app.listing.label())],
@@ -441,10 +441,7 @@ const HELP: [(&[Command], &str); 17] = [
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
-    (
-        &[Command::Order],
-        "cycle the browse orders and the watchlist",
-    ),
+    (&[Command::Order], "change the list the catalogue shows"),
     (
         &[Command::Play, Command::PlayRest],
         "play the episode / the rest of the season",
@@ -839,7 +836,7 @@ mod tests {
     use crate::tui::art::Gallery;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
-    use crate::tui::worker::Worker;
+    use crate::tui::worker::{Listing, Worker};
 
     use super::{HELP, cells, draw, duration, poster_width, thumbnail_width};
 
@@ -1111,14 +1108,15 @@ mod tests {
     }
 
     /// The catalogue label is a button and what it does is move on to the next list, so
-    /// a pointer has to be able to walk the whole ring - the account's watchlist
+    /// a pointer has to be able to walk the whole ring - the account's own lists
     /// included - and come back round to where it started. A list that is drawn but not
-    /// clickable would be one the mouse could enter and never leave.
+    /// clickable would be one the mouse could enter and never leave. The walk starts
+    /// wherever the interface opens, which is the point: every stop has to lead on.
     #[test]
     fn the_listing_label_walks_the_whole_ring() {
         let mut app = app();
         let mut labels = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..Listing::sources().len() + 1 {
             labels.push(app.listing.label());
             let _ = buffer(120, 30, &mut app);
             let (x, y) = middle(button(&app, Command::Order));
@@ -1127,11 +1125,12 @@ mod tests {
         assert_eq!(
             labels,
             [
+                "Continue watching",
                 "Popular",
                 "Recently added",
                 "A to Z",
                 "Watchlist",
-                "Popular"
+                "Continue watching"
             ]
         );
     }
@@ -1142,6 +1141,9 @@ mod tests {
     #[test]
     fn leaving_a_search_comes_back_to_the_order_in_use() {
         let mut app = app();
+        // Off the opening list and one step along the browse orders, so that coming back
+        // to the top of the catalogue would be visibly the wrong answer.
+        press(&mut app, KeyCode::Char('o'));
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(app.listing.label(), "Recently added");
         press(&mut app, KeyCode::Char('/'));
@@ -1435,7 +1437,7 @@ mod tests {
         assert_eq!(word(Command::AudioLanguage), "audio 日本語");
         assert_eq!(word(Command::SubtitleLanguage), "subs English");
         assert_eq!(word(Command::Quality), "video 1080p");
-        assert_eq!(word(Command::Order), "Popular");
+        assert_eq!(word(Command::Order), "Continue watching");
         assert_eq!(word(Command::Open), "⏎ open/play");
         assert_eq!(word(Command::Download), "d download");
         assert_eq!(word(Command::Quit), "q quit");

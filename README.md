@@ -135,6 +135,11 @@ seasons and episodes, with playback and downloading on a key.
 cargo run --release -- --tui
 ```
 
+It opens on Continue watching - the series the account was last watching, newest
+first - since that is what a video client is usually wanted for. An account that has
+watched nothing, or a history Crunchyroll will not hand over, opens on the catalogue
+instead and says so on the status line.
+
 | Key | Action | What it does |
 | --- | --- | --- |
 | `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
@@ -144,7 +149,7 @@ cargo run --release -- --tui
 | `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns |
 | `/` | `search` | Search the catalogue. An empty search goes back to browsing |
-| `o` | `order` | Change the list: popular, recently added, A to Z, then the account's watchlist |
+| `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
 | `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
 | `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
@@ -419,7 +424,7 @@ The commands, and the keys they answer to out of the box:
 | `back` | `left` `h` `esc` | Go back a column, and leave a search |
 | `next-column` | `tab` | Cycle the columns |
 | `search` | `/` | Search the catalogue |
-| `order` | `o` | Cycle the browse orders and the watchlist |
+| `order` | `o` | Change the list the catalogue shows |
 | `reload` | `r` | Reload the current column |
 | `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
 | `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
