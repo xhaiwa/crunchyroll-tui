@@ -282,6 +282,21 @@ pub enum Request {
         audio: String,
         subs: String,
     },
+    /// The films a movie listing holds, which is the other question the middle column
+    /// can ask. A film has no seasons endpoint and no episodes endpoint, so the one row
+    /// the middle column shows for it opens into the films inside the listing instead -
+    /// usually exactly one of them.
+    ///
+    /// Answered as a [`Response::Episodes`] under the listing's own id, because that is
+    /// what the answer is: a list of rows for the episodes column, owned by the row that
+    /// was opened. Everything the interface does when a season arrives - the cursor, the
+    /// disk markers, the playheads it asks for next - is the same work for a film, and a
+    /// second answer meaning the same thing would have to be told to do all of it again.
+    Movies {
+        listing_id: String,
+        audio: String,
+        subs: String,
+    },
     /// Put the series on the watchlist, or take it off if it is already there. Which of
     /// the two it is takes a request of its own to find out, and that answer is only
     /// worth having on the thread that is about to act on it: asking from the interface
@@ -589,6 +604,17 @@ impl Worker {
                             result: result.map_err(|error| format!("{error:#}")),
                         }
                     }
+                    Request::Movies {
+                        listing_id,
+                        audio,
+                        subs,
+                    } => {
+                        let result = client.movies(&listing_id, &audio, &subs);
+                        Response::Episodes {
+                            season_id: listing_id,
+                            result: result.map_err(|error| format!("{error:#}")),
+                        }
+                    }
                     Request::Watchlist {
                         series_id,
                         series_title,
@@ -831,11 +857,12 @@ mod tests {
     /// page as a bug.
     #[test]
     fn the_simulcast_filter_sieves_the_page_it_was_given() {
-        let page: Vec<CatalogItem> = ["Frieren", "An Old Favourite", "Dandadan"]
+        let mut page: Vec<CatalogItem> = ["Frieren", "An Old Favourite", "Dandadan"]
             .iter()
             .enumerate()
             .map(|(index, title)| CatalogItem {
                 id: format!("G{index}"),
+                kind: "series".to_owned(),
                 title: (*title).to_owned(),
                 series_metadata: SeriesMetadata {
                     is_simulcast: index != 1,
@@ -844,15 +871,27 @@ mod tests {
                 ..CatalogItem::default()
             })
             .collect();
+        // The catalogue holds films now, and a film is not something Crunchyroll
+        // simulcasts: it has no series metadata at all, so it says nothing about
+        // simulcasting and goes with the rest of what the filter does not want. Nothing
+        // has to be written to make that happen, which is the point of pinning it - a
+        // sieve that read a missing answer as a yes would leave every film in the column
+        // under a filter that asked for weekly episodes.
+        page.push(CatalogItem {
+            id: "GY5P48DMY".to_owned(),
+            kind: "movie_listing".to_owned(),
+            title: "Suzume".to_owned(),
+            ..CatalogItem::default()
+        });
 
         let whole = Page {
             items: page,
             total: Some(120),
-            next: Some(3),
+            next: Some(4),
         };
         let off = Filters::default();
         let left = off.sieve(whole.clone());
-        assert_eq!(left.items.len(), 3, "nothing asked, nothing cut");
+        assert_eq!(left.items.len(), 4, "nothing asked, nothing cut");
         assert_eq!(
             left.total,
             Some(120),
@@ -866,7 +905,7 @@ mod tests {
         let sieved = on.sieve(whole);
         assert_eq!(
             (sieved.total, sieved.next),
-            (None, Some(3)),
+            (None, Some(4)),
             "a sieved page counts nothing the endpoint counted, but carries on where it did"
         );
         let kept: Vec<String> = sieved
