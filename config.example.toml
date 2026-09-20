@@ -248,6 +248,14 @@ play-rest = "P"
 download = "d"
 download-season = "D"
 
+# What the account knows. `watchlist` puts the selected series on the watchlist
+# or takes it off again, whichever column the cursor is in; the other two move
+# the selected episode's playhead to the end or back to the start, which is how
+# Crunchyroll is told an episode has been watched or has not.
+watchlist = "w"
+mark-watched = "m"
+mark-unwatched = "M"
+
 # Languages. The first pair open the list, which offers what the selected season
 # has; the second pair step to the next locale without opening anything.
 audio-language = "a"

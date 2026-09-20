@@ -40,6 +40,31 @@ pub struct Notice {
     pub error: bool,
 }
 
+/// The playhead that counts an episode as watched, in the whole seconds the endpoint
+/// takes.
+///
+/// Crunchyroll gives a running time in milliseconds, and the fraction of a second on the
+/// end of it is neither here nor there - an episode whose playhead is at its last whole
+/// second has been watched by any reading. A running time far too large to be one is
+/// held at the largest second there is rather than wrapping round to an early one, since
+/// a playhead near the start is the one answer that would be wrong.
+fn whole_seconds(duration_ms: u64) -> u32 {
+    u32::try_from(duration_ms / 1000).unwrap_or(u32::MAX)
+}
+
+/// What a notice calls an episode: the number Crunchyroll prints on it - which is "SP"
+/// or "1.5" as often as it is a number - behind the E the episode column shows. The
+/// title would be truer to the episode, but it is the number the user just moved the
+/// cursor onto, and a sentence on the status line has no room for both.
+fn episode_label(episode: &SeasonEpisode) -> String {
+    let number = if episode.episode.is_empty() {
+        episode.episode_number.to_string()
+    } else {
+        episode.episode.clone()
+    };
+    format!("E{number}")
+}
+
 /// One column: what it holds, where the cursor is, and whether it is still waiting.
 pub struct Pane<T> {
     pub items: Vec<T>,
@@ -249,6 +274,14 @@ impl App {
         });
     }
 
+    /// What the interface has asked the worker for since this was last called. A command
+    /// that only sends a request changes nothing a test can look at, so which item it
+    /// picked has to be read off the request itself.
+    #[cfg(test)]
+    pub fn sent(&self) -> Vec<Request> {
+        self.worker.sent()
+    }
+
     fn request_catalog(&mut self) {
         self.series.clear();
         self.seasons.clear();
@@ -340,6 +373,13 @@ impl App {
                         }
                     }
                 }
+                // Nothing on screen is redrawn by this - the watchlist and the history
+                // are not among the three columns - so the sentence is the whole of it,
+                // and it is shown whether the cursor has moved on since or not.
+                Response::Account { result } => match result {
+                    Ok(message) => self.say(message),
+                    Err(error) => self.complain(error),
+                },
             }
         }
         self.art.drain();
@@ -446,6 +486,48 @@ impl App {
         } else {
             self.episodes.items[index..=index].to_vec()
         }
+    }
+
+    /// Puts the selected series on the watchlist, or takes it off.
+    ///
+    /// The series is the one the catalogue column has selected, whichever column the
+    /// keyboard happens to be in. The seasons and the episodes on screen belong to that
+    /// series, so someone working down in the episodes who asks for the watchlist means
+    /// the series those episodes came from - there is nothing else the key could mean,
+    /// and doing nothing in two columns out of three would be an odd way to say so.
+    ///
+    /// Which way it goes is settled on the worker thread, because finding out takes a
+    /// request of its own.
+    fn toggle_watchlist(&mut self) {
+        let Some(series) = self.series.selected() else {
+            self.complain("Pick a series first.");
+            return;
+        };
+        self.worker.send(Request::Watchlist {
+            series_id: series.id.clone(),
+            series_title: series.title.clone(),
+        });
+    }
+
+    /// Marks the selected episode watched, or unwatched again.
+    ///
+    /// This one is about the episode under the cursor and nothing else, so with no
+    /// season open it says what `play` and `download` say - the answer is the same one:
+    /// open a season.
+    fn mark(&mut self, watched: bool) {
+        let Some(episode) = self.episodes.selected() else {
+            self.complain("Open a season first.");
+            return;
+        };
+        self.worker.send(Request::Playhead {
+            episode_id: episode.id.clone(),
+            label: episode_label(episode),
+            seconds: if watched {
+                whole_seconds(episode.duration_ms)
+            } else {
+                0
+            },
+        });
     }
 
     fn play(&mut self, to_end: bool) -> Action {
@@ -731,6 +813,9 @@ impl App {
             Command::PlayRest => return self.play(true),
             Command::Download => return self.download(false),
             Command::DownloadSeason => return self.download(true),
+            Command::Watchlist => self.toggle_watchlist(),
+            Command::MarkWatched => self.mark(true),
+            Command::MarkUnwatched => self.mark(false),
             Command::AudioLanguage => self.open_picker(true),
             Command::SubtitleLanguage => self.open_picker(false),
             Command::NextAudio => self.cycle_locale(true),
@@ -924,7 +1009,48 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::Pane;
+    use super::{Pane, SeasonEpisode, episode_label, whole_seconds};
+
+    /// The playhead that marks an episode watched is its own running time, and the
+    /// endpoint counts in seconds while Crunchyroll answers in milliseconds. Getting the
+    /// conversion wrong by a factor of a thousand would leave every episode marked
+    /// watched at the twenty-four-second mark, which Crunchyroll would take as barely
+    /// started rather than as finished.
+    #[test]
+    fn an_episode_is_watched_to_its_last_whole_second() {
+        assert_eq!(whole_seconds(1_461_000), 1461);
+        // The running time rarely divides evenly, and the fraction left over is not
+        // worth a request that says 1462 seconds of a 1461-second episode.
+        assert_eq!(whole_seconds(1_461_999), 1461);
+        // Crunchyroll sends no running time for some episodes, which is a playhead of
+        // zero - the one place this cannot put the playhead at the end, because there is
+        // no end to put it at.
+        assert_eq!(whole_seconds(0), 0);
+        // And a nonsense duration is held at the last second there is rather than
+        // wrapping round to a playhead near the start.
+        assert_eq!(whole_seconds(u64::MAX), u32::MAX);
+    }
+
+    /// The notice names the episode by the number printed beside it, which for a special
+    /// is not a number at all - and "ESP" beats "E0", which is what the number field has
+    /// to say about one.
+    #[test]
+    fn an_episode_is_named_the_way_the_column_names_it() {
+        let special = SeasonEpisode {
+            episode: "SP".to_owned(),
+            episode_number: 0,
+            ..SeasonEpisode::default()
+        };
+        assert_eq!(episode_label(&special), "ESP");
+        assert_eq!(
+            episode_label(&SeasonEpisode {
+                episode: String::new(),
+                episode_number: 4,
+                ..SeasonEpisode::default()
+            }),
+            "E4"
+        );
+    }
 
     #[test]
     fn cursor_stays_inside_a_pane() {

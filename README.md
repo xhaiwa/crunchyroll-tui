@@ -9,6 +9,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 ## Features
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
+- The watchlist and the history kept up to date from the interface: a series added or removed, an episode marked watched or unwatched
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
@@ -147,6 +148,8 @@ cargo run --release -- --tui
 | `o` | `order` | Change the browse order: popular, recently added, A to Z |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
 | `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
+| `w` | `watchlist` | Put the selected series on the watchlist, or take it off if it is already there |
+| `m`, `M` | `mark-watched`, `mark-unwatched` | Mark the episode under the cursor watched, or unwatched again |
 | `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
 | `A`, `S` | `next-audio`, `next-subtitle` | Step to the next audio or subtitle locale without opening the list |
 | `v` | `quality` | Cycle the video quality |
@@ -159,6 +162,13 @@ The Action column is the name the key is written under in the config file; see
 [Keys](#keys) for moving any of them. `ctrl-c` quits whatever the config says.
 
 Every one of these can be moved somewhere else; see [Keys](#keys) below.
+
+`w` acts on the series the catalogue column has selected, whoever has the keyboard: the
+seasons and the episodes on screen are that series' own. `m` and `M` act on the episode
+under the cursor, and what they do is move its playhead - Crunchyroll counts an episode
+watched once the playhead has reached the end, so `m` puts it there and `M` puts it back
+to the start. All three go to Crunchyroll in the background and say what became of them
+on the status line: `Added Frieren to the watchlist`, `Marked E4 watched`.
 
 The languages offered by `a` and `s` are the ones the selected season lists, falling back
 to the series, then to what was asked for on the command line, then to every locale
@@ -417,6 +427,8 @@ The commands, and the keys they answer to out of the box:
 | `reload` | `r` | Reload the current column |
 | `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
 | `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
+| `watchlist` | `w` | Put the series on the watchlist, or take it off |
+| `mark-watched` `mark-unwatched` | `m`, `M` | Mark the episode watched, or unwatched |
 | `audio-language` `subtitle-language` | `a`, `s` | Open the language list |
 | `next-audio` `next-subtitle` | `A`, `S` | Step to the next locale without the list |
 | `quality` | `v` | Cycle the video quality |
