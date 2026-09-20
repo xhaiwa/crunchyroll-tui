@@ -244,9 +244,14 @@ order = "o"
 reload = "r"
 
 # Getting an episode. The season forms take everything from the cursor down for
-# playing, and the whole season for downloading.
+# playing, and the whole season for downloading. `mark` covers the case in
+# between: put a mark on as many episodes of the open season as you like and
+# `download` takes those instead of the one under the cursor, in the order the
+# season lists them rather than the order you marked them. The marks come off
+# when the column moves to another season.
 play = "p"
 play-rest = "P"
+mark = "space"
 download = "d"
 download-season = "D"
 

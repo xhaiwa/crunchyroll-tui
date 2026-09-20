@@ -97,7 +97,13 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
     ListItem::new(Line::from(spans))
 }
 
-/// One episode: its number, what the account has already made of it, and its title.
+/// What a marked episode is drawn with. A dot, because the two glyphs already in this
+/// column mean something else: the check is the account's opinion of the episode and the
+/// arrow beside it is the cursor, and a mark is neither.
+const MARK: &str = "\u{2022}";
+
+/// One episode: whether it is marked for downloading, its number, what the account has
+/// already made of it, and its title.
 ///
 /// The marker takes the running time's place rather than a column of its own. The three
 /// lists are already fighting for room on a narrow terminal, and a title pushed off the
@@ -105,17 +111,30 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
 /// through is the less interesting of the two anyway, since where to pick it up says more
 /// than how long it lasts. It is the same rule playing uses, so a row showing a time is a
 /// row mpv opens at that time, and a check is an episode it would start from the top.
+///
+/// A mark is the one thing here that does take a column of its own, and `mark` says
+/// whether this row has one - or `None`, where the season has no marks at all and so is
+/// drawn without the column. A gutter standing empty down every season nobody is marking
+/// would spend a column of every title on the seasons that are, which is the trade the
+/// paragraph above refuses; this way it appears as the first mark goes on and leaves as
+/// the last comes off, which is a column of movement at the two moments the user asked
+/// for it and none of the rest of the time.
 fn episode_row(
     theme: &Theme,
     episode: &SeasonEpisode,
     playhead: Option<&Playhead>,
+    mark: Option<bool>,
 ) -> ListItem<'static> {
     let number = if episode.episode.is_empty() {
         episode.episode_number.to_string()
     } else {
         episode.episode.clone()
     };
-    let mut spans = vec![theme.accent(format!("E{number:<3}"))];
+    let mut spans = Vec::new();
+    if let Some(marked) = mark {
+        spans.push(theme.accent(if marked { MARK } else { " " }));
+    }
+    spans.push(theme.accent(format!("E{number:<3}")));
     let resume =
         playhead.and_then(|seen| resume_at(seen.playhead, episode.duration_ms, seen.fully_watched));
     if let Some(seconds) = resume {
@@ -446,7 +465,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 19] = [
+const HELP: [(&[Command], &str); 20] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -466,8 +485,12 @@ const HELP: [(&[Command], &str); 19] = [
         "play the episode / the rest of the season",
     ),
     (
+        &[Command::Mark],
+        "mark the episode, to download several at once",
+    ),
+    (
         &[Command::Download, Command::DownloadSeason],
-        "download the episode / the whole season",
+        "download the marked episodes / the whole season",
     ),
     (
         &[Command::Watchlist],
@@ -724,10 +747,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             tick,
         )
     } else {
+        let marked: Vec<bool> = app
+            .episodes
+            .items
+            .iter()
+            .map(|episode| app.marked.contains(&episode.id))
+            .collect();
+        // Read off the open list rather than off the set, so a mark carried across a
+        // list that came back without its episode does not open a gutter for a row that
+        // is not there - see [`episode_row`].
+        let gutter = marked.contains(&true);
         app.episodes
             .items
             .iter()
-            .map(|episode| episode_row(&theme, episode, app.playheads.get(&episode.id)))
+            .zip(marked)
+            .map(|(episode, marked)| {
+                episode_row(
+                    &theme,
+                    episode,
+                    app.playheads.get(&episode.id),
+                    gutter.then_some(marked),
+                )
+            })
             .collect()
     };
     let focused = focus == Focus::Episodes;
@@ -867,7 +908,7 @@ mod tests {
     use crate::tui::theme::{self, Theme};
     use crate::tui::worker::{Listing, Request, Response, Worker};
 
-    use super::{HELP, cells, draw, duration, poster_width, thumbnail_width};
+    use super::{HELP, MARK, cells, draw, duration, poster_width, thumbnail_width};
 
     #[test]
     fn formats_a_running_time() {
@@ -1505,6 +1546,37 @@ mod tests {
             .collect();
         let screen = rendered(120, 30, &mut app);
         assert!(screen.contains("24:21"), "so the running time is back");
+    }
+
+    /// A mark is a decision the user made about a row, so it has to be visible on that
+    /// row - and the column it needs has to be there only while a mark is on one of them,
+    /// since the width of this column is what the titles are living on.
+    #[test]
+    fn a_marked_episode_carries_a_dot_and_an_unmarked_season_carries_no_column() {
+        let mut app = app();
+        let plain = rendered(120, 30, &mut app);
+        assert!(
+            !plain.contains(MARK),
+            "a season with nothing marked drew the column anyway"
+        );
+        // The cursor is on E1, so its row is the arrow and then the number.
+        assert!(plain.contains("\u{203a} E1"));
+
+        app.marked.insert("E2".to_owned());
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains(&format!("{MARK}E2")),
+            "the marked episode is not wearing its mark"
+        );
+        assert!(
+            screen.contains("\u{203a}  E1"),
+            "the unmarked rows did not move over with the marked one"
+        );
+
+        // And the column goes again with the last mark, rather than standing empty for
+        // the rest of the season.
+        app.marked.clear();
+        assert_eq!(rendered(120, 30, &mut app), plain);
     }
 
     /// An answer is only worth painting onto the column it was asked about. The lists are

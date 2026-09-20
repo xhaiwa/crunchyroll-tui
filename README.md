@@ -10,6 +10,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
 - The watchlist and the history kept up to date from the interface: a series added or removed, an episode marked watched or unwatched
+- Several episodes of a season marked and downloaded together, in the order the season lists them
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
 - Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
 - Multiple audio, subtitle and closed-caption tracks in one MKV
@@ -153,7 +154,8 @@ instead and says so on the status line.
 | `/` | `search` | Search the catalogue. An empty search goes back to browsing |
 | `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
 | `p`, `P` | `play`, `play-rest` | Play the episode, or the rest of the season one episode after another |
-| `d`, `D` | `download`, `download-season` | Download the episode, or the whole season |
+| `space` | `mark` | Mark the episode under the cursor for downloading, or take the mark off |
+| `d`, `D` | `download`, `download-season` | Download the marked episodes, the episode under the cursor if none are marked, or the whole season |
 | `w` | `watchlist` | Put the selected series on the watchlist, or take it off if it is already there |
 | `m`, `M` | `mark-watched`, `mark-unwatched` | Mark the episode under the cursor watched, or unwatched again |
 | `a`, `s` | `audio-language`, `subtitle-language` | Pick the audio or subtitle language from a list. `tab` swaps lists, `⏎` applies, `esc` cancels |
@@ -185,6 +187,17 @@ to the start. An episode Crunchyroll gives no running time for has no end to aim
 three go to Crunchyroll in the background and say what became of them on the status line:
 `Added Frieren to the watchlist`, `Marked E4 watched`.
 
+`space` marks episodes, for the seasons where what you are after is five of the
+twenty-four. It works in the Episodes column, on the episode under the cursor, and it
+says how many of the season are marked as it goes; `d` then downloads the marked ones
+instead of the one under the cursor, and downloads them in the order the season lists
+them rather than the order they were marked. With nothing marked, `d` is the key it
+always was. `D` is not affected either way: the whole season is the one thing a handful
+of marks cannot mean, so it stays the way to ask for it. Marks are kept against the
+episodes themselves rather than against rows, so they come off when the column moves to
+another season and survive `r` or a change of language, which are the same season asked
+for again.
+
 The languages offered by `a` and `s` are the ones the selected season lists, falling back
 to the series, then to what was asked for on the command line, then to every locale
 Crunchyroll publishes - so the list follows whatever the series actually has. The locale
@@ -203,6 +216,11 @@ episode you have finished, and the time to pick it up from for one you left part
 through - which is where playing it opens. The marker takes the running time's place
 rather than a column of its own, so the titles stay where they are on a narrow terminal.
 See [Picking up where you left off](#picking-up-where-you-left-off).
+
+A marked episode carries a dot in front of its number. That dot does get a column of its
+own, and it takes one only while something in the season is marked: a gutter standing
+empty down every season nobody is marking would cost every title a column for the sake
+of the seasons that are.
 
 #### With a mouse
 
@@ -467,7 +485,8 @@ The commands, and the keys they answer to out of the box:
 | `order` | `o` | Change the list the catalogue shows |
 | `reload` | `r` | Reload the current column |
 | `play` `play-rest` | `p`, `P` | Play the episode, or the rest of the season |
-| `download` `download-season` | `d`, `D` | Download the episode, or the whole season |
+| `mark` | `space` | Mark the episode for downloading, or unmark it |
+| `download` `download-season` | `d`, `D` | Download the marked episodes, or the episode under the cursor, or the whole season |
 | `watchlist` | `w` | Put the series on the watchlist, or take it off |
 | `mark-watched` `mark-unwatched` | `m`, `M` | Mark the episode watched, or unwatched |
 | `audio-language` `subtitle-language` | `a`, `s` | Open the language list |

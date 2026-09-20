@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use ratatui::crossterm::event::{
@@ -64,6 +64,19 @@ fn episode_label(episode: &SeasonEpisode) -> String {
         episode.episode.clone()
     };
     format!("E{number}")
+}
+
+/// How much of the season is marked, as the status line says it.
+///
+/// "nothing marked" rather than "0 episodes marked", because the sentence it ends is
+/// read after unmarking the last one, and a count of zero is a thing to work out rather
+/// than an answer.
+fn marks_tally(count: usize) -> String {
+    match count {
+        0 => "nothing marked".to_owned(),
+        1 => "1 episode marked".to_owned(),
+        many => format!("{many} episodes marked"),
+    }
 }
 
 /// One column: what it holds, where the cursor is, and whether it is still waiting.
@@ -192,6 +205,15 @@ pub struct App {
     /// they are: a marker held over from the last season would be painted onto whichever
     /// episode of this one happened to share an id, which is none of them.
     pub playheads: HashMap<String, Playhead>,
+    /// The episodes `download` is to take, by id, rather than the one under the cursor.
+    ///
+    /// By id and not by index, because the one thing a mark has to survive is the list
+    /// being handed back again - a reload, or the same season asked for in another
+    /// language - and those can come back a different length, where an index would have
+    /// slid onto whichever episode had moved into its place. An id the open list does
+    /// not have marks nothing at all, which is what makes carrying the set over those
+    /// two safe when carrying an index over them would not be.
+    pub marked: HashSet<String>,
     pub listing: Listing,
     /// The search box while it is being typed into.
     pub editing: Option<String>,
@@ -239,6 +261,7 @@ impl App {
             seasons: Pane::default(),
             episodes: Pane::default(),
             playheads: HashMap::new(),
+            marked: HashSet::new(),
             // The most useful first screen a video client has is the thing that was
             // being watched last, so that is what the interface opens on. An account
             // with no history, or a request that fails, falls back to the catalogue
@@ -306,9 +329,16 @@ impl App {
     }
 
     /// Empties the episodes column and everything drawn alongside it.
+    ///
+    /// The marks go the way the playheads do, and for the same reason: both belong to
+    /// the season being put away rather than to the column they were drawn in. Whether
+    /// they come back afterwards is not settled here, because this is also the path a
+    /// different season takes - it is settled by the two callers that ask for the same
+    /// season over again. See [`App::request_episodes_again`].
     fn clear_episodes(&mut self) {
         self.episodes.clear();
         self.playheads.clear();
+        self.marked.clear();
     }
 
     fn request_catalog(&mut self) {
@@ -351,6 +381,25 @@ impl App {
             audio: self.audio(),
             subs: self.subs(),
         });
+    }
+
+    /// Asks for the season that is already open a second time, keeping what the user put
+    /// on it.
+    ///
+    /// A reload and a language change are the two ways the episode list is replaced by
+    /// another list of the same season, and the cursor is already carried across both
+    /// because it is still the same season being looked at. The marks are the same
+    /// argument, only louder: the cursor is one keypress to put back and five marks are
+    /// five, and someone who marks half a season and then notices it is offering the sub
+    /// has asked for another dub rather than for their marks to be swept up. They are
+    /// safe to carry because they name episodes by id, so a list that comes back without
+    /// one of them simply has nothing marked there.
+    fn request_episodes_again(&mut self) {
+        let cursor = self.episodes.state.selected();
+        let marks = std::mem::take(&mut self.marked);
+        self.request_episodes();
+        self.episodes.pending_cursor = cursor;
+        self.marked = marks;
     }
 
     /// A catalogue answer, and the one decision the opening screen still has to make.
@@ -634,6 +683,57 @@ impl App {
         });
     }
 
+    /// Puts a mark on the episode under the cursor, or takes the one that is there off.
+    ///
+    /// The keyboard has to be in the episodes column for this, where `play`, `download`
+    /// and `mark-watched` all act on the episode under the cursor from wherever it
+    /// happens to be. The difference is that those three do something and say so on the
+    /// status line, while this one leaves a mark behind on a row that a user reading the
+    /// catalogue column cannot see: a key that quietly decorated a list three columns
+    /// away would be a poor thing to have to discover. Pressed elsewhere it says which
+    /// column it belongs to, rather than being a key that does nothing on two columns
+    /// out of three.
+    fn toggle_mark(&mut self) {
+        if self.focus != Focus::Episodes {
+            self.complain("Marking is the episodes column's key.");
+            return;
+        }
+        let Some(episode) = self.episodes.selected() else {
+            self.complain("Open a season first.");
+            return;
+        };
+        let episode_id = episode.id.clone();
+        let label = episode_label(episode);
+        let verb = if self.marked.remove(&episode_id) {
+            "Unmarked"
+        } else {
+            self.marked.insert(episode_id);
+            "Marked"
+        };
+        // Counted through the open list rather than off the set, so that a mark carried
+        // across a list that came back without its episode is not counted for a row
+        // nobody can see.
+        let tally = marks_tally(self.marked_episodes().len());
+        self.say(format!("{verb} {label} - {tally}."));
+    }
+
+    /// The marked episodes, in the order the season lists them.
+    ///
+    /// The set behind them remembers that a mark was put on an id and nothing else, and
+    /// this is the reason it needs to remember nothing else: what comes back is the
+    /// column read top to bottom, so four episodes marked in whatever order they caught
+    /// the eye are downloaded in the order they are meant to be watched in. The
+    /// alternative - the order they were pressed - would mean the shape of a download
+    /// depending on something no longer visible anywhere on screen.
+    fn marked_episodes(&self) -> Vec<SeasonEpisode> {
+        self.episodes
+            .items
+            .iter()
+            .filter(|episode| self.marked.contains(&episode.id))
+            .cloned()
+            .collect()
+    }
+
     fn play(&mut self, to_end: bool) -> Action {
         let episodes = self.selection(to_end);
         if episodes.is_empty() {
@@ -642,6 +742,13 @@ impl App {
         Action::Play(episodes)
     }
 
+    /// What `download` and `download-season` hand over.
+    ///
+    /// `download` means the marks when there are any and the episode under the cursor
+    /// when there are none, so the key does not have to be learnt twice: nothing is
+    /// marked until somebody marks something, and until then it is the key it always
+    /// was. `download-season` is left alone - the whole season is the one request that
+    /// cannot be meant by a handful of marks, and it stays the way to ask for it.
     fn download(&mut self, whole_season: bool) -> Action {
         let episodes = if whole_season {
             if self.episodes.items.is_empty() {
@@ -649,7 +756,16 @@ impl App {
             }
             self.episodes.items.clone()
         } else {
-            self.selection(false)
+            let marked = self.marked_episodes();
+            if marked.is_empty() {
+                self.selection(false)
+            } else {
+                self.say(match marked.len() {
+                    1 => "Downloading the marked episode.".to_owned(),
+                    count => format!("Downloading {count} marked episodes, in season order."),
+                });
+                marked
+            }
         };
         if episodes.is_empty() {
             return Action::None;
@@ -749,9 +865,7 @@ impl App {
     fn refresh_localised(&mut self) {
         let focus = self.focus;
         if !self.episodes.owner.is_empty() {
-            let cursor = self.episodes.state.selected();
-            self.request_episodes();
-            self.episodes.pending_cursor = cursor;
+            self.request_episodes_again();
         } else if !self.seasons.owner.is_empty() {
             let cursor = self.seasons.state.selected();
             self.request_seasons();
@@ -796,11 +910,7 @@ impl App {
                 self.request_seasons();
                 self.seasons.pending_cursor = cursor;
             }
-            Focus::Episodes => {
-                let cursor = self.episodes.state.selected();
-                self.request_episodes();
-                self.episodes.pending_cursor = cursor;
-            }
+            Focus::Episodes => self.request_episodes_again(),
         }
     }
 
@@ -923,6 +1033,7 @@ impl App {
             }
             Command::Play => return self.play(false),
             Command::PlayRest => return self.play(true),
+            Command::Mark => self.toggle_mark(),
             Command::Download => return self.download(false),
             Command::DownloadSeason => return self.download(true),
             Command::Watchlist => self.toggle_watchlist(),
@@ -1126,13 +1237,13 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     use crate::download::DownloadOptions;
-    use crate::model::CatalogItem;
+    use crate::model::{CatalogItem, Season};
     use crate::tui::art::Gallery;
     use crate::tui::keys::{Bindings, Command};
     use crate::tui::theme::Theme;
-    use crate::tui::worker::{Listing, Worker};
+    use crate::tui::worker::{Listing, Request, Worker};
 
-    use super::{App, Pane, SeasonEpisode, episode_label, whole_seconds};
+    use super::{Action, App, Focus, Pane, SeasonEpisode, episode_label, whole_seconds};
 
     /// An interface with nothing behind it: the worker swallows every request and never
     /// answers one, so the only answers it sees are those a test hands it directly.
@@ -1163,6 +1274,57 @@ mod tests {
             kind: "series".to_owned(),
             ..CatalogItem::default()
         }
+    }
+
+    /// A season of `episodes` episodes open in the third column, with the second column
+    /// behind it - which is the only way a season is ever open, and what the keys that
+    /// ask for it again need in order to have something to ask for. The first season
+    /// carries two dubs so that the language key has somewhere to go.
+    fn season(app: &mut App, episodes: i32) {
+        app.seasons.owner = "GY8VEQ95Y".to_owned();
+        app.seasons.set(vec![
+            Season {
+                id: "S1".to_owned(),
+                audio_locales: vec!["ja-JP".to_owned(), "en-US".to_owned()],
+                ..Season::default()
+            },
+            Season {
+                id: "S2".to_owned(),
+                ..Season::default()
+            },
+        ]);
+        app.episodes.owner = "S1".to_owned();
+        app.episodes.set(
+            (1..=episodes)
+                .map(|number| SeasonEpisode {
+                    id: format!("E{number}"),
+                    episode: number.to_string(),
+                    episode_number: number,
+                    duration_ms: 1_461_000,
+                    ..SeasonEpisode::default()
+                })
+                .collect(),
+        );
+        app.focus = Focus::Episodes;
+        let _ = app.sent();
+    }
+
+    /// The episodes an action is carrying, by id. A command that hands the terminal away
+    /// says what it picked in the action and nowhere else, so this is where a test reads
+    /// it.
+    fn downloading(action: Action) -> Vec<String> {
+        match action {
+            Action::Download(episodes) => episodes.into_iter().map(|episode| episode.id).collect(),
+            _ => panic!("nothing was sent to download"),
+        }
+    }
+
+    /// What the status line is saying.
+    fn said(app: &App) -> String {
+        app.notice
+            .as_ref()
+            .map(|notice| notice.text.clone())
+            .unwrap_or_default()
     }
 
     /// The interface opens on what was being watched last, and an account that has
@@ -1294,6 +1456,167 @@ mod tests {
             }),
             "E4"
         );
+    }
+
+    /// The key has to put a mark on and take it off again with the same press, because
+    /// the only other way to undo one would be to leave the season - which is a long way
+    /// to go to correct a slip, and takes the other four marks with it.
+    #[test]
+    fn a_mark_goes_on_and_comes_off_the_episode_under_the_cursor() {
+        let mut app = app();
+        season(&mut app, 4);
+
+        app.run(Command::Mark);
+        assert!(app.marked.contains("E1"));
+        assert_eq!(said(&app), "Marked E1 - 1 episode marked.");
+
+        app.run(Command::Down);
+        app.run(Command::Mark);
+        assert_eq!(said(&app), "Marked E2 - 2 episodes marked.");
+
+        app.run(Command::Mark);
+        assert!(!app.marked.contains("E2"), "the second press did nothing");
+        assert_eq!(said(&app), "Unmarked E2 - 1 episode marked.");
+
+        app.run(Command::Up);
+        app.run(Command::Mark);
+        assert!(app.marked.is_empty());
+        assert_eq!(
+            said(&app),
+            "Unmarked E1 - nothing marked.",
+            "a count of zero is a thing to work out rather than an answer"
+        );
+    }
+
+    /// The point of the whole exercise: `d` is the key it always was until something is
+    /// marked, and once something is it means the marks rather than the row the cursor
+    /// happens to be resting on. `D` is not drawn into it - the whole season is the one
+    /// request a handful of marks cannot be asking for.
+    #[test]
+    fn download_takes_the_marks_when_there_are_any_and_the_cursor_when_there_are_none() {
+        let mut app = app();
+        season(&mut app, 4);
+        assert_eq!(downloading(app.run(Command::Download)), ["E1"]);
+
+        app.episodes.select(2);
+        app.run(Command::Mark);
+        app.episodes.select(0);
+        assert_eq!(
+            downloading(app.run(Command::Download)),
+            ["E3"],
+            "the cursor is not the question once something is marked"
+        );
+        assert_eq!(said(&app), "Downloading the marked episode.");
+
+        app.episodes.select(1);
+        app.run(Command::Mark);
+        assert_eq!(downloading(app.run(Command::Download)), ["E2", "E3"]);
+        assert_eq!(
+            said(&app),
+            "Downloading 2 marked episodes, in season order."
+        );
+
+        assert_eq!(
+            downloading(app.run(Command::DownloadSeason)),
+            ["E1", "E2", "E3", "E4"],
+            "the whole season still means the whole season"
+        );
+    }
+
+    /// Marks are put on in whatever order the eye finds them, and a season is watched in
+    /// the order it is listed in. Downloading E7 before E2 because the cursor got there
+    /// first would make the shape of a download depend on something that is no longer
+    /// visible anywhere on screen.
+    #[test]
+    fn marked_episodes_come_back_in_the_order_the_season_lists_them() {
+        let mut app = app();
+        season(&mut app, 5);
+        for index in [3, 0, 4] {
+            app.episodes.select(index);
+            app.run(Command::Mark);
+        }
+        assert_eq!(downloading(app.run(Command::Download)), ["E1", "E4", "E5"]);
+    }
+
+    /// A mark belongs to the season it was put on. Carried into another one it would be
+    /// pointing at an episode that is not there, and the season that replaced it would
+    /// arrive with rows already marked that nobody had touched.
+    #[test]
+    fn the_marks_do_not_follow_the_column_to_another_season() {
+        let mut app = app();
+        season(&mut app, 3);
+        app.run(Command::Mark);
+        assert_eq!(app.marked.len(), 1);
+
+        app.focus = Focus::Seasons;
+        app.seasons.select(1);
+        app.run(Command::Open);
+        assert!(app.marked.is_empty(), "the marks came along to S2");
+        assert_eq!(
+            app.sent(),
+            [Request::Episodes {
+                season_id: "S2".to_owned(),
+                audio: "ja-JP".to_owned(),
+                subs: "en-US".to_owned(),
+            }]
+        );
+    }
+
+    /// A reload and a language change are the same season asked for over again, which is
+    /// why the cursor is put back across both. Five marks are more work to put back than
+    /// one cursor, and someone who marks half a season and then notices it is offering
+    /// the sub has asked for another dub rather than for their marks to be swept up.
+    #[test]
+    fn the_marks_survive_the_season_being_asked_for_again() {
+        let mut app = app();
+        season(&mut app, 4);
+        app.episodes.select(2);
+        app.run(Command::Mark);
+
+        app.run(Command::Reload);
+        assert!(app.marked.contains("E3"), "a reload threw the marks away");
+        assert_eq!(app.episodes.pending_cursor, Some(2));
+        let _ = app.sent();
+
+        app.run(Command::NextAudio);
+        assert_eq!(app.audio(), "en-US", "the language did not change");
+        assert!(
+            app.marked.contains("E3"),
+            "a change of dub threw the marks away"
+        );
+        assert_eq!(
+            app.sent(),
+            [Request::Episodes {
+                season_id: "S1".to_owned(),
+                audio: "en-US".to_owned(),
+                subs: "en-US".to_owned(),
+            }]
+        );
+    }
+
+    /// The other episode keys act on the cursor from wherever the keyboard is, because
+    /// there is only one thing they could mean. A mark is different: it is left behind on
+    /// a row that someone reading the catalogue column cannot see. So it belongs to the
+    /// episodes column, and pressed anywhere else it says so rather than being a key that
+    /// does nothing on two columns out of three.
+    #[test]
+    fn marking_answers_only_in_the_episodes_column() {
+        // With no season open at all the answer is the one every other episode key
+        // gives, because it is the same answer.
+        let mut empty = app();
+        empty.focus = Focus::Episodes;
+        empty.run(Command::Mark);
+        assert_eq!(said(&empty), "Open a season first.");
+
+        let mut app = app();
+        season(&mut app, 3);
+        for elsewhere in [Focus::Series, Focus::Seasons] {
+            app.focus = elsewhere;
+            app.run(Command::Mark);
+            assert!(app.marked.is_empty(), "{elsewhere:?} marked an episode");
+            assert_eq!(said(&app), "Marking is the episodes column's key.");
+            assert!(app.notice.as_ref().is_some_and(|notice| notice.error));
+        }
     }
 
     #[test]

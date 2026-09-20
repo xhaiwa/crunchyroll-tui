@@ -25,6 +25,7 @@ pub enum Command {
     Reload,
     Play,
     PlayRest,
+    Mark,
     Download,
     DownloadSeason,
     Watchlist,
@@ -60,6 +61,7 @@ impl Command {
             Self::Reload => "reload",
             Self::Play => "play",
             Self::PlayRest => "play-rest",
+            Self::Mark => "mark",
             Self::Download => "download",
             Self::DownloadSeason => "download-season",
             Self::Watchlist => "watchlist",
@@ -80,7 +82,7 @@ impl Command {
 /// Every command and the keys it answers to out of the box - vim's, with the arrows
 /// beside them. They are written the way a user would write them in the config and read
 /// by the same parser, so the defaults cannot mean something the config file cannot say.
-pub const DEFAULTS: [(Command, &[&str]); 27] = [
+pub const DEFAULTS: [(Command, &[&str]); 28] = [
     (Command::Up, &["up", "k"]),
     (Command::Down, &["down", "j"]),
     (Command::PageUp, &["pgup"]),
@@ -95,6 +97,7 @@ pub const DEFAULTS: [(Command, &[&str]); 27] = [
     (Command::Reload, &["r"]),
     (Command::Play, &["p"]),
     (Command::PlayRest, &["P"]),
+    (Command::Mark, &["space"]),
     (Command::Download, &["d"]),
     (Command::DownloadSeason, &["D"]),
     (Command::Watchlist, &["w"]),
