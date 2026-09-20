@@ -141,9 +141,9 @@ fn line(run: &Run) -> Line<'static> {
 /// The left of the header: what is being listed, and how much of it.
 ///
 /// The label is a button, because what it says is exactly what a click on it changes -
-/// `Popular` cycles the order, and `Search: frieren` leaves the search. The count beside
-/// it is not. While the box is being typed into, none of it is: a click there closes the
-/// box, as escape does.
+/// `Popular` and `Continue watching` alike move on to the next list, and `Search: frieren`
+/// leaves the search. The count beside it is not. While the box is being typed into, none
+/// of it is: a click there closes the box, as escape does.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
@@ -158,7 +158,7 @@ fn listing(app: &App) -> Run {
         None => vec![
             (
                 Some(match app.listing {
-                    Listing::Browse(_) => Command::Order,
+                    Listing::Browse(_) | Listing::History => Command::Order,
                     Listing::Search(_) => Command::Back,
                 }),
                 vec![theme.strong(app.listing.label())],
@@ -441,7 +441,7 @@ const HELP: [(&[Command], &str); 17] = [
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
-    (&[Command::Order], "change the browse order"),
+    (&[Command::Order], "change the list the catalogue shows"),
     (
         &[Command::Play, Command::PlayRest],
         "play the episode / the rest of the season",
@@ -1388,7 +1388,7 @@ mod tests {
         assert_eq!(word(Command::AudioLanguage), "audio 日本語");
         assert_eq!(word(Command::SubtitleLanguage), "subs English");
         assert_eq!(word(Command::Quality), "video 1080p");
-        assert_eq!(word(Command::Order), "Popular");
+        assert_eq!(word(Command::Order), "Continue watching");
         assert_eq!(word(Command::Open), "⏎ open/play");
         assert_eq!(word(Command::Download), "d download");
         assert_eq!(word(Command::Quit), "q quit");
