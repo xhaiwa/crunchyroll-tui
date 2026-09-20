@@ -160,9 +160,9 @@ fn line(run: &Run) -> Line<'static> {
 /// The left of the header: what is being listed, and how much of it.
 ///
 /// The label is a button, because what it says is exactly what a click on it changes -
-/// `Popular` cycles the order, and `Search: frieren` leaves the search. The count beside
-/// it is not. While the box is being typed into, none of it is: a click there closes the
-/// box, as escape does.
+/// `Popular`, `Watchlist` and `Continue watching` alike move on to the next list, and
+/// `Search: frieren` leaves the search. The count beside it is not. While the box is
+/// being typed into, none of it is: a click there closes the box, as escape does.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
@@ -177,7 +177,7 @@ fn listing(app: &App) -> Run {
         None => vec![
             (
                 Some(match app.listing {
-                    Listing::Browse(_) => Command::Order,
+                    Listing::Browse(_) | Listing::Watchlist | Listing::History => Command::Order,
                     Listing::Search(_) => Command::Back,
                 }),
                 vec![theme.strong(app.listing.label())],
@@ -446,7 +446,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 17] = [
+const HELP: [(&[Command], &str); 19] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -460,7 +460,7 @@ const HELP: [(&[Command], &str); 17] = [
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
     (&[Command::Search], "search the catalogue"),
-    (&[Command::Order], "change the browse order"),
+    (&[Command::Order], "change the list the catalogue shows"),
     (
         &[Command::Play, Command::PlayRest],
         "play the episode / the rest of the season",
@@ -468,6 +468,14 @@ const HELP: [(&[Command], &str); 17] = [
     (
         &[Command::Download, Command::DownloadSeason],
         "download the episode / the whole season",
+    ),
+    (
+        &[Command::Watchlist],
+        "put the series on the watchlist, or take it off",
+    ),
+    (
+        &[Command::MarkWatched, Command::MarkUnwatched],
+        "mark the episode watched / unwatched",
     ),
     (
         &[Command::AudioLanguage, Command::SubtitleLanguage],
@@ -857,7 +865,7 @@ mod tests {
     use crate::tui::art::Gallery;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
-    use crate::tui::worker::{Response, Worker};
+    use crate::tui::worker::{Listing, Request, Response, Worker};
 
     use super::{HELP, cells, draw, duration, poster_width, thumbnail_width};
 
@@ -1148,6 +1156,186 @@ mod tests {
         assert_eq!(app.episodes.state.selected(), Some(0), "j is not bound");
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.episodes.state.selected(), Some(1));
+    }
+
+    /// The catalogue label is a button and what it does is move on to the next list, so
+    /// a pointer has to be able to walk the whole ring - the account's own lists
+    /// included - and come back round to where it started. A list that is drawn but not
+    /// clickable would be one the mouse could enter and never leave. The walk starts
+    /// wherever the interface opens, which is the point: every stop has to lead on.
+    #[test]
+    fn the_listing_label_walks_the_whole_ring() {
+        let mut app = app();
+        let mut labels = Vec::new();
+        for _ in 0..Listing::sources().len() + 1 {
+            labels.push(app.listing.label());
+            let _ = buffer(120, 30, &mut app);
+            let (x, y) = middle(button(&app, Command::Order));
+            click(&mut app, x, y);
+        }
+        assert_eq!(
+            labels,
+            [
+                "Continue watching",
+                "Popular",
+                "Recently added",
+                "A to Z",
+                "Watchlist",
+                "Continue watching"
+            ]
+        );
+    }
+
+    /// A search is a detour off the ring, and leaving one has to come back to the order
+    /// that was in use when it began rather than to the top of the catalogue: someone
+    /// who went looking from A to Z did not ask to be put back on Popular.
+    #[test]
+    fn leaving_a_search_comes_back_to_the_order_in_use() {
+        let mut app = app();
+        // Off the opening list and one step along the browse orders, so that coming back
+        // to the top of the catalogue would be visibly the wrong answer.
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.listing.label(), "Recently added");
+        press(&mut app, KeyCode::Char('/'));
+        for letter in "frieren".chars() {
+            press(&mut app, KeyCode::Char(letter));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.listing.label(), "Search: frieren");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.listing.label(), "Recently added");
+    }
+
+    /// The watchlist is a thing about a series, and the seasons and the episodes on
+    /// screen are that series' own - so the key means the same series from any of the
+    /// three columns, rather than doing nothing in two of them.
+    #[test]
+    fn the_watchlist_key_takes_the_series_from_any_column() {
+        let mut app = app();
+        for focus in [Focus::Series, Focus::Seasons, Focus::Episodes] {
+            app.focus = focus;
+            // The catalogue the interface asks for as it opens is not what is being
+            // asked about here.
+            app.sent();
+            press(&mut app, KeyCode::Char('w'));
+            assert_eq!(
+                app.sent(),
+                vec![Request::Watchlist {
+                    series_id: "GY5P48XEY".to_owned(),
+                    series_title: "Frieren".to_owned(),
+                }],
+                "from the {focus:?} column"
+            );
+        }
+    }
+
+    /// And says so rather than going quiet when the catalogue has nothing selected -
+    /// while the first page is still on its way, or after a search that found nothing.
+    #[test]
+    fn the_watchlist_key_needs_a_series() {
+        let mut app = app();
+        app.series.clear();
+        app.sent();
+        press(&mut app, KeyCode::Char('w'));
+        assert!(
+            app.sent().is_empty(),
+            "asked Crunchyroll about a series nobody picked"
+        );
+        assert!(rendered(120, 30, &mut app).contains("Pick a series first."));
+    }
+
+    /// Marking watched is about the episode under the cursor: the playhead goes to the
+    /// episode's own running time in whole seconds, which is what Crunchyroll counts as
+    /// watched, and back to zero to undo it. The notice needs the episode's number as
+    /// well, since the cursor may have moved on by the time the answer arrives.
+    #[test]
+    fn marking_an_episode_moves_its_playhead_to_the_end_and_back() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        app.episodes.set(vec![SeasonEpisode {
+            id: "GZ7UV8KWZ".to_owned(),
+            episode: "4".to_owned(),
+            episode_number: 4,
+            season_number: 1,
+            title: "The Land Where Souls Rest".to_owned(),
+            duration_ms: 1_461_999,
+            ..SeasonEpisode::default()
+        }]);
+        app.sent();
+
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Playhead {
+                episode_id: "GZ7UV8KWZ".to_owned(),
+                label: "E4".to_owned(),
+                seconds: 1461,
+            }]
+        );
+
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Playhead {
+                episode_id: "GZ7UV8KWZ".to_owned(),
+                label: "E4".to_owned(),
+                seconds: 0,
+            }]
+        );
+    }
+
+    /// Some episodes come with no running time at all, and the playhead that marks one
+    /// watched is its running time. Sending the zero would put the playhead at the start,
+    /// which is what unwatched means - so `m` would quietly do what `M` does. It says
+    /// there is nothing to aim at instead, and `M` still works, since zero is where it
+    /// was going anyway.
+    #[test]
+    fn an_episode_with_no_running_time_cannot_be_marked_watched() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        app.episodes.set(vec![SeasonEpisode {
+            id: "GZ7UV8KWZ".to_owned(),
+            episode: "4".to_owned(),
+            episode_number: 4,
+            duration_ms: 0,
+            ..SeasonEpisode::default()
+        }]);
+        app.sent();
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(
+            app.sent().is_empty(),
+            "marked an episode watched by putting its playhead back to the start"
+        );
+        assert!(rendered(120, 30, &mut app).contains("no running time"));
+
+        // Unmarking one is still the same request it always was.
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(
+            app.sent(),
+            vec![Request::Playhead {
+                episode_id: "GZ7UV8KWZ".to_owned(),
+                label: "E4".to_owned(),
+                seconds: 0,
+            }]
+        );
+    }
+
+    /// With no season open there is no episode to mark, whatever the other two columns
+    /// hold - so it asks for one in the same words `play` and `download` use.
+    #[test]
+    fn marking_watched_needs_an_open_season() {
+        let mut app = app();
+        app.episodes.clear();
+        app.focus = Focus::Series;
+        app.sent();
+        press(&mut app, KeyCode::Char('m'));
+        assert!(
+            app.sent().is_empty(),
+            "moved the playhead of an episode nobody picked"
+        );
+        assert!(rendered(120, 30, &mut app).contains("Open a season first."));
     }
 
     /// The language list is the way a locale gets changed, so it has to offer what the
@@ -1495,7 +1683,7 @@ mod tests {
         assert_eq!(word(Command::AudioLanguage), "audio 日本語");
         assert_eq!(word(Command::SubtitleLanguage), "subs English");
         assert_eq!(word(Command::Quality), "video 1080p");
-        assert_eq!(word(Command::Order), "Popular");
+        assert_eq!(word(Command::Order), "Continue watching");
         assert_eq!(word(Command::Open), "⏎ open/play");
         assert_eq!(word(Command::Download), "d download");
         assert_eq!(word(Command::Quit), "q quit");

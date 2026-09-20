@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -11,9 +12,9 @@ use uuid::Uuid;
 
 use crate::credentials::Secret;
 use crate::model::{
-    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, Playhead,
-    PlayheadsResponse, SearchResponse, Season, SeasonEpisode, SeasonEpisodesResponse,
-    SeasonsResponse,
+    BrowseResponse, CatalogItem, Episode, EpisodeInfo, EpisodeMetadataResponse, HistoryEntry,
+    HistoryResponse, ObjectsResponse, Playhead, PlayheadsResponse, SearchResponse, Season,
+    SeasonEpisode, SeasonEpisodesResponse, SeasonsResponse, WatchlistEntry, WatchlistResponse,
 };
 
 const USER_AGENT_VALUE: &str =
@@ -129,6 +130,70 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .filter_map(|claim| claims.get(claim)?.as_str())
         .find(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+/// The series among a watchlist's rows.
+///
+/// The watchlist takes no `type` filter the way browse and search do, so the sifting has
+/// to happen here, and it is the same sifting `search` does for the same reason: a movie
+/// has no seasons endpoint and no episodes endpoint, so one in this column is a dead end
+/// for anyone who selects it.
+///
+/// Split out from the request so the part that does not need an account or a network can
+/// be tested against the two shapes the rows arrive in.
+fn watchlist_series(entries: Vec<WatchlistEntry>) -> Vec<CatalogItem> {
+    entries
+        .into_iter()
+        .map(WatchlistEntry::into_item)
+        .filter(|item| item.kind == "series")
+        .collect()
+}
+
+/// How many ids one `objects` request may name. The endpoint takes them as a
+/// comma-separated path segment, so a whole page of history in one request would be a URL
+/// some proxy between here and Crunchyroll is entitled to refuse; fifty is what the web
+/// player asks for and is comfortably inside anything that counts.
+const OBJECTS_PER_REQUEST: usize = 50;
+
+/// The series behind a page of history, newest first and each one named once.
+///
+/// The history is a list of episodes and the catalogue column holds series, so several
+/// entries in a row are usually the same series being worked through. Keeping the first
+/// occurrence rather than the last is the whole point: the first is the most recently
+/// watched, and what the column is for is saying what was being watched last.
+///
+/// Split out from the request because everything interesting about it - the order, and
+/// what happens to an entry that names no series - is worth pinning down without a
+/// network behind it.
+fn series_watched(entries: &[HistoryEntry]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .map(HistoryEntry::series_id)
+        .filter(|series| !series.is_empty() && seen.insert(*series))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The ids of one `objects` request each, comma-joined and ready to go into the path.
+fn object_batches(ids: &[String]) -> Vec<String> {
+    ids.chunks(OBJECTS_PER_REQUEST)
+        .map(|batch| batch.join(","))
+        .collect()
+}
+
+/// The catalogue entries put back into the order the ids were asked in.
+///
+/// `objects` promises nothing about the order it answers in, and for a list whose whole
+/// meaning is its order that is not something to take on trust. An id the endpoint said
+/// nothing about - a series that has been withdrawn, or one this account may no longer
+/// see - simply is not in the result, which is better than a hole in the column.
+fn in_asked_order(ids: &[String], items: Vec<CatalogItem>) -> Vec<CatalogItem> {
+    let mut found: HashMap<String, CatalogItem> = items
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect();
+    ids.iter().filter_map(|id| found.remove(id)).collect()
 }
 
 /// The requests one playheads lookup turns into: one per chunk of ids.
@@ -294,6 +359,17 @@ impl CrunchyrollClient {
         unreachable!()
     }
 
+    /// A request carrying a small JSON document, which is the shape every endpoint that
+    /// changes something about the account takes. The answer is handed back unchecked:
+    /// what counts as success differs between them - a 200 here, a 204 there - and each
+    /// caller can say what went wrong in its own words.
+    fn send_json(&self, method: Method, url: &str, body: &serde_json::Value) -> Result<Response> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let body = serde_json::to_vec(body).context("encode the request body")?;
+        self.send_authed(method, url, &headers, Some(&body))
+    }
+
     fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
         self.send_authed(Method::GET, url, &HeaderMap::new(), None)?
             .error_for_status()
@@ -379,27 +455,6 @@ impl CrunchyrollClient {
         Ok(playheads)
     }
 
-    /// Says how far into an episode the account has got, so that the phone and the web
-    /// player open where this client stopped.
-    ///
-    /// Answered with a 204 and an empty body, so there is nothing to decode and nothing
-    /// to hand back: either Crunchyroll took it or it did not.
-    pub fn set_playhead(&self, content_id: &str, seconds: u32) -> Result<()> {
-        let account_id = self.account_id()?;
-        let url = format!("https://www.crunchyroll.com/content/v2/{account_id}/playheads");
-        let body = serde_json::to_vec(&serde_json::json!({
-            "content_id": content_id,
-            "playhead": seconds,
-        }))
-        .context("encode the playback position")?;
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        self.send_authed(Method::POST, &url, &headers, Some(&body))?
-            .error_for_status()
-            .context("report the playback position")?;
-        Ok(())
-    }
-
     /// The catalogue, in whatever order `sort_by` asks for: `popularity`,
     /// `newly_added` or `alphabetical`.
     ///
@@ -437,6 +492,135 @@ impl CrunchyrollClient {
             .flat_map(|group| group.items)
             .filter(|item| item.kind == "series")
             .collect())
+    }
+
+    /// The series on the account's watchlist, most recently added first.
+    ///
+    /// Addressed by account rather than by token, so a session that never learned which
+    /// account it belongs to says so here rather than asking about an account that does
+    /// not exist and passing on the 404.
+    pub fn watchlist(&self, count: usize) -> Result<Vec<CatalogItem>> {
+        let account_id = self.account_id()?;
+        let mut url = reqwest::Url::parse(&format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist"
+        ))
+        .context("build the watchlist URL")?;
+        url.query_pairs_mut()
+            .append_pair("n", &count.to_string())
+            .append_pair("order", "desc")
+            .append_pair("locale", "en-US")
+            .append_pair("ratings", "true");
+        Ok(watchlist_series(
+            self.get_json::<WatchlistResponse>(url.as_str())?.data,
+        ))
+    }
+
+    /// The series the account was last watching, newest first.
+    ///
+    /// Crunchyroll keeps the history as episodes, one row per thing played, so the same
+    /// series turns up once for every episode of it that was watched. The catalogue
+    /// column shows series and drills into seasons, so the episodes are boiled down to
+    /// the series behind them and then fetched in full: a title on its own would make
+    /// this the one list in the column with no poster and nothing to say about itself.
+    pub fn history(&self, count: usize) -> Result<Vec<CatalogItem>> {
+        let account = self.account_id()?;
+        let mut url = reqwest::Url::parse(&format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account}/history"
+        ))
+        .context("build the history URL")?;
+        url.query_pairs_mut()
+            .append_pair("page_size", &count.to_string())
+            .append_pair("locale", "en-US")
+            .append_pair("ratings", "true");
+        let watched = self.get_json::<HistoryResponse>(url.as_str())?.data;
+        self.objects(&series_watched(&watched))
+    }
+
+    /// The catalogue entries for a set of ids, in the order they were asked for.
+    pub fn objects(&self, ids: &[String]) -> Result<Vec<CatalogItem>> {
+        let mut found = Vec::with_capacity(ids.len());
+        for batch in object_batches(ids) {
+            let url = format!(
+                "https://www.crunchyroll.com/content/v2/cms/objects/{batch}?ratings=true&locale=en-US"
+            );
+            found.extend(self.get_json::<ObjectsResponse>(&url)?.data);
+        }
+        Ok(in_asked_order(ids, found))
+    }
+
+    /// Whether the watchlist already holds this series.
+    ///
+    /// Nothing answers that as a yes or a no. Asking the watchlist about one series
+    /// comes back with the row it keeps for it, and with an empty list when it keeps
+    /// none, so the length of the list is the answer.
+    pub fn in_watchlist(&self, series_id: &str) -> Result<bool> {
+        let account_id = self.account_id()?;
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist/{series_id}?locale=en-US"
+        );
+        /// The row itself is never looked at, only counted, so nothing is built out of
+        /// it - a shape that changes on Crunchyroll's side cannot break a question this
+        /// narrow.
+        #[derive(Deserialize)]
+        struct WatchlistRows {
+            #[serde(default)]
+            data: Vec<serde::de::IgnoredAny>,
+        }
+        Ok(!self.get_json::<WatchlistRows>(&url)?.data.is_empty())
+    }
+
+    /// Puts the series on the watchlist. One half of a toggle rather than a way of
+    /// making sure, so the caller is expected to have asked whether it is there already.
+    pub fn watchlist_add(&self, series_id: &str) -> Result<()> {
+        let account_id = self.account_id()?;
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist?locale=en-US"
+        );
+        self.send_json(
+            Method::POST,
+            &url,
+            &serde_json::json!({ "content_id": series_id }),
+        )?
+        .error_for_status()
+        .context("put the series on the watchlist")?;
+        Ok(())
+    }
+
+    /// Takes the series off the watchlist again.
+    pub fn watchlist_remove(&self, series_id: &str) -> Result<()> {
+        let account_id = self.account_id()?;
+        let url = format!(
+            "https://www.crunchyroll.com/content/v2/discover/{account_id}/watchlist/{series_id}?locale=en-US"
+        );
+        self.send_authed(Method::DELETE, &url, &HeaderMap::new(), None)?
+            .error_for_status()
+            .context("take the series off the watchlist")?;
+        Ok(())
+    }
+
+    /// Moves one episode's playhead, in whole seconds from the start.
+    ///
+    /// Two things ride on this one request. It is how the position mpv has reached gets
+    /// back to the account, so that the phone and the web player open where this client
+    /// stopped; and it is how an episode is marked watched, which the name of the
+    /// endpoint gives no hint of - Crunchyroll keeps no flag for it and counts an episode
+    /// watched once its playhead has reached the end. So marking one watched is putting
+    /// the playhead at the episode's running time, and marking it unwatched is putting it
+    /// back to zero.
+    ///
+    /// Answered with a 204 and an empty body, so there is nothing to decode and nothing
+    /// to hand back: either Crunchyroll took it or it did not.
+    pub fn set_playhead(&self, content_id: &str, seconds: u32) -> Result<()> {
+        let account_id = self.account_id()?;
+        let url = format!("https://www.crunchyroll.com/content/v2/{account_id}/playheads");
+        self.send_json(
+            Method::POST,
+            &url,
+            &serde_json::json!({ "content_id": content_id, "playhead": seconds }),
+        )?
+        .error_for_status()
+        .context("move the episode's playhead")?;
+        Ok(())
     }
 
     pub fn manifest(&self, url: &str) -> Result<Vec<u8>> {
@@ -523,7 +707,12 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use super::{Duration, account_id_from_jwt, build_media_client, playhead_urls};
+    use crate::model::{CatalogItem, HistoryResponse, WatchlistResponse};
+
+    use super::{
+        Duration, OBJECTS_PER_REQUEST, account_id_from_jwt, build_media_client, in_asked_order,
+        object_batches, playhead_urls, series_watched, watchlist_series,
+    };
 
     /// A JWT with `claims` as its payload, signed by nobody: the segments are what is
     /// read here, and a signature this code never checks is not worth faking.
@@ -572,6 +761,102 @@ mod tests {
         ] {
             assert_eq!(account_id_from_jwt(token), None, "{token}");
         }
+    }
+
+    /// A watchlist holds whatever the account put on it, and that includes films. One in
+    /// this column would be a dead end - there is no seasons endpoint behind it - so it
+    /// is dropped here the way `search` drops one, rather than being drawn as a row that
+    /// does nothing when it is opened.
+    #[test]
+    fn a_film_on_the_watchlist_is_not_offered() {
+        let json = r#"{"total":3,"data":[
+            {"id":"GY8VEQ95Y","panel":{"id":"GY8VEQ95Y","type":"series","title":"Frieren"}},
+            {"id":"GM5V7XW1Q","panel":{"id":"GM5V7XW1Q","type":"movie_listing","title":"Suzume"}},
+            {"id":"G9DUEG5MB","type":"series","title":"Dandadan"}
+        ]}"#;
+        let response: WatchlistResponse = serde_json::from_str(json).expect("a watchlist");
+        let titles: Vec<String> = watchlist_series(response.data)
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["Frieren", "Dandadan"]);
+    }
+
+    /// A catalogue entry that is nothing but its id, which is all the ordering cares
+    /// about.
+    fn item(id: &str) -> CatalogItem {
+        CatalogItem {
+            id: id.to_owned(),
+            ..CatalogItem::default()
+        }
+    }
+
+    /// The history is a list of episodes, and watching three of one series in a row is
+    /// the ordinary case: the column has to show that series once, where the first and
+    /// most recent of those three put it. An entry that names no series at all belongs to
+    /// nothing the column can drill into, so it goes.
+    #[test]
+    fn boils_the_history_down_to_the_series_watched() {
+        let json = r#"{"data":[
+            {"parent_id":"GY8VEQ95Y"},
+            {"parent_id":"GY8VEQ95Y"},
+            {"parent_id":"GRMG8ZQZR"},
+            {"parent_id":"","panel":{"episode_metadata":{"series_id":"GEXH3W4JP"}}},
+            {"parent_id":"GY8VEQ95Y"},
+            {"id":"GZ7UV8KWZ","panel":null}
+        ]}"#;
+        let entries = serde_json::from_str::<HistoryResponse>(json).unwrap().data;
+        assert_eq!(
+            series_watched(&entries),
+            ["GY8VEQ95Y", "GRMG8ZQZR", "GEXH3W4JP"]
+        );
+    }
+
+    /// Newest-watched first is the only thing this list has over the catalogue, and the
+    /// objects endpoint makes no promise about the order it answers in. An id it says
+    /// nothing about - a series withdrawn, or one this account may no longer see - leaves
+    /// no gap, and anything it volunteered that was not asked for is not part of the
+    /// order and has no place in the column.
+    #[test]
+    fn puts_the_objects_answer_back_into_the_asked_for_order() {
+        let asked: Vec<String> = ["GY8VEQ95Y", "GRMG8ZQZR", "GWITHDRAWN", "GY5P48XEY"]
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        let answered = vec![
+            item("GY5P48XEY"),
+            item("GUNASKED"),
+            item("GRMG8ZQZR"),
+            item("GY8VEQ95Y"),
+        ];
+        let ordered: Vec<String> = in_asked_order(&asked, answered)
+            .into_iter()
+            .map(|series| series.id)
+            .collect();
+        assert_eq!(ordered, ["GY8VEQ95Y", "GRMG8ZQZR", "GY5P48XEY"]);
+    }
+
+    /// The ids go into the path as one comma-separated segment, so a whole page of
+    /// history in a single request is a URL long enough for something in the middle to
+    /// refuse it. Nothing to ask about is no request at all, which is what keeps an
+    /// account with an empty history from asking the objects endpoint about no ids.
+    #[test]
+    fn asks_about_fifty_ids_at_a_time() {
+        let remainder = 20;
+        let ids: Vec<String> = (0..OBJECTS_PER_REQUEST * 2 + remainder)
+            .map(|index| format!("G{index:03}"))
+            .collect();
+        let batches = object_batches(&ids);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].split(',').count(), OBJECTS_PER_REQUEST);
+        assert_eq!(batches[1].split(',').count(), OBJECTS_PER_REQUEST);
+        assert_eq!(batches[2].split(',').count(), remainder);
+        assert!(batches[0].starts_with("G000,G001,"));
+        assert_eq!(
+            batches[2].split(',').next_back(),
+            ids.last().map(String::as_str)
+        );
+        assert!(object_batches(&[]).is_empty());
     }
 
     /// The ids travel in the query string, so a season long enough to overrun what a

@@ -235,8 +235,10 @@ open = ["enter", "right", "l"]
 back = ["left", "h", "esc"]
 next-column = "tab"
 
-# The catalogue. An empty search goes back to browsing, and `order` cycles
-# popular, recently added and A to Z.
+# The catalogue. An empty search goes back to browsing, and `order` cycles the
+# lists the column can show: popular, recently added, A to Z, the account's own
+# watchlist, and then Continue watching, which is its history and what the
+# interface opens on.
 search = "/"
 order = "o"
 reload = "r"
@@ -247,6 +249,14 @@ play = "p"
 play-rest = "P"
 download = "d"
 download-season = "D"
+
+# What the account knows. `watchlist` puts the selected series on the watchlist
+# or takes it off again, whichever column the cursor is in; the other two move
+# the selected episode's playhead to the end or back to the start, which is how
+# Crunchyroll is told an episode has been watched or has not.
+watchlist = "w"
+mark-watched = "m"
+mark-unwatched = "M"
 
 # Languages. The first pair open the list, which offers what the selected season
 # has; the second pair step to the next locale without opening anything.

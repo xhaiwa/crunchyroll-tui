@@ -27,6 +27,9 @@ pub enum Command {
     PlayRest,
     Download,
     DownloadSeason,
+    Watchlist,
+    MarkWatched,
+    MarkUnwatched,
     AudioLanguage,
     SubtitleLanguage,
     NextAudio,
@@ -59,6 +62,9 @@ impl Command {
             Self::PlayRest => "play-rest",
             Self::Download => "download",
             Self::DownloadSeason => "download-season",
+            Self::Watchlist => "watchlist",
+            Self::MarkWatched => "mark-watched",
+            Self::MarkUnwatched => "mark-unwatched",
             Self::AudioLanguage => "audio-language",
             Self::SubtitleLanguage => "subtitle-language",
             Self::NextAudio => "next-audio",
@@ -74,7 +80,7 @@ impl Command {
 /// Every command and the keys it answers to out of the box - vim's, with the arrows
 /// beside them. They are written the way a user would write them in the config and read
 /// by the same parser, so the defaults cannot mean something the config file cannot say.
-pub const DEFAULTS: [(Command, &[&str]); 24] = [
+pub const DEFAULTS: [(Command, &[&str]); 27] = [
     (Command::Up, &["up", "k"]),
     (Command::Down, &["down", "j"]),
     (Command::PageUp, &["pgup"]),
@@ -91,6 +97,9 @@ pub const DEFAULTS: [(Command, &[&str]); 24] = [
     (Command::PlayRest, &["P"]),
     (Command::Download, &["d"]),
     (Command::DownloadSeason, &["D"]),
+    (Command::Watchlist, &["w"]),
+    (Command::MarkWatched, &["m"]),
+    (Command::MarkUnwatched, &["M"]),
     (Command::AudioLanguage, &["a"]),
     (Command::SubtitleLanguage, &["s"]),
     (Command::NextAudio, &["A"]),

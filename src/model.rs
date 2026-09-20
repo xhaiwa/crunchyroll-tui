@@ -123,6 +123,11 @@ pub struct EpisodeMetadata {
     pub episode_number: i32,
     #[serde(default, deserialize_with = "null_default")]
     pub season_number: i32,
+    /// Which series the episode is an episode of. The history is what wants it: its
+    /// entries are episodes, the catalogue column holds series, and this is where the
+    /// series hides on an entry whose `parent_id` was left out.
+    #[serde(default, deserialize_with = "null_default")]
+    pub series_id: String,
     #[serde(default)]
     pub series_title: String,
     #[serde(default)]
@@ -276,6 +281,95 @@ pub struct BrowseResponse {
     pub total: i64,
 }
 
+/// One row of the account's watchlist.
+///
+/// Crunchyroll answers this endpoint in two shapes and both turn up in the wild. Either
+/// the row wraps the series in a `panel`, with the bookkeeping the watchlist keeps about
+/// it - whether it is new, whether it is a favourite - sitting outside the wrapper, or
+/// the row simply *is* the series, with that same bookkeeping beside its title. Taking
+/// the panel where there is one and the row itself where there is not covers both,
+/// without having to know in advance which shape an account will be sent.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WatchlistEntry {
+    #[serde(default)]
+    pub panel: Option<CatalogItem>,
+    /// The other shape: the series' own fields, straight on the row. Harmless where a
+    /// panel is present, since everything it would collect is inside the wrapper and the
+    /// row keeps only its own id.
+    #[serde(flatten)]
+    pub item: CatalogItem,
+}
+
+impl WatchlistEntry {
+    /// The series the row stands for, whichever of the two shapes it arrived in.
+    pub fn into_item(self) -> CatalogItem {
+        self.panel.unwrap_or(self.item)
+    }
+}
+
+/// The panel an entry of the history carries: the episode as the catalogue would have
+/// shown it, with the metadata that says which series it came from.
+///
+/// Only the metadata is read. The panel describes an episode, and the column the history
+/// ends up in holds series, so the episode itself is of no use here beyond what it says
+/// about its parent.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HistoryPanel {
+    #[serde(default, deserialize_with = "null_default")]
+    pub episode_metadata: EpisodeMetadata,
+}
+
+/// One episode the account has watched, newest first.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HistoryEntry {
+    #[serde(default, deserialize_with = "null_default")]
+    pub parent_id: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub panel: HistoryPanel,
+}
+
+impl HistoryEntry {
+    /// The series this episode belongs to.
+    ///
+    /// `parent_id` is the entry's own answer and the one to trust, but it is not always
+    /// filled in, and the panel hanging off the entry says the same thing a second time.
+    /// An entry with neither knows of no series at all, which the caller reads as an
+    /// empty string and drops.
+    pub fn series_id(&self) -> &str {
+        if self.parent_id.is_empty() {
+            &self.panel.episode_metadata.series_id
+        } else {
+            &self.parent_id
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WatchlistResponse {
+    #[serde(default)]
+    pub data: Vec<WatchlistEntry>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryResponse {
+    #[serde(default)]
+    pub data: Vec<HistoryEntry>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub total: i64,
+}
+
+/// What `objects` answers with: the catalogue entries for the ids it was given, in
+/// whatever order it felt like putting them in.
+#[derive(Debug, Deserialize)]
+pub struct ObjectsResponse {
+    #[serde(default)]
+    pub data: Vec<CatalogItem>,
+}
+
 /// Search answers with one group per result type rather than a flat list.
 #[derive(Debug, Deserialize)]
 pub struct SearchGroup {
@@ -291,7 +385,10 @@ pub struct SearchResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{Episode, PlayheadsResponse, SeasonEpisode, SeasonEpisodesResponse};
+    use super::{
+        Episode, HistoryResponse, PlayheadsResponse, SeasonEpisode, SeasonEpisodesResponse,
+        WatchlistResponse,
+    };
 
     #[test]
     fn accepts_all_playback_error_shapes() {
@@ -366,6 +463,120 @@ mod tests {
         assert_eq!(episodes[0].episode_number, 0);
         assert_eq!(episodes[0].title, "");
         assert_eq!(episodes[1].duration_ms, 1_461_000);
+    }
+
+    /// The watchlist arrives in one of two shapes depending on the account, and neither
+    /// of them is worth guessing wrong: a row read the wrong way round is a column of
+    /// blank titles that nothing can be opened from.
+    #[test]
+    fn reads_a_watchlist_row_in_either_shape() {
+        // Wrapped: the watchlist's own bookkeeping outside, the series in `panel`.
+        let wrapped = r#"{"total":1,"data":[
+            {"id":"GY8VEQ95Y","new":false,"is_favorite":false,
+             "panel":{"id":"GY8VEQ95Y","type":"series","title":"Frieren",
+                      "description":"An elf outlives her party.",
+                      "images":{"poster_tall":[[{"width":240,"source":"a.jpg"}]]},
+                      "series_metadata":{"season_count":1,"is_dubbed":true}}}
+        ]}"#;
+        // Flat: the row is the series, with the same bookkeeping beside its title.
+        let flat = r#"{"total":1,"data":[
+            {"id":"GY8VEQ95Y","new":false,"is_favorite":false,"type":"series",
+             "title":"Frieren","description":"An elf outlives her party.",
+             "images":{"poster_tall":[[{"width":240,"source":"a.jpg"}]]},
+             "series_metadata":{"season_count":1,"is_dubbed":true}}
+        ]}"#;
+        for json in [wrapped, flat] {
+            let response: WatchlistResponse = serde_json::from_str(json).unwrap();
+            let item = response.data.into_iter().next().unwrap().into_item();
+            assert_eq!(item.id, "GY8VEQ95Y", "{json}");
+            assert_eq!(item.kind, "series", "{json}");
+            assert_eq!(item.title, "Frieren", "{json}");
+            assert_eq!(item.description, "An elf outlives her party.", "{json}");
+            assert_eq!(item.series_metadata.season_count, 1, "{json}");
+            assert!(item.series_metadata.is_dubbed, "{json}");
+            assert_eq!(item.images.poster(240), Some("a.jpg"), "{json}");
+        }
+    }
+
+    /// A series with no poster yet is sent either as `"images": null` or with the field
+    /// left out, and in both shapes of row. None of the four is a reason to throw the
+    /// whole watchlist away - the column draws a placeholder and carries on.
+    #[test]
+    fn takes_a_watchlist_row_with_no_artwork() {
+        for json in [
+            r#"{"data":[{"id":"G1","panel":{"id":"G1","type":"series","images":null}}]}"#,
+            r#"{"data":[{"id":"G1","panel":{"id":"G1","type":"series"}}]}"#,
+            r#"{"data":[{"id":"G1","type":"series","images":null}]}"#,
+            r#"{"data":[{"id":"G1","type":"series"}]}"#,
+        ] {
+            let response: WatchlistResponse = serde_json::from_str(json).unwrap();
+            let item = response.data.into_iter().next().unwrap().into_item();
+            assert_eq!(item.id, "G1", "{json}");
+            assert_eq!(item.images.poster(240), None, "{json}");
+        }
+    }
+
+    /// The history as Crunchyroll actually sends it. It is a list of episodes, and the
+    /// only thing read off each one is which series it belongs to, so that is what this
+    /// pins down: the whole shape goes in, and the series comes out.
+    #[test]
+    fn reads_the_history_an_episode_at_a_time() {
+        let json = r#"{"total":120,"data":[
+            {"id":"GZ7UV8KWZ","playhead":842,"fully_watched":false,
+             "date_played":"2026-05-01T10:11:12Z",
+             "parent_id":"GY8VEQ95Y","parent_type":"series",
+             "panel":{"id":"GZ7UV8KWZ","type":"episode","title":"The Land Where Souls Rest",
+                      "episode_metadata":{"series_id":"GY8VEQ95Y","series_title":"Frieren",
+                                          "season_number":1,"episode_number":4}}}
+        ]}"#;
+        let response: HistoryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.total, 120);
+        let entry = &response.data[0];
+        assert_eq!(entry.series_id(), "GY8VEQ95Y");
+        assert_eq!(entry.panel.episode_metadata.series_title, "Frieren");
+        assert_eq!(entry.panel.episode_metadata.episode_number, 4);
+    }
+
+    /// `parent_id` is the entry's own word for which series it came from, and it is not
+    /// always there. The panel says the same thing a second time, so an entry without one
+    /// is still worth keeping - and an entry with neither names no series at all, which
+    /// the caller has to be able to tell apart from one that does.
+    #[test]
+    fn finds_the_series_wherever_the_entry_keeps_it() {
+        let json = r#"{"data":[
+            {"parent_id":"","panel":{"episode_metadata":{"series_id":"GY8VEQ95Y"}}},
+            {"panel":{"episode_metadata":{"series_id":"GRMG8ZQZR"}}},
+            {"parent_id":"GY5P48XEY","panel":{"episode_metadata":{"series_id":"G0LDEN"}}},
+            {"panel":{"episode_metadata":{"series_id":null}}},
+            {"id":"GZ7UV8KWZ"}
+        ]}"#;
+        let entries = serde_json::from_str::<HistoryResponse>(json).unwrap().data;
+        assert_eq!(entries[0].series_id(), "GY8VEQ95Y");
+        assert_eq!(entries[1].series_id(), "GRMG8ZQZR");
+        assert_eq!(
+            entries[2].series_id(),
+            "GY5P48XEY",
+            "the entry's own parent beats the panel's copy of it"
+        );
+        assert_eq!(entries[3].series_id(), "");
+        assert_eq!(entries[4].series_id(), "");
+    }
+
+    /// An entry whose panel Crunchyroll has nothing to say about - a deleted episode, or
+    /// one the account may no longer see - arrives with the panel or its metadata null
+    /// rather than missing. Neither is a broken page of history: it is one entry that
+    /// cannot be turned into a series, and the rest of the page still can.
+    #[test]
+    fn takes_an_entry_with_no_panel() {
+        for json in [
+            r#"{"data":[{"parent_id":"GY8VEQ95Y","panel":null}]}"#,
+            r#"{"data":[{"parent_id":"GY8VEQ95Y","panel":{"episode_metadata":null}}]}"#,
+            r#"{"data":[{"parent_id":"GY8VEQ95Y","panel":{}}]}"#,
+        ] {
+            let entries = serde_json::from_str::<HistoryResponse>(json).unwrap().data;
+            assert_eq!(entries[0].series_id(), "GY8VEQ95Y", "{json}");
+            assert_eq!(entries[0].panel.episode_metadata.series_title, "", "{json}");
+        }
     }
 
     /// The answer decides whether a row is marked and where mpv opens, so one odd entry

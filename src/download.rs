@@ -1412,6 +1412,9 @@ pub fn episode_info(episode: &SeasonEpisode) -> EpisodeInfo {
             audio_locale: episode.audio_locale.clone(),
             versions: episode.versions.clone(),
             availability_starts: episode.availability_starts.clone(),
+            // A season listing names the series by title and not by id, and nothing a
+            // download does with this asks for the id.
+            ..EpisodeMetadata::default()
         },
         title: episode.title.clone(),
     }
