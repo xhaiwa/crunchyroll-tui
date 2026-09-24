@@ -1,5 +1,6 @@
 mod app;
 pub mod art;
+pub mod grid;
 pub mod keys;
 mod mouse;
 pub mod theme;

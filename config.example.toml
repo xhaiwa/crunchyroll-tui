@@ -234,13 +234,19 @@ bottom = ["end", "G"]
 
 # Moving between the three columns. `open` also plays the episode under the
 # cursor, and `back` also leaves a search. `left` and `right` do the same as
-# `back` and `open` in the columns; they are commands of their own so that the
-# arrows can mean something else where there is a sideways to move in.
+# `back` and `open` in the columns; on the wall of covers they move to the
+# previous and the next cover, which is why they are commands of their own.
 left = ["left", "h"]
 right = ["right", "l"]
 open = "enter"
 back = "esc"
 next-column = "tab"
+
+# Between the columns and the wall of covers: the catalogue as a grid of
+# posters, as many across as the terminal has room for. `up` and `down` move a
+# row of covers, `open` opens one into the columns, and `back` out of its
+# seasons comes back to the wall.
+view = "t"
 
 # The catalogue. `search` asks Crunchyroll for a query and replaces the column
 # with what comes back; an empty search goes back to browsing. `order` cycles the

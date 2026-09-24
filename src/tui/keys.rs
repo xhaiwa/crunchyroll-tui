@@ -25,6 +25,8 @@ pub enum Command {
     Open,
     Back,
     NextColumn,
+    /// Between the columns and the wall of covers.
+    View,
     Search,
     Filter,
     Order,
@@ -67,6 +69,7 @@ impl Command {
             Self::Open => "open",
             Self::Back => "back",
             Self::NextColumn => "next-column",
+            Self::View => "view",
             Self::Search => "search",
             Self::Filter => "filter",
             Self::Order => "order",
@@ -103,7 +106,7 @@ impl Command {
 /// tile while return still opens one and escape still leaves a search - and a command
 /// only ever hears which command it is, never which key asked for it. In the columns the
 /// two are passed straight on to `back` and `open`, so nothing changes there.
-pub const DEFAULTS: [(Command, &[&str]); 34] = [
+pub const DEFAULTS: [(Command, &[&str]); 35] = [
     (Command::Up, &["up", "k"]),
     (Command::Down, &["down", "j"]),
     (Command::PageUp, &["pgup"]),
@@ -115,6 +118,7 @@ pub const DEFAULTS: [(Command, &[&str]); 34] = [
     (Command::Open, &["enter"]),
     (Command::Back, &["esc"]),
     (Command::NextColumn, &["tab"]),
+    (Command::View, &["t"]),
     (Command::Search, &["/"]),
     (Command::Filter, &["f"]),
     (Command::Order, &["o"]),

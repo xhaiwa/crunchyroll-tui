@@ -51,6 +51,10 @@ pub enum Target {
     /// A column, wherever in it: a border and a title are part of the column to anyone
     /// aiming a pointer at one.
     Column(Focus),
+    /// One cover on the wall, by the row of the catalogue it stands for. A tile is an
+    /// item rather than a place in a list, so unlike a column this does say which one:
+    /// the wall has no single offset a line of the screen could be counted from.
+    Tile(usize),
     /// Inside whichever list is open over the interface.
     Picker,
     /// One of those lists is open and the pointer is somewhere else, which is how it is
@@ -84,6 +88,10 @@ pub struct Regions {
     pub downloads: Rect,
     /// The list of values while one is open, and nothing while none is.
     pub picker: Rect,
+    /// Every cover on the wall, and the row of the catalogue it stands for, while the
+    /// wall is up. The wall's own box is `series`, so the gaps between the tiles are
+    /// still the catalogue to a pointer - somewhere to spin the wheel, not to click.
+    pub tiles: Vec<(usize, Rect)>,
     /// Every word drawn along the top and bottom edges, and the command it runs. One
     /// list, because they are all the same thing: a word somewhere, that answers.
     pub buttons: Vec<(Command, Rect)>,
@@ -121,6 +129,9 @@ impl Regions {
         }
         if let Some((command, _)) = self.buttons.iter().find(|(_, area)| area.contains(at)) {
             return Target::Button(*command);
+        }
+        if let Some((row, _)) = self.tiles.iter().find(|(_, area)| area.contains(at)) {
+            return Target::Tile(*row);
         }
         [
             Focus::Series,
@@ -353,6 +364,7 @@ mod tests {
             episodes: Rect { x: 50, ..COLUMN },
             downloads: Rect::default(),
             picker: Rect::default(),
+            tiles: Vec::new(),
             buttons: vec![(
                 Command::Quit,
                 Rect {
@@ -399,6 +411,53 @@ mod tests {
             Regions::default().at(Position::new(0, 0)),
             Target::Nothing,
             "nothing has been drawn yet, so nothing can be clicked"
+        );
+    }
+
+    #[test]
+    fn a_cover_is_hit_by_the_row_it_stands_for() {
+        let wall = Rect {
+            x: 0,
+            y: 3,
+            width: 80,
+            height: 20,
+        };
+        let regions = Regions {
+            area: Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            series: wall,
+            tiles: vec![
+                (
+                    40,
+                    Rect {
+                        x: 1,
+                        y: 4,
+                        width: 18,
+                        height: 16,
+                    },
+                ),
+                (
+                    41,
+                    Rect {
+                        x: 20,
+                        y: 4,
+                        width: 18,
+                        height: 16,
+                    },
+                ),
+            ],
+            ..Regions::default()
+        };
+        assert_eq!(regions.at(Position::new(5, 10)), Target::Tile(40));
+        assert_eq!(regions.at(Position::new(37, 19)), Target::Tile(41));
+        assert_eq!(
+            regions.at(Position::new(19, 10)),
+            Target::Column(Focus::Series),
+            "the gap between two covers is the wall, not either of them"
         );
     }
 }
