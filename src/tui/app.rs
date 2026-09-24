@@ -2180,7 +2180,7 @@ impl App {
             return;
         };
         match command {
-            Command::Back | Command::Quit => self.picker = None,
+            Command::Back | Command::Left | Command::Quit => self.picker = None,
             Command::Up => picker.pane.move_by(-1),
             Command::Down => picker.pane.move_by(1),
             Command::PageUp => picker.pane.move_by(-10),
@@ -2195,7 +2195,7 @@ impl App {
             Command::SubtitleLanguage => self.open_picker(Picking::Subtitles),
             Command::Genre => self.open_picker(Picking::Filter(FilterKind::Genre)),
             Command::AnimeSeason => self.open_picker(Picking::Filter(FilterKind::Season)),
-            Command::Open => {
+            Command::Open | Command::Right => {
                 let kind = picker.kind;
                 let chosen = picker.pane.selected().cloned();
                 self.picker = None;
@@ -2282,8 +2282,8 @@ impl App {
             Command::PageDown => self.focused_pane_move(10),
             Command::Top => self.focused_pane_edge(false),
             Command::Bottom => self.focused_pane_edge(true),
-            Command::Open => return self.descend(),
-            Command::Back => self.ascend(),
+            Command::Open | Command::Right => return self.descend(),
+            Command::Back | Command::Left => self.ascend(),
             Command::NextColumn => {
                 self.focus = match self.focus {
                     Focus::Series => Focus::Seasons,

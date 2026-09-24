@@ -233,9 +233,13 @@ top = ["home", "g"]
 bottom = ["end", "G"]
 
 # Moving between the three columns. `open` also plays the episode under the
-# cursor, and `back` also leaves a search.
-open = ["enter", "right", "l"]
-back = ["left", "h", "esc"]
+# cursor, and `back` also leaves a search. `left` and `right` do the same as
+# `back` and `open` in the columns; they are commands of their own so that the
+# arrows can mean something else where there is a sideways to move in.
+left = ["left", "h"]
+right = ["right", "l"]
+open = "enter"
+back = "esc"
 next-column = "tab"
 
 # The catalogue. `search` asks Crunchyroll for a query and replaces the column

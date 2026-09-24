@@ -17,6 +17,11 @@ pub enum Command {
     PageDown,
     Top,
     Bottom,
+    /// Sideways. In the columns these are `back` and `open` under another name, which is
+    /// all the arrows ever were there; on the wall of covers they move a tile - see
+    /// [`DEFAULTS`] for why they are commands of their own.
+    Left,
+    Right,
     Open,
     Back,
     NextColumn,
@@ -57,6 +62,8 @@ impl Command {
             Self::PageDown => "page-down",
             Self::Top => "top",
             Self::Bottom => "bottom",
+            Self::Left => "left",
+            Self::Right => "right",
             Self::Open => "open",
             Self::Back => "back",
             Self::NextColumn => "next-column",
@@ -90,15 +97,23 @@ impl Command {
 /// Every command and the keys it answers to out of the box - vim's, with the arrows
 /// beside them. They are written the way a user would write them in the config and read
 /// by the same parser, so the defaults cannot mean something the config file cannot say.
-pub const DEFAULTS: [(Command, &[&str]); 32] = [
+///
+/// The arrows and `h` `l` used to belong to `open` and `back` directly. They are `left`
+/// and `right` now, because on the wall of covers a sideways key has to move to the next
+/// tile while return still opens one and escape still leaves a search - and a command
+/// only ever hears which command it is, never which key asked for it. In the columns the
+/// two are passed straight on to `back` and `open`, so nothing changes there.
+pub const DEFAULTS: [(Command, &[&str]); 34] = [
     (Command::Up, &["up", "k"]),
     (Command::Down, &["down", "j"]),
     (Command::PageUp, &["pgup"]),
     (Command::PageDown, &["pgdn"]),
     (Command::Top, &["home", "g"]),
     (Command::Bottom, &["end", "G"]),
-    (Command::Open, &["enter", "right", "l"]),
-    (Command::Back, &["left", "h", "esc"]),
+    (Command::Left, &["left", "h"]),
+    (Command::Right, &["right", "l"]),
+    (Command::Open, &["enter"]),
+    (Command::Back, &["esc"]),
     (Command::NextColumn, &["tab"]),
     (Command::Search, &["/"]),
     (Command::Filter, &["f"]),
@@ -555,10 +570,10 @@ images = \"q\"
     fn the_colemak_example_is_a_working_config() {
         let (bindings, warnings) = toml::from_str::<Settings>(
             "\
-back = [\"n\", \"left\", \"esc\"]
+left = [\"n\", \"left\"]
 down = [\"e\", \"down\"]
 up = [\"i\", \"up\"]
-open = [\"o\", \"enter\", \"right\"]
+right = [\"o\", \"right\"]
 anime-season = \"N\"
 images = \"I\"
 order = \"O\"
@@ -568,10 +583,10 @@ order = \"O\"
         .resolve();
         assert!(warnings.is_empty(), "{warnings:?}");
         for (letter, expected) in [
-            ('n', Command::Back),
+            ('n', Command::Left),
             ('e', Command::Down),
             ('i', Command::Up),
-            ('o', Command::Open),
+            ('o', Command::Right),
             ('N', Command::AnimeSeason),
             ('I', Command::Images),
             ('O', Command::Order),

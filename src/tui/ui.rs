@@ -743,7 +743,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 23] = [
+const HELP: [(&[Command], &str); 24] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -752,6 +752,10 @@ const HELP: [(&[Command], &str); 23] = [
     (
         &[Command::Top, Command::Bottom],
         "jump to the first or last item",
+    ),
+    (
+        &[Command::Left, Command::Right],
+        "go back a column / open the selection",
     ),
     (
         &[Command::Open],

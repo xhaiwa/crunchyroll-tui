@@ -207,8 +207,9 @@ instead and says so on the status line.
 | `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
 | `pgup` `pgdn` | `page-up`, `page-down` | Move a page at a time |
 | `home` `end`, `g` `G` | `top`, `bottom` | Jump to the first or last item |
-| `⏎`, `→`, `l` | `open` | Open the selection, play the episode under the cursor, drop a row of the queue |
-| `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
+| `←` `→`, `h` `l` | `left`, `right` | Go back a column, or open the selection - the same as `back` and `open` |
+| `⏎` | `open` | Open the selection, play the episode under the cursor, drop a row of the queue |
+| `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns: series, seasons, episodes, downloads |
 | `/` | `search` | Search the catalogue: asks Crunchyroll, and replaces the Series column with the answer. An empty search goes back to browsing |
 | `f` | `filter` | Narrow the column the cursor is in to the rows that match what you type. Asks nobody anything, and hides nothing anywhere else |
@@ -695,10 +696,10 @@ where `hjkl` is scattered across the keyboard rather than sitting under a hand.
 ```toml
 [keys]
 # Colemak's navigation row - neio - with the arrows kept beside it
-back = ["n", "left", "esc"]
+left = ["n", "left"]
 down = ["e", "down"]
 up = ["i", "up"]
-open = ["o", "enter", "right"]
+right = ["o", "right"]
 # and somewhere to put the three that `n`, `i` and `o` were holding
 anime-season = "N"
 images = "I"
@@ -718,8 +719,9 @@ The commands, and the keys they answer to out of the box:
 | `up` `down` | `↑` `k`, `↓` `j` | Move the cursor |
 | `page-up` `page-down` | `pgup`, `pgdn` | Move it ten rows |
 | `top` `bottom` | `home` `g`, `end` `G` | Jump to the first or last item |
-| `open` | `enter` `right` `l` | Open the selection, play an episode, drop a download |
-| `back` | `left` `h` `esc` | Go back a column, and leave a search |
+| `left` `right` | `left` `h`, `right` `l` | Go back a column, or open the selection |
+| `open` | `enter` | Open the selection, play an episode, drop a download |
+| `back` | `esc` | Go back a column, and leave a search |
 | `next-column` | `tab` | Cycle the columns |
 | `search` | `/` | Search the catalogue |
 | `order` | `o` | Change the list the catalogue shows |
