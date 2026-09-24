@@ -65,6 +65,17 @@
 # before the first `[section]` heading. That is TOML, not us.
 images = "auto"
 
+# How the catalogue is drawn when the interface opens:
+#
+#   "columns"  series, seasons and episodes side by side, with the poster of
+#              the selected series beside them
+#   "covers"   the catalogue as a wall of posters; opening one goes to the
+#              columns, and backing out of its seasons comes back to the wall
+#
+# `--view` overrides this, and `t` switches between the two while the
+# interface is running. Top level as well, for the same reason.
+view = "columns"
+
 
 # ============================================================================
 # The mouse

@@ -90,7 +90,7 @@ pub fn run(
     if mouse {
         mouse::restore_on_panic();
     }
-    let app = App::new(
+    let mut app = App::new(
         Worker::spawn(client.clone()),
         options,
         theme,
@@ -98,6 +98,7 @@ pub fn run(
         notices,
         gallery,
     );
+    app.view = config.view;
     let result = event_loop(&mut terminal, &client, app, mouse);
     // Before the terminal is given back, never after: `try_restore` turns raw mode off
     // first, and a report landing in the moment between the two is printed on the user's

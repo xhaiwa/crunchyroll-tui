@@ -505,6 +505,13 @@ it opens it, and the wheel scrolls a row at a time.
 A cover that has not arrived yet, or any cover while the artwork is off, is drawn as a
 shaded panel with the title's initials on it rather than left as a hole.
 
+To open on the wall rather than the columns, say so on the command line or put
+`view = "covers"` in the [config file](#configuration):
+
+```shell
+cargo run --release -- --tui --view covers
+```
+
 ### The download queue
 
 `d` and `D` do not take the terminal away any more. The episode goes on a queue, the
@@ -671,6 +678,9 @@ etp_rt_command = "pass show crunchyroll"
 # Posters and episode stills: "auto", "on" or "off". Top level, so it has to come
 # before the first section - that is TOML, not us.
 images = "auto"
+
+# Whether the catalogue opens as "columns" or as a wall of "covers". Top level too.
+view = "columns"
 
 # Whether the interface answers the mouse. Turning it off gives the terminal back
 # its own click-and-drag text selection. Top level too.

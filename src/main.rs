@@ -113,6 +113,12 @@ struct Cli {
     #[arg(long, value_name = "WHEN", requires = "tui")]
     images: Option<tui::art::Setting>,
 
+    /// Whether the terminal interface opens on the three columns or on the catalogue as
+    /// a wall of covers, overriding the config file. `t` switches between them either
+    /// way.
+    #[arg(long, value_name = "VIEW", requires = "tui")]
+    view: Option<tui::grid::View>,
+
     /// Whether the terminal interface answers the mouse, overriding the config file.
     /// `--mouse=false` browses with the keyboard alone and leaves the terminal its own
     /// click-and-drag text selection.
@@ -297,6 +303,9 @@ fn run() -> Result<()> {
         }
         if let Some(images) = cli.images {
             config.images = images;
+        }
+        if let Some(view) = cli.view {
+            config.view = view;
         }
         if cli.mouse.is_some() {
             config.mouse = cli.mouse;
