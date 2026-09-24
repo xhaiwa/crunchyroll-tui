@@ -1,8 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect, Size};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::download::OnDisk;
 use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode, single_name};
@@ -67,9 +66,31 @@ fn column_name(app: &App, focus: Focus) -> &'static str {
 /// half the season. The count is both numbers rather than the one, because how much is
 /// missing is the part that cannot be seen.
 fn pane_title<T>(name: &str, pane: &Pane<T>) -> String {
+    let glyph = glyph(name);
     match pane.query() {
-        Some(query) => format!("{name} \"{query}\" {}/{}", pane.rows(), pane.items.len()),
-        None => name.to_owned(),
+        Some(query) => format!(
+            "{glyph} {name} \"{query}\" {}/{}",
+            pane.rows(),
+            pane.items.len()
+        ),
+        None => format!("{glyph} {name}"),
+    }
+}
+
+/// The small mark in front of a column's title, so that the four boxes can be told
+/// apart at a glance before any of their words have been read.
+///
+/// Keyed on the name [`column_name`] gives rather than on the focus, because that name
+/// is what every title is built from; whatever the middle column is called - `Seasons`,
+/// `Film`, `Music` - it is the middle column. The glyphs are all ones a monospace font
+/// draws a single cell wide and none of them has an emoji form, which is what would
+/// otherwise knock every title after it a column out of line.
+fn glyph(name: &str) -> &'static str {
+    match name {
+        "Series" => "\u{25a4}",
+        "Episodes" | "Episode" => "\u{25b8}",
+        "Downloads" | "Download" => "\u{21e3}",
+        _ => "\u{25eb}",
     }
 }
 
@@ -85,17 +106,25 @@ fn nothing_shown<T>(pane: &Pane<T>, idle: &str) -> String {
     }
 }
 
+/// A column's box: the border and the title in the accent while it has the keyboard,
+/// and both stepped back while it does not, so the focused column is the one thing on
+/// the screen framed in colour.
 fn pane_block(theme: &Theme, title: &str, focused: bool) -> Block<'static> {
     let heading = if focused {
         theme.title(format!(" {title} "))
     } else {
-        Span::styled(format!(" {title} "), Style::new().fg(theme.heading))
+        theme.heading(format!(" {title} "))
     };
     theme.bordered(focused).title(heading)
 }
 
 /// What a column shows when it holds nothing: why it is empty, or that it is still
 /// waiting for an answer.
+///
+/// The waiting and the idle sentence sit in the middle of the column, where they read as
+/// something the column is saying rather than as a row of it; a failure keeps to the
+/// left, because it is often longer than the column is wide and a centred line cut off
+/// at both ends would lose the start of it, which is where the reason usually is.
 fn placeholder(
     theme: &Theme,
     loading: bool,
@@ -106,36 +135,56 @@ fn placeholder(
     let line = if loading {
         Line::from(vec![
             theme.accent(SPINNER[tick % SPINNER.len()]),
-            theme.text(" Loading..."),
+            theme.dim(" Loading\u{2026}"),
         ])
+        .centered()
     } else if let Some(error) = error {
-        Line::from(theme.error(error.clone()))
+        Line::from(vec![theme.error("\u{2717} "), theme.error(error.clone())])
     } else {
-        Line::from(theme.dim(idle.to_owned()))
+        Line::from(theme.dim(idle.to_owned())).centered()
     };
     vec![ListItem::new(line)]
+}
+
+/// The little words after a title, held apart by a dot. `(true, ..)` is a word that
+/// stands out - what kind of thing a row is where it is not a series, or that it is
+/// simulcasting - and is drawn in the accent; the rest are dim.
+fn tags(theme: &Theme, tags: Vec<(bool, String)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, (loud, word)) in tags.into_iter().enumerate() {
+        spans.push(theme.dim(if index == 0 { "  " } else { DOT }));
+        spans.push(if loud {
+            theme.accent(word)
+        } else {
+            theme.dim(word)
+        });
+    }
+    spans
 }
 
 fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
     let metadata = &series.series_metadata;
     let film = &series.movie_listing_metadata;
-    let mut tags = Vec::new();
+    let mut words = Vec::new();
     // What it is, where it is not a series. `2 seasons` is a thing to say about a series
     // and nothing to say about a film, and the catalogue now mixes the two: a row that
     // said neither would leave the column looking like a list of series with some odd
     // short ones in it.
     if let Some(word) = single_name(&series.kind) {
-        tags.push(word.to_lowercase());
+        words.push((true, word.to_lowercase()));
     } else if metadata.season_count > 1 {
-        tags.push(format!("{} seasons", metadata.season_count));
+        words.push((false, format!("{} seasons", metadata.season_count)));
     }
     if metadata.is_dubbed || film.is_dubbed {
-        tags.push("dub".to_owned());
+        words.push((false, "dub".to_owned()));
     }
-    let mut spans = vec![theme.text(series.title.clone())];
-    if !tags.is_empty() {
-        spans.push(theme.dim(format!("  {}", tags.join(" · "))));
+    // New episodes every week is the one thing about a series that changes what
+    // somebody does next, so it is worth a word in the row rather than only in the panel.
+    if metadata.is_simulcast {
+        words.push((true, "simulcast".to_owned()));
     }
+    let mut spans = vec![theme.strong(series.title.clone())];
+    spans.extend(tags(theme, words));
     ListItem::new(Line::from(spans))
 }
 
@@ -144,7 +193,10 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
     // is already showing - see [`season_title`], which the narrowing reads a row with.
     let mut spans = vec![theme.text(season_title(season, series_title))];
     if season.number_of_episodes > 0 {
-        spans.push(theme.dim(format!("  {} ep", season.number_of_episodes)));
+        spans.extend(tags(
+            theme,
+            vec![(false, format!("{} ep", season.number_of_episodes))],
+        ));
     }
     ListItem::new(Line::from(spans))
 }
@@ -197,6 +249,17 @@ fn episode_row(
     } else {
         episode.episode.clone()
     };
+    // An episode the account has finished steps back: its number and its title go dim
+    // and the check stands out instead, so what is left to watch in a season is what the
+    // eye lands on and the finished ones read as done without being hidden.
+    let watched = playhead.is_some_and(|seen| seen.fully_watched);
+    let quiet = |text: String| {
+        if watched {
+            theme.dim(text)
+        } else {
+            theme.accent(text)
+        }
+    };
     let mut spans = Vec::new();
     if let Some(marked) = mark {
         spans.push(theme.accent(if marked { MARK } else { " " }));
@@ -205,8 +268,8 @@ fn episode_row(
     // in itself is called what the rest of the interface calls it. The word is spent in
     // the four cells the number slot already takes, so nothing below it moves.
     spans.push(match single_name(&episode.kind) {
-        Some(word) => theme.accent(format!("{word:<4}")),
-        None => theme.accent(format!("E{number:<3}")),
+        Some(word) => quiet(format!("{word:<4}")),
+        None => quiet(format!("E{number:<3}")),
     });
     spans.push(match held {
         OnDisk::Complete => theme.accent("● "),
@@ -216,32 +279,32 @@ fn episode_row(
     let resume =
         playhead.and_then(|seen| resume_at(seen.playhead, episode.duration_ms, seen.fully_watched));
     if let Some(seconds) = resume {
-        spans.push(theme.accent(format!("{:>6}  ", duration(u64::from(seconds) * 1000))));
-    } else if playhead.is_some_and(|seen| seen.fully_watched) {
-        spans.push(theme.dim(format!("{:>6}  ", "✓")));
+        spans.push(theme.title(format!("{:>6}", duration(u64::from(seconds) * 1000))));
+        spans.push(theme.dim("  "));
+    } else if watched {
+        spans.push(theme.accent(format!("{:>6}", "✓")));
+        spans.push(theme.dim("  "));
     } else if episode.duration_ms > 0 {
         spans.push(theme.dim(format!("{:>6}  ", duration(episode.duration_ms))));
     }
-    spans.push(theme.text(episode.title.clone()));
+    spans.push(if watched {
+        theme.dim(episode.title.clone())
+    } else {
+        theme.text(episode.title.clone())
+    });
     ListItem::new(Line::from(spans))
 }
 
-/// A bar drawn out of the characters the command line's own progress bars use, so a
-/// download looks like a download wherever this program shows one. A fraction with no
-/// number behind it yet - a subtitle fetch, a mux, a track whose server would not say
-/// how long the file is - is an empty track rather than a full one, which is the honest
-/// reading of not knowing.
-fn meter(fraction: Option<f64>, width: u16) -> String {
+/// A bar as two runs of line: the part that is done, heavy, and the track still to go,
+/// thin - given back apart so the done part can be drawn in the accent and the track
+/// left dim, which is what makes a bar read at a glance rather than by counting. A
+/// fraction with no number behind it yet - a subtitle fetch, a mux, a track whose server
+/// would not say how long the file is - is an empty track rather than a full one, which
+/// is the honest reading of not knowing.
+fn meter(fraction: Option<f64>, width: u16) -> (String, String) {
     let width = usize::from(width);
     let filled = fraction.map_or(0.0, |fraction| fraction.clamp(0.0, 1.0) * width as f64) as usize;
-    let mut bar = "=".repeat(filled);
-    if filled < width {
-        // The arrow is the head of the bar rather than part of what is done, so it only
-        // appears once something has been.
-        bar.push(if filled > 0 { '>' } else { ' ' });
-        bar.push_str(&" ".repeat(width - filled - 1));
-    }
-    format!("[{bar}]")
+    ("\u{2501}".repeat(filled), "\u{2500}".repeat(width - filled))
 }
 
 /// How wide the bar in the queue is. Wide enough to read a tenth off, narrow enough to
@@ -260,18 +323,20 @@ fn download_row(theme: &Theme, download: &Download, column: usize) -> ListItem<'
     spans.push(theme.text(download.title.clone()));
     spans.push(theme.text(" ".repeat(column.saturating_sub(title) + 2)));
     match &download.state {
-        State::Queued => spans.push(theme.dim("queued")),
+        State::Queued => spans.push(theme.dim("\u{25e6} queued")),
         State::Running => {
             let (stage, fraction) = download.stage().unwrap_or(("starting", None));
-            spans.push(theme.accent(meter(fraction, METER_WIDTH)));
-            spans.push(theme.accent(match fraction {
+            let (done, left) = meter(fraction, METER_WIDTH);
+            spans.push(theme.accent(done));
+            spans.push(theme.dim(left));
+            spans.push(theme.title(match fraction {
                 Some(fraction) => format!(" {:>3}%", (fraction * 100.0) as u16),
                 None => "     ".to_owned(),
             }));
             spans.push(theme.dim(format!("  {stage}")));
         }
-        State::Done => spans.push(theme.dim("done")),
-        State::Failed(error) => spans.push(theme.error(format!("failed: {error}"))),
+        State::Done => spans.push(theme.accent("\u{2713} done")),
+        State::Failed(error) => spans.push(theme.error(format!("\u{2717} failed: {error}"))),
     }
     ListItem::new(Line::from(spans))
 }
@@ -320,10 +385,15 @@ fn line(run: &Run) -> Line<'static> {
 fn tally(app: &App) -> String {
     let loaded = app.series.items.len();
     match app.paging.total {
-        Some(total) => format!("   {loaded} of {total} series"),
-        None => format!("   {loaded} series"),
+        Some(total) => format!("{loaded} of {total} series"),
+        None => format!("{loaded} series"),
     }
 }
+
+/// What the words along the header are held apart by: a dot with room either side, the
+/// same separator the details panel puts between its facts, so a line of the interface
+/// reads as a list of things wherever it is one.
+const DOT: &str = " \u{b7} ";
 
 /// The left of the header: what is being listed, how much of it, and what it is narrowed
 /// by.
@@ -341,7 +411,9 @@ fn tally(app: &App) -> String {
 /// vanish.
 ///
 /// While the box is being typed into, none of it is a button: a click there closes the
-/// box, as escape does.
+/// box, as escape does. It carries its own two keys at the end instead, because those
+/// are the only two that mean anything while it is open and neither is on the line
+/// along the bottom.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
@@ -349,21 +421,33 @@ fn listing(app: &App) -> Run {
         // the two things a box of typing could be doing and only one of them is about
         // to go to Crunchyroll: `Search:` replaces this column with an answer, and
         // `Filter Episodes:` leaves a column alone but for the rows it is hiding.
-        Some(editing) => vec![(
-            None,
-            vec![
-                theme.accent(match editing {
-                    Editing::Search(_) => "Search: ".to_owned(),
-                    Editing::Narrow { focus, .. } => {
-                        format!("Filter {}: ", column_name(app, *focus))
-                    }
-                }),
-                theme.text(editing.query().to_owned()),
-                theme.accent("▏"),
-            ],
-        )],
+        Some(editing) => {
+            let (prompt, enter, escape) = match editing {
+                Editing::Search(_) => ("Search: ".to_owned(), "search", "cancel"),
+                Editing::Narrow { focus, .. } => (
+                    format!("Filter {}: ", column_name(app, *focus)),
+                    "keep",
+                    "clear",
+                ),
+            };
+            vec![(
+                None,
+                vec![
+                    theme.text(" "),
+                    theme.title(prompt),
+                    theme.strong(editing.query().to_owned()),
+                    theme.accent("\u{258f}"),
+                    theme.dim("   "),
+                    theme.title("\u{23ce}"),
+                    theme.dim(format!(" {enter}{DOT}")),
+                    theme.title("esc"),
+                    theme.dim(format!(" {escape}")),
+                ],
+            )]
+        }
         None => {
             let mut run = vec![
+                (None, vec![theme.text(" ")]),
                 (
                     Some(match app.listing {
                         Listing::Browse(_) | Listing::Watchlist | Listing::History => {
@@ -371,9 +455,9 @@ fn listing(app: &App) -> Run {
                         }
                         Listing::Search(_) => Command::Back,
                     }),
-                    vec![theme.strong(app.listing.label())],
+                    vec![theme.title(app.listing.label())],
                 ),
-                (None, vec![theme.dim(tally(app))]),
+                (None, vec![theme.dim(format!("{DOT}{}", tally(app)))]),
             ];
             if matches!(app.listing, Listing::Browse(_)) {
                 let filters = [
@@ -386,7 +470,7 @@ fn listing(app: &App) -> Run {
                 ];
                 for (command, word) in filters {
                     if let Some(word) = word {
-                        run.push((None, vec![theme.dim("   ")]));
+                        run.push((None, vec![theme.dim(DOT)]));
                         run.push((Some(command), vec![theme.accent(word)]));
                     }
                 }
@@ -396,70 +480,127 @@ fn listing(app: &App) -> Run {
     }
 }
 
-/// The three labels along the top right, in the order they are drawn, each with the
-/// command a click on it runs.
-fn settings(app: &App) -> Run {
+/// The three settings along the top right, in the order they are drawn, each with the
+/// command a click on it runs: a dim word saying which setting it is and the value in
+/// the accent, so the eye reads the values and the words are there for whoever needs
+/// telling what `日本語` is the setting of.
+///
+/// `room` is the width of the header. Where the name in the corner and the words would
+/// not both fit, the words go and the values stay: the values are what a click changes
+/// and what someone glances up for, and a right-aligned title that ran over the left
+/// one would print half a name.
+fn settings(app: &App, room: u16) -> Run {
     let theme = &app.theme;
-    vec![
-        (
-            Some(Command::AudioLanguage),
-            vec![
-                theme.dim("audio "),
-                theme.accent(language_name(&app.audio()).to_owned()),
-            ],
-        ),
-        (None, vec![theme.dim("  ")]),
-        (
-            Some(Command::SubtitleLanguage),
-            vec![
-                theme.dim("subs "),
-                theme.accent(language_name(&app.subs()).to_owned()),
-            ],
-        ),
-        (None, vec![theme.dim("  ")]),
-        (
-            Some(Command::Quality),
-            vec![
-                theme.dim("video "),
-                theme.accent(app.options.video_quality.clone()),
-            ],
-        ),
-        (None, vec![theme.text(" ")]),
-    ]
+    let chips = |labelled: bool| {
+        let chip = |command, what: &str, value: String| {
+            let mut spans = Vec::new();
+            if labelled {
+                spans.push(theme.dim(format!("{what} ")));
+            }
+            spans.push(theme.title(value));
+            (Some(command), spans)
+        };
+        vec![
+            (None, vec![theme.text(" ")]),
+            chip(
+                Command::AudioLanguage,
+                "audio",
+                language_name(&app.audio()).to_owned(),
+            ),
+            (None, vec![theme.dim(DOT)]),
+            chip(
+                Command::SubtitleLanguage,
+                "subs",
+                language_name(&app.subs()).to_owned(),
+            ),
+            (None, vec![theme.dim(DOT)]),
+            chip(Command::Quality, "video", app.options.video_quality.clone()),
+            (None, vec![theme.text(" ")]),
+        ]
+    };
+    let full = chips(true);
+    if fits_beside_the_name(&full, room) {
+        full
+    } else {
+        chips(false)
+    }
 }
 
-fn header(app: &App) -> Paragraph<'static> {
+/// The name of the program, set in the top left corner of the header as a label of its
+/// own so the frame has a title the way a window does.
+const NAME: &str = " crunchyroll-tui ";
+
+/// Whether a run of words fits along the top border beside the name: the two corners,
+/// the name with a cell either side of it, and the run.
+fn fits_beside_the_name(run: &Run, room: u16) -> bool {
+    let wide: u16 = widths(run).iter().map(|(_, width)| width).sum();
+    let name = cells(&[Span::raw(NAME)]).saturating_add(2);
+    wide.saturating_add(name).saturating_add(2) <= room
+}
+
+/// The header, `room` columns wide. The name is left out altogether on a terminal too
+/// narrow for it and the settings both, since the settings are the part that does
+/// something.
+fn header(app: &App, room: u16) -> Paragraph<'static> {
     let theme = &app.theme;
-    let block = theme
+    let settings = settings(app, room);
+    let mut block = theme
         .bordered(false)
-        .title(theme.title(" Crunchyroll "))
-        .title_top(line(&settings(app)).right_aligned());
+        .title_top(line(&settings).right_aligned());
+    if fits_beside_the_name(&settings, room) {
+        block = block.title(Line::from(vec![
+            theme.text(" "),
+            theme.badge(NAME),
+            theme.text(" "),
+        ]));
+    }
     Paragraph::new(line(&listing(app))).block(block)
 }
 
+/// A line of facts held apart by dots: the plain ones in the heading colour, and after
+/// them the ones worth finding first - that a series is simulcasting, where an episode
+/// was left off - in the accent.
+fn facts(theme: &Theme, plain: Vec<String>, loud: Vec<String>) -> Line<'static> {
+    let mut spans = Vec::new();
+    let words = plain
+        .into_iter()
+        .map(|fact| theme.heading(fact))
+        .chain(loud.into_iter().map(|fact| theme.accent(fact)));
+    for (index, word) in words.enumerate() {
+        if index > 0 {
+            spans.push(theme.dim(DOT));
+        }
+        spans.push(word);
+    }
+    Line::from(spans)
+}
+
 /// The panel under the columns: everything about the item the cursor is on that does
-/// not fit on its one line.
-fn details(app: &App) -> Vec<Line<'static>> {
+/// not fit on its one line, as a card - the title in the accent, a line of facts, and
+/// then the description - and what to call the card, which is what it is describing
+/// rather than a word like `Details` that would be true of any of them.
+fn details(app: &App) -> (&'static str, Vec<Line<'static>>) {
     let theme = &app.theme;
     let mut lines = Vec::new();
-    match app.focus {
+    let name = match app.focus {
         Focus::Series | Focus::Seasons => {
             let Some(series) = app.series.selected() else {
-                return lines;
+                return ("Series", lines);
             };
             let metadata = &series.series_metadata;
             // A film keeps the same facts under a name of its own and leaves
             // `series_metadata` empty, so both are read and whichever has something to
             // say fills the line. Nothing has both.
             let film = &series.movie_listing_metadata;
-            lines.push(Line::from(theme.strong(series.title.clone())));
-            let mut facts = Vec::new();
+            lines.push(Line::from(theme.title(series.title.clone())));
+            let mut plain = Vec::new();
+            let mut loud = Vec::new();
             // What it is comes first where it is not a series, because everything after
             // it reads differently for a film - a running time rather than a count of
             // episodes - and this is the one place with room to say which is being
             // described.
             if let Some(word) = single_name(&series.kind) {
-                facts.push(word.to_owned());
+                plain.push(word.to_owned());
             }
             let year = if metadata.series_launch_year > 0 {
                 metadata.series_launch_year
@@ -467,16 +608,19 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 film.movie_release_year
             };
             if year > 0 {
-                facts.push(year.to_string());
+                plain.push(year.to_string());
+            }
+            if metadata.season_count > 1 {
+                plain.push(format!("{} seasons", metadata.season_count));
             }
             if metadata.episode_count > 0 {
-                facts.push(format!("{} episodes", metadata.episode_count));
+                plain.push(format!("{} episodes", metadata.episode_count));
             }
             if film.duration_ms > 0 {
-                facts.push(duration(film.duration_ms));
+                plain.push(duration(film.duration_ms));
             }
             if !metadata.audio_locales.is_empty() {
-                facts.push(format!("{} audio tracks", metadata.audio_locales.len()));
+                plain.push(format!("{} audio tracks", metadata.audio_locales.len()));
             }
             let subtitles = if metadata.subtitle_locales.is_empty() {
                 &film.subtitle_locales
@@ -484,9 +628,9 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 &metadata.subtitle_locales
             };
             if !subtitles.is_empty() {
-                facts.push(format!("{} subtitles", subtitles.len()));
+                plain.push(format!("{} subtitles", subtitles.len()));
             }
-            facts.extend(
+            plain.extend(
                 metadata
                     .maturity_ratings
                     .iter()
@@ -494,17 +638,18 @@ fn details(app: &App) -> Vec<Line<'static>> {
                     .cloned(),
             );
             if metadata.is_simulcast {
-                facts.push("simulcast".to_owned());
+                loud.push("simulcast".to_owned());
             }
-            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            lines.push(facts(theme, plain, loud));
             lines.push(Line::from(theme.text(series.description.clone())));
+            single_name(&series.kind).unwrap_or("Series")
         }
         Focus::Episodes => {
             let Some(episode) = app.episodes.selected() else {
-                return lines;
+                return ("Episode", lines);
             };
-            lines.push(Line::from(theme.strong(episode.title.clone())));
-            let mut facts = vec![single_name(&episode.kind).map_or_else(
+            lines.push(Line::from(theme.title(episode.title.clone())));
+            let mut plain = vec![single_name(&episode.kind).map_or_else(
                 || {
                     format!(
                         "S{}E{}",
@@ -519,34 +664,51 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 str::to_owned,
             )];
             if episode.duration_ms > 0 {
-                facts.push(duration(episode.duration_ms));
+                plain.push(duration(episode.duration_ms));
             }
             if !episode.audio_locale.is_empty() {
-                facts.push(language_name(&episode.audio_locale).to_owned());
+                plain.push(language_name(&episode.audio_locale).to_owned());
             }
             if episode.versions.len() > 1 {
-                facts.push(format!("{} dubs", episode.versions.len()));
+                plain.push(format!("{} dubs", episode.versions.len()));
             }
             if let Some(date) = episode.availability_starts.split('T').next()
                 && !date.is_empty()
             {
-                facts.push(date.to_owned());
+                plain.push(date.to_owned());
             }
-            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            // What the row says in a glyph and a number, said here in words: the row
+            // has four cells for it and the panel has the width of the screen.
+            let mut loud = Vec::new();
+            let playhead = app.playheads.get(&episode.id);
+            if let Some(seconds) = playhead
+                .and_then(|seen| resume_at(seen.playhead, episode.duration_ms, seen.fully_watched))
+            {
+                loud.push(format!("resume at {}", duration(u64::from(seconds) * 1000)));
+            } else if playhead.is_some_and(|seen| seen.fully_watched) {
+                loud.push("watched".to_owned());
+            }
+            match app.downloaded.get(&episode.id) {
+                Some(OnDisk::Complete) => loud.push("on disk".to_owned()),
+                Some(OnDisk::Partial) => loud.push("partly on disk".to_owned()),
+                Some(OnDisk::Missing) | None => {}
+            }
+            lines.push(facts(theme, plain, loud));
             lines.push(Line::from(theme.text(episode.description.clone())));
+            single_name(&episode.kind).unwrap_or("Episode")
         }
         // The panel is one line per episode and a failure is a sentence out of
         // anyhow's chain, so this is the only place with room to say what went wrong.
         Focus::Downloads => {
             let Some(download) = app.downloads.selected() else {
-                return lines;
+                return ("Download", lines);
             };
-            lines.push(Line::from(theme.strong(download.title.clone())));
-            let mut facts = vec![download.number.clone()];
+            lines.push(Line::from(theme.title(download.title.clone())));
+            let mut plain = vec![download.number.clone()];
             if !download.series.is_empty() {
-                facts.push(download.series.clone());
+                plain.push(download.series.clone());
             }
-            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            lines.push(facts(theme, plain, Vec::new()));
             lines.push(Line::from(match &download.state {
                 State::Queued => theme.dim("Waiting for the episode in front of it."),
                 State::Running => match download.stage() {
@@ -556,9 +718,10 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 State::Done => theme.dim("Downloaded."),
                 State::Failed(error) => theme.error(error.clone()),
             }));
+            "Download"
         }
-    }
-    lines
+    };
+    (name, lines)
 }
 
 /// A run of cells turned into the pixels behind it, which is what the CDN is asked for:
@@ -694,43 +857,67 @@ fn picker_overlay(
         .iter()
         .map(|row| {
             let padding = " ".repeat(column - width(row) + 2);
+            // The one in force is the row with the dot, and its name is set in bold as
+            // well: the dot alone is a small thing to find in a list forty rows long.
+            let chosen = row.value == current;
             ListItem::new(Line::from(vec![
-                theme.text(if row.value == current { "● " } else { "  " }),
-                theme.text(format!("{}{padding}", row.label)),
+                if chosen {
+                    theme.accent("● ")
+                } else {
+                    theme.text("  ")
+                },
+                if chosen {
+                    theme.strong(format!("{}{padding}", row.label))
+                } else {
+                    theme.text(format!("{}{padding}", row.label))
+                },
                 theme.dim(row.value.clone()),
             ]))
         })
         .collect();
-    // Wide enough for the longest name, and never so narrow that the hint along the
-    // bottom edge is cut in half.
+    // Wide enough for the longest name and the cell of padding either side, and never
+    // so narrow that the hint along the bottom edge is cut in half.
     let area = popup(
         area,
-        (column as u16 + 20).max(42),
+        (column as u16 + 22).max(44),
         picker.pane.items.len() as u16 + 2,
     );
-    let mut hint = [
+    // The hint along the bottom edge, keys in the accent the way the footer has them.
+    let mut hint = Vec::new();
+    for (command, what) in [
         (Command::Open, "apply"),
         (Command::NextColumn, "other list"),
         (Command::Back, "cancel"),
-    ]
-    .iter()
-    .filter_map(|(command, what)| {
-        let key = keys.first(*command);
-        (!key.is_empty()).then(|| format!("{key} {what}"))
-    })
-    .collect::<Vec<_>>()
-    .join(" · ");
-    if picker.pane.loading {
-        hint = format!("{} {hint}", SPINNER[tick % SPINNER.len()]);
+    ] {
+        let key = keys.first(command);
+        if key.is_empty() {
+            continue;
+        }
+        if !hint.is_empty() {
+            hint.push(theme.dim(DOT));
+        }
+        hint.push(theme.title(key));
+        hint.push(theme.dim(format!(" {what}")));
     }
+    if picker.pane.loading {
+        hint.insert(
+            0,
+            theme.accent(format!("{} ", SPINNER[tick % SPINNER.len()])),
+        );
+    }
+    hint.insert(0, theme.text(" "));
+    hint.push(theme.text(" "));
     frame.render_widget(Clear, area);
+    // Padding at the sides only: a row of padding along the top would move every row
+    // down under a pointer that [`mouse::row_at`] expects to find one border in.
     frame.render_stateful_widget(
         List::new(items)
             .block(
                 theme
                     .bordered(true)
+                    .padding(Padding::horizontal(1))
                     .title(theme.title(picker.title()))
-                    .title_bottom(theme.dim(format!(" {hint} "))),
+                    .title_bottom(Line::from(hint)),
             )
             .highlight_style(theme.highlight(true))
             .highlight_symbol("› ")
@@ -845,6 +1032,119 @@ const FOOTER: [(&[Command], &str, Option<Command>); 9] = [
 /// What the hints along the bottom edge are held apart by.
 const FOOTER_GAP: &str = "   ";
 
+/// The reminder along the bottom edge as a run of words: each hint a key in the accent
+/// and what it does in dim, which is what lets the eye pick the keys out of the line
+/// without a separator between every pair. One walk over the table makes both the line
+/// and the boxes, so a hint unbound by the config leaves neither a gap in the line nor
+/// a box over nothing.
+fn footer(app: &App) -> Run {
+    let theme = &app.theme;
+    let mut run: Run = vec![(None, vec![theme.text(" ")])];
+    for (commands, what, click) in FOOTER {
+        let key = one_key(&app.keys, commands, "/");
+        if key.is_empty() {
+            continue;
+        }
+        if run.len() > 1 {
+            run.push((None, vec![theme.dim(FOOTER_GAP)]));
+        }
+        run.push((click, vec![theme.title(key), theme.dim(format!(" {what}"))]));
+    }
+    run
+}
+
+/// What the interface is waiting on, if anything, in the words the status line uses
+/// while there is no sentence of its own to show. The columns say `Loading…` where they
+/// are empty, but a column that is being filled again keeps its old rows until the new
+/// ones land, and a page appended to the catalogue happens below the fold - so this is
+/// the one place that is always on screen to say something is on its way.
+fn waiting_on(app: &App) -> Option<&'static str> {
+    if app
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.pane.loading)
+    {
+        Some("Loading the list\u{2026}")
+    } else if app.episodes.loading {
+        Some("Loading episodes\u{2026}")
+    } else if app.seasons.loading {
+        Some("Loading seasons\u{2026}")
+    } else if app.paging.asked.is_some_and(|start| start > 0) {
+        Some("Loading more of the catalogue\u{2026}")
+    } else if app.series.loading || app.paging.asked.is_some() {
+        Some("Loading the catalogue\u{2026}")
+    } else {
+        None
+    }
+}
+
+/// The status line: the last thing the interface had to say, with a mark in front
+/// saying what kind of thing it was - a cross for a failure, a spinner while something
+/// is on its way, a check otherwise.
+fn status_line(app: &App) -> Line<'static> {
+    let theme = &app.theme;
+    let waiting = waiting_on(app);
+    let icon = if waiting.is_some() {
+        theme.accent(SPINNER[app.tick % SPINNER.len()])
+    } else {
+        theme.accent("\u{2713}")
+    };
+    let spans = match (&app.notice, waiting) {
+        (Some(notice), _) if notice.error => {
+            vec![theme.error(" \u{2717} "), theme.error(notice.text.clone())]
+        }
+        (Some(notice), _) => vec![
+            theme.text(" "),
+            icon,
+            theme.text(format!(" {}", notice.text)),
+        ],
+        (None, Some(what)) => vec![theme.text(" "), icon, theme.dim(format!(" {what}"))],
+        (None, None) => vec![theme.dim(" \u{2713} Ready.")],
+    };
+    Line::from(spans)
+}
+
+/// The right end of the status line: what the user has put in motion, so that a mark
+/// or a queue scrolled out of sight is still counted somewhere. Empty while there is
+/// nothing to count, which is most of the time.
+fn activity(app: &App) -> Line<'static> {
+    let theme = &app.theme;
+    let mut words = Vec::new();
+    if !app.marked.is_empty() {
+        words.push(theme.accent(format!("{MARK} {} marked", app.marked.len())));
+    }
+    let count = |wanted: fn(&State) -> bool| {
+        app.downloads
+            .items
+            .iter()
+            .filter(|download| wanted(&download.state))
+            .count()
+    };
+    let running = count(|state| matches!(state, State::Running));
+    let queued = count(|state| matches!(state, State::Queued));
+    let failed = count(|state| matches!(state, State::Failed(_)));
+    if running > 0 {
+        words.push(theme.accent(format!("\u{21e3} {running} downloading")));
+    }
+    if queued > 0 {
+        words.push(theme.dim(format!("{queued} queued")));
+    }
+    if failed > 0 {
+        words.push(theme.error(format!("{failed} failed")));
+    }
+    let mut spans = Vec::new();
+    for (index, word) in words.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(theme.dim(DOT));
+        }
+        spans.push(word);
+    }
+    if !spans.is_empty() {
+        spans.push(theme.text(" "));
+    }
+    Line::from(spans)
+}
+
 /// Every key the commands answer to: `↑ k / ↓ j`. A command that has been unbound
 /// contributes nothing rather than a gap.
 fn every_key(keys: &Bindings, commands: &[Command], separator: &str) -> String {
@@ -884,24 +1184,32 @@ fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, keys: &Bindings) {
         .map(|(shown, what)| {
             let padding = " ".repeat(column - Span::raw(shown).width());
             Line::from(vec![
-                theme.accent(format!(" {shown}{padding}  ")),
+                theme.title(format!("{shown}{padding}  ")),
                 theme.text(*what),
             ])
         })
         .collect();
-    // And the box is as wide as the widest line it holds - the key column, the space
-    // either side of it, the longest description and the two the border takes - rather
-    // than a number chosen once and quietly outgrown by a description added later. A
-    // popup that cuts its own last word off is worse than one that is a little wide.
+    // And the box is as wide as the widest line it holds - the key column, the two
+    // cells after it, the longest description, the cell of padding either side and the
+    // two the border takes - rather than a number chosen once and quietly outgrown by a
+    // description added later. A popup that cuts its own last word off is worse than
+    // one that is a little wide. A row of padding along the top gives the title room to
+    // breathe; the bottom border carries the hint, so it needs none.
     let widest = rows
         .iter()
         .map(|(_, what)| Span::raw(*what).width())
         .max()
         .unwrap_or(0);
-    let popup = popup(area, (column + widest) as u16 + 5, lines.len() as u16 + 2);
+    let popup = popup(area, (column + widest) as u16 + 6, lines.len() as u16 + 3);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(theme.bordered(true).title(theme.title(" Keys "))),
+        Paragraph::new(lines).block(
+            theme
+                .bordered(true)
+                .padding(Padding::new(1, 1, 1, 0))
+                .title(theme.title(" Keys "))
+                .title_bottom(Line::from(theme.dim(" any key closes this ")).right_aligned()),
+        ),
         popup,
     );
 }
@@ -937,7 +1245,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // worked out again afterwards.
     let mut buttons: Vec<(Command, Rect)> = Vec::new();
 
-    frame.render_widget(header(app), top);
+    frame.render_widget(header(app, top.width), top);
     // The settings are a right-aligned title, so they sit on the border row itself,
     // inside it and hard against the right edge; the listing label is the paragraph's
     // own line, one row below. Both are reproduced here rather than guessed at, so that
@@ -948,7 +1256,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         width: top.width.saturating_sub(2),
         height: top.height.min(1),
     };
-    let labels = widths(&settings(app));
+    let labels = widths(&settings(app, top.width));
     let wide: u16 = labels.iter().map(|(_, width)| width).sum();
     let start = bar.right().saturating_sub(wide).max(bar.left());
     buttons.extend(mouse::lay_out(bar, start, &labels));
@@ -1054,7 +1362,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &theme,
             app.seasons.loading,
             app.seasons.error.as_ref(),
-            &nothing_shown(&app.seasons, "Pick a series."),
+            &nothing_shown(&app.seasons, "Pick a series on the left."),
             tick,
         )
     } else {
@@ -1085,7 +1393,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &theme,
             app.episodes.loading,
             app.episodes.error.as_ref(),
-            &nothing_shown(&app.episodes, "Pick a season."),
+            &nothing_shown(&app.episodes, "Pick a season to list its episodes."),
             tick,
         )
     } else {
@@ -1177,7 +1485,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if details_height > 0 {
-        let block = theme.bordered(false).title(theme.dim(" Details "));
+        let (name, mut lines) = details(app);
+        // A card with nothing under the cursor to describe says so, rather than standing
+        // empty and looking like something failed to arrive.
+        if lines.is_empty() {
+            lines.push(Line::from(theme.dim("Nothing selected yet.")));
+        }
+        // A cell of room either side, so the words sit inside the card rather than
+        // against its edges.
+        let block = theme
+            .bordered(false)
+            .padding(Padding::horizontal(1))
+            .title(theme.heading(format!(" {} {name} ", glyph(name))));
         let inner = block.inner(bottom);
         frame.render_widget(block, bottom);
 
@@ -1197,7 +1516,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .areas(inner);
 
-        let lines = details(app);
         if let Some(url) = still
             && !app.art.draw(frame, still_area, &url)
         {
@@ -1206,44 +1524,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
     }
 
-    let line = match &app.notice {
-        Some(notice) if notice.error => Line::from(theme.error(format!(" {}", notice.text))),
-        Some(notice) => Line::from(theme.text(format!(" {}", notice.text))),
-        None => Line::from(theme.dim(" Ready.")),
-    };
-    frame.render_widget(Paragraph::new(line), status);
+    // The counts along the right take what they need and the sentence gets the rest,
+    // so a long notice runs into the edge of its own half rather than over the counts.
+    let counts = activity(app);
+    let [said, counted] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(u16::try_from(counts.width()).unwrap_or(u16::MAX)),
+    ])
+    .areas(status);
+    frame.render_widget(Paragraph::new(status_line(app)), said);
+    frame.render_widget(Paragraph::new(counts), counted);
 
-    // One walk over the table: the words that are drawn and the boxes that are clicked
-    // come out of the same list, so a hint unbound by the config leaves neither a gap in
-    // the line nor a box over nothing.
-    let hints: Vec<(Option<Command>, String)> = FOOTER
-        .iter()
-        .map(|(commands, what, click)| {
-            (
-                *click,
-                format!("{} {what}", one_key(&app.keys, commands, "/")),
-            )
-        })
-        .filter(|(_, hint)| !hint.starts_with(' '))
-        .collect();
-    let reminder = hints
-        .iter()
-        .map(|(_, hint)| hint.as_str())
-        .collect::<Vec<_>>()
-        .join(FOOTER_GAP);
-    frame.render_widget(
-        Paragraph::new(Line::from(theme.dim(format!(" {reminder}")))),
-        keys,
-    );
-    let mut words: Vec<(Option<Command>, u16)> = Vec::new();
-    for (command, hint) in &hints {
-        if !words.is_empty() {
-            words.push((None, cells(&[Span::raw(FOOTER_GAP)])));
-        }
-        words.push((*command, cells(&[Span::raw(hint.clone())])));
-    }
-    // The line is drawn one column in, which is where the run of words starts.
-    buttons.extend(mouse::lay_out(keys, keys.x.saturating_add(1), &words));
+    let reminder = footer(app);
+    frame.render_widget(Paragraph::new(line(&reminder)), keys);
+    buttons.extend(mouse::lay_out(keys, keys.x, &widths(&reminder)));
 
     if app.show_help {
         help_overlay(frame, area, &theme, &app.keys);
@@ -1464,7 +1758,7 @@ mod tests {
         let mut app = app();
         let screen = rendered(120, 30, &mut app);
         for expected in [
-            "Crunchyroll",
+            "crunchyroll-tui",
             "Series",
             "Seasons",
             "Episodes",
@@ -1476,6 +1770,73 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
+    }
+
+    /// The header is a title bar: the program's name in the corner, what is listed and
+    /// how much of it underneath, and the three settings along the right as one line of
+    /// labelled values held apart the way the facts in the details panel are.
+    #[test]
+    fn the_header_reads_as_a_title_bar() {
+        let mut app = app();
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains(" crunchyroll-tui "),
+            "no name in the corner"
+        );
+        assert!(screen.contains("Continue watching \u{b7} 1 series"));
+        assert!(screen.contains("subs English \u{b7} video 1080p"));
+
+        // Too narrow for the name and the words both, the words go and the values
+        // stay - and are still where a click finds them.
+        let drawn = buffer(60, 16, &mut app);
+        let top: String = (0..60).map(|x| drawn[(x, 0)].symbol()).collect();
+        assert!(top.contains(" crunchyroll-tui "), "{top}");
+        assert!(top.contains("English \u{b7} 1080p"), "{top}");
+        assert!(!top.contains("video"), "{top}");
+        let quality = button(&app, Command::Quality);
+        let word: String = (quality.left()..quality.right())
+            .map(|x| drawn[(x, quality.y)].symbol())
+            .collect();
+        assert_eq!(word, "1080p");
+
+        // While the box is open it says which two keys mean something in it, since
+        // neither of them is on the line along the bottom.
+        press(&mut app, KeyCode::Char('/'));
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Search: "));
+        assert!(screen.contains("\u{23ce} search \u{b7} esc cancel"));
+        press(&mut app, KeyCode::Esc);
+        app.focus = Focus::Episodes;
+        press(&mut app, KeyCode::Char('f'));
+        assert!(rendered(120, 30, &mut app).contains("\u{23ce} keep \u{b7} esc clear"));
+    }
+
+    /// Each column wears its own mark in front of its name, and only the column with the
+    /// keyboard is framed in the accent - which is what finds it on a screen of four
+    /// boxes before a word of any title has been read.
+    #[test]
+    fn the_focused_column_is_the_one_framed_in_colour() {
+        let mut app = app();
+        let buffer = buffer(120, 30, &mut app);
+        let screen: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for expected in ["\u{25a4} Series", "\u{25eb} Seasons", "\u{25b8} Episodes"] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+
+        let corner = |area: Rect| &buffer[(area.x, area.y)];
+        let series = corner(app.regions.series);
+        let episodes = corner(app.regions.episodes);
+        assert_eq!(series.symbol(), "\u{256d}", "the box is not rounded");
+        assert_eq!(
+            series.fg,
+            Color::Yellow,
+            "the focused column is not accented"
+        );
+        assert_eq!(episodes.fg, Color::DarkGray, "an idle column is accented");
     }
 
     /// A film keeps the three columns and changes the words in them. Four places would
@@ -2299,6 +2660,175 @@ mod tests {
         assert!(screen.contains("24:21"), "so the running time is back");
     }
 
+    /// A finished episode steps back rather than disappearing: its title goes dim, so
+    /// what is left of a season is what the eye lands on, and the check stands out in
+    /// its place so the row still says why.
+    #[test]
+    fn a_watched_episode_steps_back() {
+        let mut app = app();
+        app.playheads = [("E2".to_owned(), playhead("E2", 1_410, true))]
+            .into_iter()
+            .collect();
+        let drawn = buffer(120, 30, &mut app);
+        let first_cell_of = |text: &str| {
+            let area = drawn.area;
+            (area.top()..area.bottom())
+                .find_map(|y| {
+                    let line: String = (area.left()..area.right())
+                        .map(|x| drawn[(x, y)].symbol())
+                        .collect();
+                    // Every cell up to the word is one column: nothing wide is drawn
+                    // in the episodes column in front of a title.
+                    line.find(text).map(|at| {
+                        let x = line[..at].chars().count() as u16;
+                        drawn[(x, y)].clone()
+                    })
+                })
+                .unwrap_or_else(|| panic!("{text:?} was not drawn"))
+        };
+        assert_eq!(first_cell_of("The Priest's Lie").fg, Color::DarkGray);
+        assert_eq!(first_cell_of("\u{2713}").fg, Color::Yellow);
+        assert_ne!(
+            first_cell_of("The Journey Ends").fg,
+            Color::DarkGray,
+            "an episode nobody has watched went dim"
+        );
+    }
+
+    /// A series that is simulcasting says so in its row, and a film says what it is,
+    /// both in the accent among the dim words, since either changes what someone does
+    /// next.
+    #[test]
+    fn a_catalogue_row_names_what_stands_out() {
+        let mut app = app();
+        app.series.items[0].series_metadata.is_simulcast = true;
+        app.series.items[0].series_metadata.is_dubbed = true;
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Frieren  dub \u{b7} simulcast"));
+    }
+
+    /// Both popups say along their bottom edge how to get out of them, and the list
+    /// sets the value in force apart from the rest in more than a dot.
+    #[test]
+    fn the_popups_say_how_to_leave_them() {
+        let mut app = app();
+        app.show_help = true;
+        assert!(rendered(120, 30, &mut app).contains("any key closes this"));
+
+        app.show_help = false;
+        press(&mut app, KeyCode::Char('a'));
+        // Off the value in force, so what sets it apart is not the cursor's own bold.
+        press(&mut app, KeyCode::Up);
+        let drawn = buffer(120, 30, &mut app);
+        let screen: String = drawn
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(screen.contains("\u{23ce} apply \u{b7} tab other list \u{b7} \u{2190} cancel"));
+        let popup = app.regions.picker;
+        let dot = (popup.top()..popup.bottom())
+            .flat_map(|y| (popup.left()..popup.right()).map(move |x| (x, y)))
+            .find(|at| drawn[*at].symbol() == "\u{25cf}")
+            .expect("the value in force is not marked");
+        assert_eq!(drawn[dot].fg, Color::Yellow);
+        assert!(
+            drawn[(dot.0 + 2, dot.1)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "the value in force is not set in bold"
+        );
+    }
+
+    /// The status line says what kind of thing it is saying before it says it: a cross
+    /// for a failure, a spinner while something is on its way, a check otherwise - and it
+    /// counts along its right end what the user has set in motion.
+    #[test]
+    fn the_status_line_marks_what_kind_of_news_it_is() {
+        let mut app = app();
+        // The opening list is still out, since nothing here answers it.
+        assert!(
+            rendered(120, 30, &mut app)
+                .contains(&format!(" {} Loading the catalogue\u{2026}", SPINNER[0]))
+        );
+        app.paging.asked = None;
+        assert!(rendered(120, 30, &mut app).contains(" \u{2713} Ready."));
+
+        app.series.items.clear();
+        press(&mut app, KeyCode::Char('w'));
+        assert!(rendered(120, 30, &mut app).contains(" \u{2717} Pick a series first."));
+
+        app.notice = None;
+        app.episodes.loading = true;
+        assert!(
+            rendered(120, 30, &mut app)
+                .contains(&format!(" {} Loading episodes\u{2026}", SPINNER[0]))
+        );
+        app.episodes.loading = false;
+
+        let mut app = self::app();
+        app.marked.insert("E1".to_owned());
+        with_downloads(&mut app, 3);
+        app.downloads.items[0].state = State::Running;
+        app.downloads.items[2].state = State::Failed("no".to_owned());
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains(&format!(
+                "{MARK} 1 marked \u{b7} \u{21e3} 1 downloading \u{b7} 1 queued \u{b7} 1 failed"
+            )),
+            "the status line kept count of nothing"
+        );
+    }
+
+    /// Each hint along the bottom is a key in the accent and what it does in dim, which is
+    /// what picks the keys out of the line.
+    #[test]
+    fn the_footer_sets_the_keys_apart_from_their_words() {
+        let mut app = app();
+        let drawn = buffer(120, 30, &mut app);
+        let quit = button(&app, Command::Quit);
+        assert_eq!(drawn[(quit.x, quit.y)].symbol(), "q");
+        assert_eq!(drawn[(quit.x, quit.y)].fg, Color::Yellow);
+        assert_eq!(drawn[(quit.x + 2, quit.y)].fg, Color::DarkGray);
+    }
+
+    /// The panel is a card named after what it describes, and for an episode it says in
+    /// words what the row can only say in a glyph and four cells: where it was left off
+    /// and whether it is on the disk.
+    #[test]
+    fn the_details_card_is_named_after_what_it_describes() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        app.playheads = [("E1".to_owned(), playhead("E1", 842, false))]
+            .into_iter()
+            .collect();
+        app.downloaded = [("E1".to_owned(), OnDisk::Complete)].into_iter().collect();
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("\u{25b8} Episode "),
+            "the card is not named"
+        );
+        assert!(
+            screen.contains("S1E1 \u{b7} 24:21 \u{b7} resume at 14:02 \u{b7} on disk"),
+            "the card kept the row's glyphs to itself"
+        );
+
+        app.playheads = [("E1".to_owned(), playhead("E1", 1_461, true))]
+            .into_iter()
+            .collect();
+        app.downloaded.clear();
+        assert!(rendered(120, 30, &mut app).contains("S1E1 \u{b7} 24:21 \u{b7} watched"));
+
+        with_downloads(&mut app, 1);
+        app.focus = Focus::Downloads;
+        assert!(rendered(120, 30, &mut app).contains("\u{21e3} Download "));
+
+        // And a card with nothing to describe says so rather than standing empty.
+        app.series.clear();
+        app.focus = Focus::Series;
+        assert!(rendered(120, 30, &mut app).contains("Nothing selected yet."));
+    }
+
     /// A mark is a decision the user made about a row, so it has to be visible on that
     /// row - and the column it needs has to be there only while a mark is on one of them,
     /// since the width of this column is what the titles are living on.
@@ -2903,7 +3433,7 @@ mod tests {
         assert!(screen.contains("Nothing matches \"zzz\"."));
         assert!(screen.contains("Episodes \"zzz\" 0/2"));
         assert!(
-            !screen.contains("Pick a season."),
+            !screen.contains("Pick a season to list its episodes."),
             "a season is open, so that is not the problem"
         );
         assert!(
@@ -3009,7 +3539,10 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
-        assert!(screen.contains("[====="), "no bar was drawn");
+        assert!(
+            screen.contains("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2500}"),
+            "no bar was drawn"
+        );
 
         // And what became of it, in the words the panel has room for.
         app.downloads.items[0].state = State::Failed("Crunchyroll said no".to_owned());
@@ -3119,18 +3652,22 @@ mod tests {
         assert_eq!(downloads_height(Rect::new(0, 3, 120, 3), 4, true), 0);
     }
 
-    /// The bar is the one the command line draws, in the characters indicatif uses for
-    /// it. A part whose size nothing knows yet is an empty track rather than a full one,
-    /// which is the honest reading of not knowing.
+    /// The bar is a heavy line for what is done on a thin one for what is left, always
+    /// the same width between them. A part whose size nothing knows yet is an empty
+    /// track rather than a full one, which is the honest reading of not knowing.
     #[test]
     fn the_bar_reads_as_a_progress_bar() {
-        assert_eq!(meter(Some(0.5), 10), "[=====>    ]");
-        assert_eq!(meter(Some(1.0), 10), "[==========]");
-        assert_eq!(meter(Some(0.0), 10), "[          ]");
-        assert_eq!(meter(None, 10), "[          ]");
+        let bar = |fraction, width| {
+            let (done, left) = meter(fraction, width);
+            format!("{done}{left}")
+        };
+        assert_eq!(bar(Some(0.5), 10), "━━━━━─────");
+        assert_eq!(bar(Some(1.0), 10), "━━━━━━━━━━");
+        assert_eq!(bar(Some(0.0), 10), "──────────");
+        assert_eq!(bar(None, 10), "──────────");
         // Nothing a downloader says can draw outside the bar.
-        assert_eq!(meter(Some(4.0), 4), "[====]");
-        assert_eq!(meter(Some(-1.0), 4), "[    ]");
+        assert_eq!(bar(Some(4.0), 4), "━━━━");
+        assert_eq!(bar(Some(-1.0), 4), "────");
     }
 
     /// A panel that is only drawn sometimes is a panel that has to survive being drawn
