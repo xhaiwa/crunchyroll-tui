@@ -827,43 +827,67 @@ fn picker_overlay(
         .iter()
         .map(|row| {
             let padding = " ".repeat(column - width(row) + 2);
+            // The one in force is the row with the dot, and its name is set in bold as
+            // well: the dot alone is a small thing to find in a list forty rows long.
+            let chosen = row.value == current;
             ListItem::new(Line::from(vec![
-                theme.text(if row.value == current { "● " } else { "  " }),
-                theme.text(format!("{}{padding}", row.label)),
+                if chosen {
+                    theme.accent("● ")
+                } else {
+                    theme.text("  ")
+                },
+                if chosen {
+                    theme.strong(format!("{}{padding}", row.label))
+                } else {
+                    theme.text(format!("{}{padding}", row.label))
+                },
                 theme.dim(row.value.clone()),
             ]))
         })
         .collect();
-    // Wide enough for the longest name, and never so narrow that the hint along the
-    // bottom edge is cut in half.
+    // Wide enough for the longest name and the cell of padding either side, and never
+    // so narrow that the hint along the bottom edge is cut in half.
     let area = popup(
         area,
-        (column as u16 + 20).max(42),
+        (column as u16 + 22).max(44),
         picker.pane.items.len() as u16 + 2,
     );
-    let mut hint = [
+    // The hint along the bottom edge, keys in the accent the way the footer has them.
+    let mut hint = Vec::new();
+    for (command, what) in [
         (Command::Open, "apply"),
         (Command::NextColumn, "other list"),
         (Command::Back, "cancel"),
-    ]
-    .iter()
-    .filter_map(|(command, what)| {
-        let key = keys.first(*command);
-        (!key.is_empty()).then(|| format!("{key} {what}"))
-    })
-    .collect::<Vec<_>>()
-    .join(" · ");
-    if picker.pane.loading {
-        hint = format!("{} {hint}", SPINNER[tick % SPINNER.len()]);
+    ] {
+        let key = keys.first(command);
+        if key.is_empty() {
+            continue;
+        }
+        if !hint.is_empty() {
+            hint.push(theme.dim(DOT));
+        }
+        hint.push(theme.title(key));
+        hint.push(theme.dim(format!(" {what}")));
     }
+    if picker.pane.loading {
+        hint.insert(
+            0,
+            theme.accent(format!("{} ", SPINNER[tick % SPINNER.len()])),
+        );
+    }
+    hint.insert(0, theme.text(" "));
+    hint.push(theme.text(" "));
     frame.render_widget(Clear, area);
+    // Padding at the sides only: a row of padding along the top would move every row
+    // down under a pointer that [`mouse::row_at`] expects to find one border in.
     frame.render_stateful_widget(
         List::new(items)
             .block(
                 theme
                     .bordered(true)
+                    .padding(Padding::horizontal(1))
                     .title(theme.title(picker.title()))
-                    .title_bottom(theme.dim(format!(" {hint} "))),
+                    .title_bottom(Line::from(hint)),
             )
             .highlight_style(theme.highlight(true))
             .highlight_symbol("› ")
@@ -1122,24 +1146,32 @@ fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, keys: &Bindings) {
         .map(|(shown, what)| {
             let padding = " ".repeat(column - Span::raw(shown).width());
             Line::from(vec![
-                theme.accent(format!(" {shown}{padding}  ")),
+                theme.title(format!("{shown}{padding}  ")),
                 theme.text(*what),
             ])
         })
         .collect();
-    // And the box is as wide as the widest line it holds - the key column, the space
-    // either side of it, the longest description and the two the border takes - rather
-    // than a number chosen once and quietly outgrown by a description added later. A
-    // popup that cuts its own last word off is worse than one that is a little wide.
+    // And the box is as wide as the widest line it holds - the key column, the two
+    // cells after it, the longest description, the cell of padding either side and the
+    // two the border takes - rather than a number chosen once and quietly outgrown by a
+    // description added later. A popup that cuts its own last word off is worse than
+    // one that is a little wide. A row of padding along the top gives the title room to
+    // breathe; the bottom border carries the hint, so it needs none.
     let widest = rows
         .iter()
         .map(|(_, what)| Span::raw(*what).width())
         .max()
         .unwrap_or(0);
-    let popup = popup(area, (column + widest) as u16 + 5, lines.len() as u16 + 2);
+    let popup = popup(area, (column + widest) as u16 + 6, lines.len() as u16 + 3);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(theme.bordered(true).title(theme.title(" Keys "))),
+        Paragraph::new(lines).block(
+            theme
+                .bordered(true)
+                .padding(Padding::new(1, 1, 1, 0))
+                .title(theme.title(" Keys "))
+                .title_bottom(Line::from(theme.dim(" any key closes this ")).right_aligned()),
+        ),
         popup,
     );
 }
@@ -2603,6 +2635,39 @@ mod tests {
         app.series.items[0].series_metadata.is_dubbed = true;
         let screen = rendered(120, 30, &mut app);
         assert!(screen.contains("Frieren  dub \u{b7} simulcast"));
+    }
+
+    /// Both popups say along their bottom edge how to get out of them, and the list
+    /// sets the value in force apart from the rest in more than a dot.
+    #[test]
+    fn the_popups_say_how_to_leave_them() {
+        let mut app = app();
+        app.show_help = true;
+        assert!(rendered(120, 30, &mut app).contains("any key closes this"));
+
+        app.show_help = false;
+        press(&mut app, KeyCode::Char('a'));
+        // Off the value in force, so what sets it apart is not the cursor's own bold.
+        press(&mut app, KeyCode::Up);
+        let drawn = buffer(120, 30, &mut app);
+        let screen: String = drawn
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(screen.contains("\u{23ce} apply \u{b7} tab other list \u{b7} \u{2190} cancel"));
+        let popup = app.regions.picker;
+        let dot = (popup.top()..popup.bottom())
+            .flat_map(|y| (popup.left()..popup.right()).map(move |x| (x, y)))
+            .find(|at| drawn[*at].symbol() == "\u{25cf}")
+            .expect("the value in force is not marked");
+        assert_eq!(drawn[dot].fg, Color::Yellow);
+        assert!(
+            drawn[(dot.0 + 2, dot.1)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "the value in force is not set in bold"
+        );
     }
 
     /// The status line says what kind of thing it is saying before it says it: a cross
