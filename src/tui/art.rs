@@ -2,10 +2,11 @@
 //!
 //! Crunchyroll hangs a poster off every series and a still off every episode, and a
 //! terminal that speaks kitty, sixel or iTerm2 can draw them properly. Everything here is
-//! best-effort: a terminal with no graphics protocol, a CDN that will not answer, a JPEG
-//! that will not decode - none of it is worth a word on the status line, let alone taking
-//! the catalogue away from someone who only wanted to browse. A panel with no picture in
-//! it is simply left to the caller to fill with something else.
+//! best-effort: a CDN that will not answer, a JPEG that will not decode - none of it is
+//! worth a word on the status line, let alone taking the catalogue away from someone who
+//! only wanted to browse. A panel with no picture in it is simply left to the caller to
+//! fill with something else. A terminal with no graphics protocol at all still gets the
+//! pictures, as half-blocks: see [`Setting::Auto`].
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,31 +28,42 @@ use serde::Deserialize;
 /// kilobytes off a CDN; anything past this is a connection that has stopped moving.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How many fetches run at once. Enough that one slow poster does not hold up the next,
-/// few enough that scrolling a page does not open a hundred sockets.
-const FETCHERS: usize = 3;
+/// How many fetches run at once. Enough that a wall of covers coming into view fills in
+/// a row at a time rather than a tile at a time, few enough that scrolling a page does
+/// not open a hundred sockets.
+const FETCHERS: usize = 5;
 
-/// How many decoded images are kept. A catalogue page is a hundred series, and a poster
-/// big enough to fill a column is most of a megabyte once it is pixels, so holding the
-/// whole page would be a hundred megabytes of artwork nobody is looking at.
-const DECODED_CACHE: usize = 48;
+/// How many decoded images are kept. A screenful of covers is a few dozen posters, and
+/// the cache has to hold that screen, the row either side of it that a keypress brings
+/// in, and the poster and still the columns draw - or scrolling back up one row fetches
+/// again what was on screen a second ago. Not the whole page, though: a hundred series
+/// at most of a megabyte each once they are pixels is a hundred megabytes of artwork
+/// nobody is looking at.
+const DECODED_CACHE: usize = 96;
 
-/// How many encoded images are kept: one per picture per panel size, so this only fills
-/// up while someone is scrolling and the same few entries are hit over and over
-/// otherwise.
-const ENCODED_CACHE: usize = 32;
+/// How many encoded images are kept: one per picture per panel size. Every tile on the
+/// wall of covers is one of these, so this has to hold a screenful of them as well, or
+/// each frame would re-encode the tiles the last frame pushed out.
+const ENCODED_CACHE: usize = 96;
 
 /// Whether the artwork is drawn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Setting {
-    /// Drawn when the terminal speaks a real graphics protocol, and not otherwise.
-    /// Halfblocks work anywhere, but they are a mosaic of coloured cells rather than a
-    /// picture, and they drag a hundred colours of their own across the colourscheme the
-    /// rest of the interface is careful to wear.
+    /// Drawn with the best the terminal can manage: kitty, sixel or iTerm2 where it
+    /// speaks one of them, and half-blocks where it speaks none.
+    ///
+    /// This used to leave half-blocks off, on the grounds that a mosaic of coloured cells
+    /// is not much of a picture and drags a hundred colours of its own across the
+    /// colourscheme. That was the right call while the artwork was decoration beside the
+    /// lists. The wall of covers made the posters the way a catalogue is browsed, and a
+    /// wall of empty frames in every terminal that is not kitty is a worse answer than a
+    /// rough picture - someone who disagrees has `off`, and `i`.
     #[default]
     Auto,
-    /// Drawn with whatever the terminal can manage, halfblocks included.
+    /// Drawn with whatever the terminal can manage, half-blocks included - which is now
+    /// what `auto` does as well. Kept so that a config file or a script that says `on`
+    /// goes on meaning what it always meant.
     On,
     Off,
 }
@@ -127,9 +139,8 @@ impl Gallery {
         // same thing `from_query_stdio` falls back to on its own.
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         let enabled = match setting {
-            Setting::On => true,
+            Setting::Auto | Setting::On => true,
             Setting::Off => false,
-            Setting::Auto => picker.protocol_type() != ProtocolType::Halfblocks,
         };
 
         let (wanted, inbox) = channel::<String>();

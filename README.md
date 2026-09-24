@@ -463,17 +463,16 @@ selected episode sits in the Details panel. They are drawn as pixels, with which
 graphics protocol the terminal answers to - kitty, sixel or iTerm2 - which is asked for
 once at startup rather than guessed from environment variables.
 
-By default they appear only where one of those protocols is available. Every terminal can
-manage half-blocks, but half-blocks are a mosaic of coloured cells rather than a picture,
-and they drag a hundred colours of their own across the colourscheme the rest of the
-interface is careful to wear - so they are opt-in:
+A terminal that speaks none of those still gets the pictures, drawn as half-blocks: a
+mosaic of coloured cells rather than a photograph, but every terminal can manage one, and
+a wall of covers with nothing on it is a worse way to browse than a rough picture. If the
+colours bother you, turn the artwork off:
 
 ```shell
-cargo run --release -- --tui --images on
+cargo run --release -- --tui --images off
 ```
 
-`--images off` turns the artwork off altogether, and `i` toggles it while the interface is
-running - which also names the protocol in use, if you are wondering why a picture is not
+`i` toggles it while the interface is running - which also names the protocol in use, if you are wondering why a picture is not
 where you expected it. The same setting lives in the [config file](#configuration), as
 `images = "auto"`.
 

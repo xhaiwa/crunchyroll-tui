@@ -48,13 +48,14 @@
 
 # Whether the series posters and episode stills are drawn:
 #
-#   "auto"   only where the terminal speaks kitty, sixel or iTerm2
-#   "on"     anywhere, falling back to half-blocks
+#   "auto"   with kitty, sixel or iTerm2 where the terminal speaks one, and as
+#            half-blocks where it does not
+#   "on"     the same as "auto", kept so that files which say it still work
 #   "off"    never
 #
-# Half-blocks work in any terminal, but they are a mosaic of coloured cells
-# rather than a picture, and they drag a hundred colours of their own across the
-# colourscheme the rest of the interface is careful to wear - so they are opt-in.
+# Half-blocks are a mosaic of coloured cells rather than a picture, but they work
+# in any terminal, and a wall of covers with nothing on it is worse than a rough
+# picture. If the colours bother you, "off" puts every picture away.
 #
 # `--images` overrides this, and `i` toggles it while the interface is running,
 # which also names the graphics protocol in use if you are wondering why a

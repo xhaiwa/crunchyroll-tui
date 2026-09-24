@@ -108,8 +108,8 @@ struct Cli {
     theme: Option<String>,
 
     /// Whether the terminal interface draws posters and episode stills, overriding the
-    /// config file. `auto` draws them only where the terminal speaks kitty, sixel or
-    /// iTerm2; `on` falls back to half-blocks.
+    /// config file. `auto` and `on` draw them with kitty, sixel or iTerm2 where the
+    /// terminal speaks one, and as half-blocks where it does not; `off` never draws them.
     #[arg(long, value_name = "WHEN", requires = "tui")]
     images: Option<tui::art::Setting>,
 
