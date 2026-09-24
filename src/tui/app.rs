@@ -710,6 +710,19 @@ pub struct App {
     /// Where the last frame put everything, so a click can be aimed at it.
     pub regions: Regions,
     pub show_help: bool,
+    /// How many lines the help popup is scrolled down, on a terminal too short to hold
+    /// all of it.
+    pub help_scroll: u16,
+    /// How far the help popup could be scrolled when it was last drawn: nothing when it
+    /// fits, which is what lets an arrow close it like any other key does then. Written
+    /// by the drawing, the way [`App::grid`] is, since only the drawing knows how tall
+    /// the terminal is.
+    pub help_room: u16,
+    /// Whether the user has yet to press a key or click anything. Until then the status
+    /// line uses its idle moments to say where the covers and the rest of the keys are,
+    /// and it stops the moment it has been heard, since a hint that stays for good
+    /// becomes part of the furniture and is read by nobody.
+    pub untouched: bool,
     pub quit: bool,
     pub tick: usize,
     /// Which browse order to come back to. The ring carries it along as it passes each
@@ -770,6 +783,9 @@ impl App {
             notices,
             regions: Regions::default(),
             show_help: false,
+            help_scroll: 0,
+            help_room: 0,
+            untouched: true,
             quit: false,
             tick: 0,
             sort: 0,
@@ -1556,6 +1572,31 @@ impl App {
         };
     }
 
+    /// Moves the help popup by what `command` would move a cursor by, if the popup is
+    /// taller than the terminal and `command` is one that moves. Says whether it was.
+    fn scroll_help(&mut self, command: Command) -> bool {
+        if self.help_room == 0 {
+            return false;
+        }
+        let page = self.help_room.max(1);
+        self.help_scroll = match command {
+            Command::Up => self.help_scroll.saturating_sub(1),
+            Command::Down => self.help_scroll.saturating_add(1),
+            Command::PageUp => self.help_scroll.saturating_sub(page),
+            Command::PageDown => self.help_scroll.saturating_add(page),
+            Command::Top => 0,
+            Command::Bottom => self.help_room,
+            _ => return false,
+        }
+        .min(self.help_room);
+        true
+    }
+
+    fn close_help(&mut self) {
+        self.show_help = false;
+        self.help_scroll = 0;
+    }
+
     fn descend(&mut self) -> Action {
         match self.focus {
             Focus::Series => {
@@ -2321,6 +2362,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        self.untouched = false;
         // The box along the top is typing rather than commands: every letter belongs in
         // it, whatever it would otherwise do.
         match self.editing {
@@ -2343,9 +2385,13 @@ impl App {
             return Action::None;
         }
         // The help popup is read and dismissed, so any key at all closes it - including
-        // one that is bound to nothing.
+        // one that is bound to nothing. The one exception is a popup too tall for the
+        // terminal, where the keys that move a cursor move the popup instead: the lines
+        // below the edge are otherwise out of reach.
         if self.show_help {
-            self.show_help = false;
+            if !command.is_some_and(|command| self.scroll_help(command)) {
+                self.close_help();
+            }
             return Action::None;
         }
         self.notice = None;
@@ -2377,7 +2423,10 @@ impl App {
                 }
                 return Action::Quit;
             }
-            Command::Help => self.show_help = true,
+            Command::Help => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             Command::Search => self.editing = Some(Editing::Search(String::new())),
             Command::Filter => self.open_narrow(),
             // The wall of covers is walked in two directions: `up` and `down` a row of
@@ -2447,6 +2496,7 @@ impl App {
     /// runs the command it names. Nothing here does anything no key does.
     pub fn on_mouse(&mut self, event: MouseEvent) -> Action {
         let at = Position::new(event.column, event.row);
+        self.untouched = false;
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.click(at),
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -2489,7 +2539,7 @@ impl App {
         // The help popup is read and dismissed, so a click anywhere closes it - even one
         // that landed on a word that would otherwise have answered.
         if self.show_help {
-            self.show_help = false;
+            self.close_help();
             return Action::None;
         }
         let target = self.regions.at(at);
@@ -2564,7 +2614,15 @@ impl App {
     /// keyboard where it was: looking down a list is not the same as going to work in
     /// it, and each column keeps a cursor of its own, so a look costs nothing.
     fn wheel(&mut self, at: Position, delta: isize) {
-        if self.editing.is_some() || self.show_help {
+        if self.show_help {
+            self.scroll_help(if delta < 0 {
+                Command::Up
+            } else {
+                Command::Down
+            });
+            return;
+        }
+        if self.editing.is_some() {
             return;
         }
         if self.picker.is_some() {
@@ -2597,7 +2655,7 @@ impl App {
             return;
         }
         if self.show_help {
-            self.show_help = false;
+            self.close_help();
             return;
         }
         if self.picker.is_some() {

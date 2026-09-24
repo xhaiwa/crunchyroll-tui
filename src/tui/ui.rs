@@ -928,108 +928,188 @@ fn picker_overlay(
     area
 }
 
-/// What the help popup lists, and in what order. Commands that read as one line share a
+/// One line of the help popup: the commands it covers, and what they do.
+type HelpLine = (&'static [Command], &'static str);
+
+/// What the help popup lists, section by section. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 25] = [
-    (&[Command::Up, Command::Down], "move the cursor"),
+///
+/// The sections are there because a list of thirty-odd keys in the order the enum
+/// happens to declare them is a list nobody reads: someone opening the popup is looking
+/// for one thing - how to download, how to change the subtitles - and a heading gets
+/// them to it. The descriptions are kept short enough that two sections sit side by side
+/// on a terminal of a hundred and twenty columns, which is what lets the whole list fit
+/// on thirty rows without scrolling.
+const HELP: [(&str, &[HelpLine]); 6] = [
     (
-        &[Command::PageUp, Command::PageDown],
-        "move a page at a time",
+        "Navigation",
+        &[
+            (&[Command::Up, Command::Down], "move the cursor"),
+            (
+                &[Command::PageUp, Command::PageDown],
+                "move a page at a time",
+            ),
+            (
+                &[Command::Top, Command::Bottom],
+                "jump to the first / last item",
+            ),
+            (
+                &[Command::Left, Command::Right],
+                "previous / next column or cover",
+            ),
+            (&[Command::Open], "open, play, or drop a download"),
+            (&[Command::Back], "go back a column, leave a search"),
+            (&[Command::NextColumn], "cycle the columns"),
+            (&[Command::Quit], "quit"),
+        ],
     ),
     (
-        &[Command::Top, Command::Bottom],
-        "jump to the first or last item",
+        "Browse & find",
+        &[
+            (&[Command::Search], "search the catalogue"),
+            (&[Command::Filter], "narrow this column as you type"),
+            (&[Command::Order], "change the list the catalogue shows"),
+            (
+                &[Command::Genre, Command::AnimeSeason],
+                "narrow by genre / anime season",
+            ),
+            (&[Command::Simulcast], "show only simulcasts, or stop"),
+            (&[Command::Reload], "reload the current column"),
+        ],
     ),
     (
-        &[Command::Left, Command::Right],
-        "go back a column / open; the previous / next cover",
+        "Playback",
+        &[
+            (
+                &[Command::Play, Command::PlayRest],
+                "play the episode / the rest after it",
+            ),
+            (
+                &[Command::AudioLanguage, Command::SubtitleLanguage],
+                "pick the audio / subtitle language",
+            ),
+            (
+                &[Command::NextAudio, Command::NextSubtitle],
+                "step the audio / subtitle language",
+            ),
+            (&[Command::Quality], "cycle the video quality"),
+        ],
     ),
     (
-        &[Command::Open],
-        "open the selection, play an episode, drop a download",
-    ),
-    (&[Command::Back], "go back a column, and leave a search"),
-    (&[Command::NextColumn], "cycle the columns"),
-    (
-        &[Command::View],
-        "switch between the columns and the wall of covers",
-    ),
-    (&[Command::Search], "search the catalogue"),
-    (
-        &[Command::Filter],
-        "narrow this column to the rows that match, as you type",
-    ),
-    (&[Command::Order], "change the list the catalogue shows"),
-    (
-        &[Command::Genre, Command::AnimeSeason],
-        "narrow the catalogue by genre / anime season",
+        "Downloads",
+        &[
+            (&[Command::Mark], "mark episodes to queue together"),
+            (
+                &[Command::Download, Command::DownloadSeason],
+                "queue the episode / the whole season",
+            ),
+        ],
     ),
     (
-        &[Command::Simulcast],
-        "show only what is simulcasting, or stop",
+        "Account",
+        &[
+            (&[Command::Watchlist], "add to or drop from the watchlist"),
+            (
+                &[Command::MarkWatched, Command::MarkUnwatched],
+                "mark the episode watched / unwatched",
+            ),
+        ],
     ),
     (
-        &[Command::Play, Command::PlayRest],
-        "play the episode / the rest of the season",
+        "Display",
+        &[
+            (&[Command::View], "switch between columns and covers"),
+            (&[Command::Images], "show or hide the posters and stills"),
+            (&[Command::Help], "show this list"),
+        ],
     ),
-    (
-        &[Command::Mark],
-        "mark the episode, to queue several of them at once",
-    ),
-    (
-        &[Command::Download, Command::DownloadSeason],
-        "queue the episode or the marked ones / the whole season",
-    ),
-    (
-        &[Command::Watchlist],
-        "put the series on the watchlist, or take it off",
-    ),
-    (
-        &[Command::MarkWatched, Command::MarkUnwatched],
-        "mark the episode watched / unwatched",
-    ),
-    (
-        &[Command::AudioLanguage, Command::SubtitleLanguage],
-        "pick the audio / subtitle language",
-    ),
-    (
-        &[Command::NextAudio, Command::NextSubtitle],
-        "next audio / subtitle language, without the list",
-    ),
-    (&[Command::Quality], "cycle the video quality"),
-    (
-        &[Command::Images],
-        "show or hide the poster and the episode still",
-    ),
-    (&[Command::Reload], "reload the current column"),
-    (&[Command::Help], "show this list"),
-    (&[Command::Quit], "quit"),
 ];
 
-/// The reminder along the bottom edge: the handful worth a permanent line, with one key
-/// each because there is no room for two, and what a click on the words runs.
+/// One hint along the bottom edge: the keys it shows, one each, the word beside them,
+/// and the command a click on it runs.
 ///
 /// The command a click runs is written down rather than taken to be the first of the
 /// keys shown, because the two are not always the same thing: `move` names two keys, and
 /// a pointer that wants to move has a wheel already.
+type Hint = (&'static [Command], &'static str, Option<Command>);
+
+const MOVE: Hint = (&[Command::Up, Command::Down], "move", None);
+const OPEN: Hint = (&[Command::Open], "open", Some(Command::Open));
+const BACK: Hint = (&[Command::Back], "back", Some(Command::Back));
+const SEARCH: Hint = (&[Command::Search], "search", Some(Command::Search));
+const FILTER: Hint = (&[Command::Filter], "filter", Some(Command::Filter));
+const LIST: Hint = (&[Command::Order], "list", Some(Command::Order));
+const NEXT: Hint = (&[Command::NextColumn], "next", Some(Command::NextColumn));
+/// Written down as `covers` and read out as whichever view it would switch to - see
+/// [`footer`] - because a key that says `view` does not say that the catalogue can be a
+/// wall of posters, which is the thing worth finding out.
+const VIEW: Hint = (&[Command::View], "covers", Some(Command::View));
+const LANGUAGE: Hint = (
+    &[Command::AudioLanguage, Command::SubtitleLanguage],
+    "language",
+    Some(Command::AudioLanguage),
+);
+
+/// The hints for what has the keyboard, most useful first.
 ///
-/// The view switch is written down as `covers` and read out as whichever view it would
-/// switch to - see [`footer`] - because a key that says `view` does not say that the
-/// catalogue can be a wall of posters, which is the thing worth finding out.
-const FOOTER: [(&[Command], &str, Option<Command>); 10] = [
-    (&[Command::Up, Command::Down], "move", None),
-    (&[Command::Open], "open/play", Some(Command::Open)),
-    (&[Command::Back], "back", Some(Command::Back)),
-    (&[Command::Search], "search", Some(Command::Search)),
-    (&[Command::View], "covers", Some(Command::View)),
-    (&[Command::Download], "download", Some(Command::Download)),
-    (
-        &[Command::AudioLanguage, Command::SubtitleLanguage],
-        "language",
-        Some(Command::AudioLanguage),
-    ),
-    (&[Command::Quality], "quality", Some(Command::Quality)),
+/// A permanent line has room for eight or nine hints, and the interface has three dozen
+/// commands, so which eight depends on where the user is: in the catalogue the things
+/// worth knowing are how to find a series, and in the episodes they are how to watch
+/// and fetch one. A hint for a key that does nothing where the cursor is would be worse
+/// than no hint - it teaches that the line cannot be trusted. Everything else is in the
+/// help popup, which [`footer`] always ends by offering, along with the way out.
+fn hints(app: &App) -> &'static [Hint] {
+    match app.focus {
+        Focus::Series if app.view == View::Covers => &[
+            (
+                &[Command::Up, Command::Down, Command::Left, Command::Right],
+                "move",
+                None,
+            ),
+            OPEN,
+            SEARCH,
+            FILTER,
+            LIST,
+            (&[Command::Genre], "genre", Some(Command::Genre)),
+            VIEW,
+        ],
+        Focus::Series => &[MOVE, OPEN, SEARCH, FILTER, LIST, VIEW, NEXT],
+        Focus::Seasons => &[
+            MOVE,
+            OPEN,
+            BACK,
+            (&[Command::Watchlist], "watchlist", Some(Command::Watchlist)),
+            LANGUAGE,
+            NEXT,
+        ],
+        Focus::Episodes => &[
+            MOVE,
+            (&[Command::Play], "play", Some(Command::Play)),
+            (&[Command::Mark], "mark", Some(Command::Mark)),
+            (&[Command::Download], "download", Some(Command::Download)),
+            (
+                &[Command::MarkWatched],
+                "watched",
+                Some(Command::MarkWatched),
+            ),
+            BACK,
+            LANGUAGE,
+        ],
+        Focus::Downloads => &[
+            MOVE,
+            (&[Command::Open], "drop", Some(Command::Open)),
+            BACK,
+            FILTER,
+            VIEW,
+            NEXT,
+        ],
+    }
+}
+
+/// What every footer ends with, whatever has the keyboard: the way to the rest of the
+/// keys and the way out, which are the two a newcomer most needs to be able to find.
+const ALWAYS: [Hint; 2] = [
     (&[Command::Help], "keys", Some(Command::Help)),
     (&[Command::Quit], "quit", Some(Command::Quit)),
 ];
@@ -1037,27 +1117,47 @@ const FOOTER: [(&[Command], &str, Option<Command>); 10] = [
 /// What the hints along the bottom edge are held apart by.
 const FOOTER_GAP: &str = "   ";
 
-/// The reminder along the bottom edge as a run of words: each hint a key in the accent
-/// and what it does in dim, which is what lets the eye pick the keys out of the line
-/// without a separator between every pair. One walk over the table makes both the line
-/// and the boxes, so a hint unbound by the config leaves neither a gap in the line nor
-/// a box over nothing.
-fn footer(app: &App) -> Run {
+/// The reminder along the bottom edge, `room` columns wide, as a run of words: each hint
+/// a key in the accent and what it does in dim, which is what lets the eye pick the keys
+/// out of the line without a separator between every pair. One walk over the table
+/// makes both the line and the boxes, so a hint unbound by the config leaves neither a
+/// gap in the line nor a box over nothing.
+///
+/// Where the line is wider than the terminal, hints come off the end of the contextual
+/// part - the least useful first - rather than off the end of the line, so `keys` and
+/// `quit` are the last two things a narrow terminal loses.
+fn footer(app: &App, room: u16) -> Run {
     let theme = &app.theme;
-    let mut run: Run = vec![(None, vec![theme.text(" ")])];
-    for (commands, what, click) in FOOTER {
+    let shown = |hint: &Hint| {
+        let (commands, what, click) = *hint;
         let key = one_key(&app.keys, commands, "/");
         if key.is_empty() {
-            continue;
-        }
-        if run.len() > 1 {
-            run.push((None, vec![theme.dim(FOOTER_GAP)]));
+            return None;
         }
         let what = match commands {
             [Command::View] if app.view == View::Covers => "columns",
             _ => what,
         };
-        run.push((click, vec![theme.title(key), theme.dim(format!(" {what}"))]));
+        Some((click, vec![theme.title(key), theme.dim(format!(" {what}"))]))
+    };
+    let mut context: Vec<_> = hints(app).iter().filter_map(shown).collect();
+    let always: Vec<_> = ALWAYS.iter().filter_map(shown).collect();
+    let gap = cells(&[Span::raw(FOOTER_GAP)]);
+    let wide = |words: &[(Option<Command>, Vec<Span<'static>>)]| -> u16 {
+        words
+            .iter()
+            .map(|(_, spans)| cells(spans).saturating_add(gap))
+            .sum()
+    };
+    while !context.is_empty() && wide(&context).saturating_add(wide(&always)) > room {
+        context.pop();
+    }
+    let mut run: Run = vec![(None, vec![theme.text(" ")])];
+    for word in context.into_iter().chain(always) {
+        if run.len() > 1 {
+            run.push((None, vec![theme.dim(FOOTER_GAP)]));
+        }
+        run.push(word);
     }
     run
 }
@@ -1087,9 +1187,34 @@ fn waiting_on(app: &App) -> Option<&'static str> {
     }
 }
 
+/// Where to start, for someone who has not pressed anything yet: the key that shows the
+/// covers - or the columns, for a config that opens on the covers - and the one that
+/// lists every other key. Built from the bindings, so a config that moved either names
+/// the key it moved it to, and leaves out a part whose key it took away.
+fn first_steps(app: &App) -> Option<String> {
+    let mut steps = Vec::new();
+    let view = app.keys.first(Command::View);
+    if !view.is_empty() {
+        let other = match app.view {
+            View::Columns => "covers",
+            View::Covers => "columns",
+        };
+        steps.push(format!("{view} shows {other}"));
+    }
+    let help = app.keys.first(Command::Help);
+    if !help.is_empty() {
+        steps.push(format!("{help} shows every key"));
+    }
+    (!steps.is_empty()).then(|| steps.join(", "))
+}
+
 /// The status line: the last thing the interface had to say, with a mark in front
 /// saying what kind of thing it was - a cross for a failure, a spinner while something
 /// is on its way, a check otherwise.
+///
+/// Until the first key is pressed, the line also says where the covers and the rest of
+/// the keys are, after whatever it is waiting on. Only while it has nothing of its own
+/// to say: a notice is news, and a tip is not worth hiding news for.
 fn status_line(app: &App) -> Line<'static> {
     let theme = &app.theme;
     let waiting = waiting_on(app);
@@ -1110,7 +1235,15 @@ fn status_line(app: &App) -> Line<'static> {
         (None, Some(what)) => vec![theme.text(" "), icon, theme.dim(format!(" {what}"))],
         (None, None) => vec![theme.dim(" \u{2713} Ready.")],
     };
-    Line::from(spans)
+    let mut line = Line::from(spans);
+    if app.notice.is_none()
+        && app.untouched
+        && let Some(steps) = first_steps(app)
+    {
+        line.push_span(theme.dim(DOT));
+        line.push_span(theme.heading(steps));
+    }
+    line
 }
 
 /// The right end of the status line: what the user has put in motion, so that a mark
@@ -1175,52 +1308,150 @@ fn one_key(keys: &Bindings, commands: &[Command], separator: &str) -> String {
         .join(separator)
 }
 
-fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, keys: &Bindings) {
-    let rows: Vec<(String, &str)> = HELP
+/// A section of the help popup as it is bound: the heading, and each line's keys beside
+/// what they do. A line whose commands have all been unbound is left out, and a section
+/// left with no lines is left out whole rather than drawn as a heading over nothing.
+type Bound = (&'static str, Vec<(String, &'static str)>);
+
+fn bound(keys: &Bindings) -> Vec<Bound> {
+    HELP.iter()
+        .map(|(heading, entries)| {
+            let rows = entries
+                .iter()
+                .map(|(commands, what)| (every_key(keys, commands, " / "), *what))
+                .filter(|(shown, _)| !shown.is_empty())
+                .collect();
+            (*heading, rows)
+        })
+        .filter(|(_, rows): &Bound| !rows.is_empty())
+        .collect()
+}
+
+/// How many lines a run of sections takes stacked: a heading and its rows each, and a
+/// blank line between one section and the next.
+fn stacked_height(sections: &[Bound]) -> usize {
+    sections
         .iter()
-        .map(|(commands, what)| (every_key(keys, commands, " / "), *what))
-        .filter(|(shown, _)| !shown.is_empty())
-        .collect();
-    // The key column is as wide as the widest binding, so a remap to `ctrl-pgdn` pushes
-    // the descriptions over rather than running into them.
-    let column = rows
+        .map(|(_, rows)| rows.len() + 2)
+        .sum::<usize>()
+        .saturating_sub(1)
+}
+
+/// Sections stacked into one column of the popup, and how wide the widest line of it
+/// is. The keys are padded to one width down the whole column, so the descriptions
+/// start together from the first section to the last, and a remap to `ctrl-pgdn` pushes
+/// them over rather than running into them.
+fn help_column(theme: &Theme, sections: &[Bound]) -> (Vec<Line<'static>>, usize) {
+    let column = sections
         .iter()
-        .map(|(shown, _)| Span::raw(shown).width())
+        .flat_map(|(_, rows)| rows.iter().map(|(shown, _)| Span::raw(shown).width()))
         .max()
         .unwrap_or(0);
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(shown, what)| {
+    let mut width = 0;
+    let mut lines = Vec::new();
+    for (index, (heading, rows)) in sections.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
+        }
+        width = width.max(Span::raw(*heading).width());
+        lines.push(Line::from(theme.heading(*heading)));
+        for (shown, what) in rows {
             let padding = " ".repeat(column - Span::raw(shown).width());
-            Line::from(vec![
+            width = width.max(column + 2 + Span::raw(*what).width());
+            lines.push(Line::from(vec![
                 theme.title(format!("{shown}{padding}  ")),
                 theme.text(*what),
-            ])
-        })
-        .collect();
-    // And the box is as wide as the widest line it holds - the key column, the two
-    // cells after it, the longest description, the cell of padding either side and the
-    // two the border takes - rather than a number chosen once and quietly outgrown by a
-    // description added later. A popup that cuts its own last word off is worse than
-    // one that is a little wide. A row of padding along the top gives the title room to
-    // breathe; the bottom border carries the hint, so it needs none.
-    let widest = rows
-        .iter()
-        .map(|(_, what)| Span::raw(*what).width())
-        .max()
-        .unwrap_or(0);
-    let popup = popup(area, (column + widest) as u16 + 6, lines.len() as u16 + 3);
+            ]));
+        }
+    }
+    (lines, width)
+}
+
+/// The space between the two columns of the help popup.
+const HELP_GUTTER: usize = 4;
+
+/// The help popup, drawn over `area` and scrolled `scroll` lines down. Returns how far
+/// it can be scrolled at most - nothing, when it fits - so the keys can be told whether
+/// an arrow is a scroll or a way out.
+///
+/// The sections are stacked in one column, or dealt into two side by side where the
+/// terminal is wide enough for that: the list is taller than it is wide, and a terminal
+/// is the other way round. They are dealt in order, split wherever the two columns come
+/// out most nearly the same height, so the popup still reads top to bottom and then
+/// left to right, the way a page of a manual does. A section is never split between the
+/// columns, since a heading at the foot of one column with its keys at the top of the
+/// next is a heading nobody connects to them.
+///
+/// Where even that is too tall for the terminal, the popup takes the whole height and
+/// scrolls, and says so along its bottom edge, rather than quietly cutting off the
+/// sections that did not fit - the ones at the end are the ones someone is least
+/// likely to know to look for.
+fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, keys: &Bindings, scroll: u16) -> u16 {
+    let sections = bound(keys);
+    let split = (1..sections.len())
+        .min_by_key(|at| stacked_height(&sections[..*at]).max(stacked_height(&sections[*at..])))
+        .unwrap_or(sections.len());
+    let (left, right) = sections.split_at(split);
+    let (left_lines, left_width) = help_column(theme, left);
+    let (right_lines, right_width) = help_column(theme, right);
+    let paired_width = left_width + HELP_GUTTER + right_width;
+    // The popup keeps two cells of the terminal either side of it, and takes one of
+    // padding either side and the two of its border inside that.
+    let paired = !right.is_empty() && paired_width + 8 <= usize::from(area.width);
+
+    let (lines, width) = if paired {
+        let column = left_width + HELP_GUTTER;
+        let rows = left_lines.len().max(right_lines.len());
+        let lines = (0..rows)
+            .map(|row| {
+                let mut spans = Vec::new();
+                let mut used = 0;
+                if let Some(line) = left_lines.get(row) {
+                    used = line.width();
+                    spans.extend(line.spans.iter().cloned());
+                }
+                if let Some(line) = right_lines.get(row) {
+                    spans.push(Span::raw(" ".repeat(column - used)));
+                    spans.extend(line.spans.iter().cloned());
+                }
+                Line::from(spans)
+            })
+            .collect();
+        (lines, paired_width)
+    } else {
+        help_column(theme, &sections)
+    };
+
+    // The box is as wide as the widest line it holds, plus the padding and the border,
+    // rather than a number chosen once and quietly outgrown by a description added
+    // later. A popup that cuts its own last word off is worse than one that is a little
+    // wide. A row of padding along the top gives the title room to breathe; the bottom
+    // border carries the hint, so it needs none.
+    let wanted = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let popup = popup(
+        area,
+        u16::try_from(width + 4).unwrap_or(u16::MAX),
+        wanted.saturating_add(3),
+    );
+    let most = wanted.saturating_sub(popup.height.saturating_sub(3));
+    let hint = if most > 0 {
+        let arrows = one_key(keys, &[Command::Up, Command::Down], "/");
+        format!(" {arrows} scroll \u{b7} any other key closes this ")
+    } else {
+        " any key closes this ".to_owned()
+    };
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).scroll((scroll.min(most), 0)).block(
             theme
                 .bordered(true)
                 .padding(Padding::new(1, 1, 1, 0))
                 .title(theme.title(" Keys "))
-                .title_bottom(Line::from(theme.dim(" any key closes this ")).right_aligned()),
+                .title_bottom(Line::from(theme.dim(hint)).right_aligned()),
         ),
         popup,
     );
+    most
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -1544,12 +1775,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(status_line(app)), said);
     frame.render_widget(Paragraph::new(counts), counted);
 
-    let reminder = footer(app);
+    let reminder = footer(app, keys.width);
     frame.render_widget(Paragraph::new(line(&reminder)), keys);
     buttons.extend(mouse::lay_out(keys, keys.x, &widths(&reminder)));
 
     if app.show_help {
-        help_overlay(frame, area, &theme, &app.keys);
+        let most = help_overlay(frame, area, &theme, &app.keys, app.help_scroll);
+        app.help_scroll = app.help_scroll.min(most);
+        app.help_room = most;
     }
 
     // Read what is in use before the list borrows the app to draw itself.
@@ -1599,6 +1832,7 @@ mod tests {
     };
     use crate::tui::app::{Action, App, Focus, Picking};
     use crate::tui::art::Gallery;
+    use crate::tui::grid::View;
     use crate::tui::keys::{self, Bindings, Command};
     use crate::tui::theme::{self, Theme};
     use crate::tui::worker::{Choice, FilterKind, Filters, Listing, Request, Response, Worker};
@@ -1973,6 +2207,7 @@ mod tests {
     fn the_help_popup_lists_every_command_as_it_is_bound() {
         let listed: Vec<Command> = HELP
             .iter()
+            .flat_map(|(_, lines)| lines.iter())
             .flat_map(|(commands, _)| commands.iter().copied())
             .collect();
         for (command, _) in keys::DEFAULTS {
@@ -2006,13 +2241,19 @@ mod tests {
             "the bottom edge still offers q for quit"
         );
         // The box grows to what it holds, so a line added to the table is not a line
-        // with its last word cut off.
-        for (_, what) in HELP {
-            assert!(
-                screen.contains(what),
-                "the popup cut {what:?} off at its own edge"
-            );
+        // with its last word cut off - and on a terminal of the commonest size it all
+        // fits, headings too, without a line of it scrolled out of sight.
+        for (heading, lines) in HELP {
+            assert!(screen.contains(heading), "no {heading:?} heading");
+            for (_, what) in lines {
+                assert!(
+                    screen.contains(what),
+                    "the popup cut {what:?} off at its own edge"
+                );
+            }
         }
+        assert!(screen.contains("any key closes this"));
+        assert!(!screen.contains("scroll"), "the popup scrolls at 120x30");
     }
 
     /// A remapped key has to do the thing it was remapped to, not only be advertised.
@@ -2801,6 +3042,205 @@ mod tests {
         assert_eq!(drawn[(quit.x + 2, quit.y)].fg, Color::DarkGray);
     }
 
+    /// The line along the bottom follows the keyboard: the keys worth knowing in the
+    /// catalogue are how to find a series, in the episodes how to watch and fetch one.
+    /// Whatever has the keyboard, the way to the rest of the keys and the way out are on
+    /// it, and each hint answers a click where it was drawn.
+    #[test]
+    fn the_footer_follows_the_keyboard() {
+        let mut app = app();
+        let footer = |app: &mut App, width| {
+            let drawn = buffer(width, 30, app);
+            (0..width)
+                .map(|x| drawn[(x, 29)].symbol().to_owned())
+                .collect::<String>()
+        };
+
+        let series = footer(&mut app, 120);
+        for hint in [
+            "\u{23ce} open",
+            "/ search",
+            "f filter",
+            "o list",
+            "t covers",
+        ] {
+            assert!(series.contains(hint), "{hint:?} is not in {series:?}");
+        }
+        assert!(!series.contains("p play"), "the catalogue offers to play");
+
+        app.focus = Focus::Episodes;
+        let episodes = footer(&mut app, 120);
+        for hint in [
+            "p play",
+            "space mark",
+            "d download",
+            "m watched",
+            "esc back",
+        ] {
+            assert!(episodes.contains(hint), "{hint:?} is not in {episodes:?}");
+        }
+        assert!(!episodes.contains("/ search"));
+        let (x, y) = middle(button(&app, Command::Download));
+        click(&mut app, x, y);
+        assert_eq!(app.downloads.items.len(), 1, "the word did not queue it");
+
+        app.focus = Focus::Downloads;
+        let downloads = footer(&mut app, 120);
+        assert!(downloads.contains("\u{23ce} drop"), "{downloads:?}");
+
+        app.focus = Focus::Series;
+        press(&mut app, KeyCode::Char('t'));
+        let covers = footer(&mut app, 120);
+        for hint in [
+            "\u{2191}/\u{2193}/\u{2190}/\u{2192} move",
+            "c genre",
+            "t columns",
+        ] {
+            assert!(covers.contains(hint), "{hint:?} is not in {covers:?}");
+        }
+
+        for line in [series, episodes, downloads, covers] {
+            assert!(
+                line.contains("? keys") && line.contains("q quit"),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// A terminal too narrow for every hint loses them off the end of what is particular
+    /// to the column, not off the end of the line: the way to the help and the way out
+    /// are the last two things to go, and no box is left over a hint that was dropped.
+    #[test]
+    fn a_narrow_footer_keeps_the_way_to_the_help_and_the_way_out() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        let drawn = buffer(50, 30, &mut app);
+        let line: String = (0..50)
+            .map(|x| drawn[(x, 29)].symbol().to_owned())
+            .collect();
+        assert!(
+            line.contains("? keys") && line.contains("q quit"),
+            "{line:?}"
+        );
+        assert!(!line.contains("a/s language"), "{line:?}");
+        assert!(
+            !app.regions
+                .buttons
+                .iter()
+                .any(|(command, area)| *command == Command::AudioLanguage && area.y == 29),
+            "a box is left over a dropped hint"
+        );
+        let (x, y) = middle(button(&app, Command::Help));
+        click(&mut app, x, y);
+        assert!(app.show_help);
+    }
+
+    /// The help popup is grouped under headings, and on a wide terminal the groups sit
+    /// side by side, so the whole list is read without scrolling.
+    #[test]
+    fn the_help_popup_is_sectioned_and_uses_the_width() {
+        let mut app = app();
+        app.show_help = true;
+        let drawn = buffer(120, 30, &mut app);
+        let row = |y: u16| -> String {
+            (0..120)
+                .map(|x| drawn[(x, y)].symbol().to_owned())
+                .collect()
+        };
+        let paired = (0..30)
+            .map(row)
+            .find(|line| line.contains("Navigation"))
+            .expect("no Navigation heading");
+        assert!(
+            paired.contains("Playback"),
+            "the sections are not side by side: {paired:?}"
+        );
+        assert_eq!(app.help_room, 0, "a popup that fits has nowhere to scroll");
+        // With nowhere to scroll, an arrow is any other key.
+        press(&mut app, KeyCode::Down);
+        assert!(!app.show_help);
+    }
+
+    /// On a terminal too short for the list, the keys that move a cursor move the popup
+    /// instead, it says so along its edge, and anything else still closes it.
+    #[test]
+    fn a_help_popup_taller_than_the_terminal_scrolls() {
+        let mut app = app();
+        app.show_help = true;
+        let screen = rendered(80, 24, &mut app);
+        assert!(
+            screen.contains("scroll"),
+            "the popup does not say it scrolls"
+        );
+        assert!(
+            !screen.contains("show this list"),
+            "the last line fits after all"
+        );
+        assert!(app.help_room > 0);
+
+        press(&mut app, KeyCode::End);
+        assert!(app.show_help, "the end key closed a popup it should scroll");
+        let screen = rendered(80, 24, &mut app);
+        assert!(
+            screen.contains("show this list"),
+            "the end is still out of sight"
+        );
+        assert!(
+            !screen.contains("move the cursor"),
+            "the top is still in sight"
+        );
+
+        wheel(&mut app, 40, 10, false);
+        assert_eq!(
+            app.help_scroll,
+            app.help_room - 1,
+            "the wheel did not scroll"
+        );
+
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.show_help);
+        assert_eq!(app.help_scroll, 0, "the next popup opens scrolled");
+    }
+
+    /// Until the first key, the status line says where the covers are and where the
+    /// rest of the keys are, in the keys this config has - and it gives way to news.
+    #[test]
+    fn a_newcomer_is_told_where_the_covers_and_the_keys_are() {
+        let mut app = app();
+        app.paging.asked = None;
+        assert!(
+            rendered(120, 30, &mut app).contains("Ready. \u{b7} t shows covers, ? shows every key")
+        );
+
+        // While the catalogue is on its way, after what is being waited on.
+        app.paging.asked = Some(0);
+        assert!(rendered(120, 30, &mut app).contains("t shows covers"));
+        app.paging.asked = None;
+
+        app.complain("Nope.");
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Nope.") && !screen.contains("shows covers"));
+        app.notice = None;
+
+        press(&mut app, KeyCode::Down);
+        assert!(!rendered(120, 30, &mut app).contains("shows every key"));
+
+        let (bindings, warnings) =
+            toml::from_str::<keys::Settings>("view = \"V\"\nhelp = \"f1\"\n")
+                .expect("valid config")
+                .resolve();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut remapped = self::app();
+        remapped.paging.asked = None;
+        remapped.keys = bindings;
+        remapped.view = View::Covers;
+        let screen = rendered(120, 30, &mut remapped);
+        assert!(
+            screen.contains("V shows columns, f1 shows every key"),
+            "the tip names keys this config does not have"
+        );
+    }
+
     /// The panel is a card named after what it describes, and for an episode it says in
     /// words what the row can only say in a glyph and four cells: where it was left off
     /// and whether it is on the disk.
@@ -3148,8 +3588,21 @@ mod tests {
         assert_eq!(word(Command::SubtitleLanguage), "subs English");
         assert_eq!(word(Command::Quality), "video 1080p");
         assert_eq!(word(Command::Order), "Continue watching");
-        assert_eq!(word(Command::Open), "⏎ open/play");
+        assert_eq!(word(Command::Open), "⏎ open");
+        assert_eq!(word(Command::Quit), "q quit");
+
+        // The footer follows the keyboard, and its boxes follow the footer.
+        app.focus = Focus::Episodes;
+        let buffer = self::buffer(120, 30, &mut app);
+        let word = |command| {
+            let area = button(&app, command);
+            (area.x..area.right())
+                .map(|x| buffer[(x, area.y)].symbol())
+                .collect::<String>()
+        };
+        assert_eq!(word(Command::Play), "p play");
         assert_eq!(word(Command::Download), "d download");
+        assert_eq!(word(Command::MarkWatched), "m watched");
         assert_eq!(word(Command::Quit), "q quit");
     }
 

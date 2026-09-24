@@ -227,9 +227,11 @@ mpv-args = []
 # is leaving a command with no key by giving its last one away.
 #
 # ctrl-c always quits and cannot be rebound, so a half-finished section here can
-# never leave you stuck in the alternate screen. The `?` overlay and the
-# reminder along the bottom of the screen are both drawn from whatever is in
-# force, so they say what your keys do rather than what these ones did.
+# never leave you stuck in the alternate screen. The `?` overlay, the reminder
+# along the bottom of the screen - which offers the keys for whichever column
+# the cursor is in - and the tip on the status line before the first key is
+# pressed are all drawn from whatever is in force, so they say what your keys
+# do rather than what these ones did.
 
 [keys]
 

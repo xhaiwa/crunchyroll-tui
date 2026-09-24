@@ -9,6 +9,9 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 ## Features
 
 - Terminal interface for browsing the catalogue and starting playback, in your own colourscheme and on your own keys
+- The catalogue as a wall of posters, or as three columns with the poster of the selected series beside them - one key between the two
+- Rounded panels with the focused one outlined in the accent, a details card under the lists, a status line that marks news apart from failures, and a footer that offers the keys for wherever the cursor is
+- A help popup grouped by what the keys are for - navigation, browsing, playback, downloads, the account, the display - drawn in two columns where the terminal is wide enough
 - The catalogue narrowed to one of Crunchyroll's categories, to one anime season, or to what is simulcasting
 - Downloads that run in the background: a queue in a panel of its own, with the catalogue still usable while a season comes down
 - The watchlist and the history kept up to date from the interface: a series added or removed, an episode marked watched or unwatched
@@ -16,7 +19,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - Several episodes of a season marked and queued together, in the order the season lists them
 - Any column narrowed as you type, fzf style, without a request going anywhere: a season, a watchlist or the download queue cut down to the rows that match
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
-- Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2, and the catalogue browsable as a wall of covers
+- Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2, and as coloured half-blocks in any other terminal
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Downloads a later run can pick up: the finished name appears only once the episode is whole, and what a killed run did fetch is kept for the next one
 - Playback with mpv while the stream downloads, instead of writing a file
@@ -207,7 +210,7 @@ instead and says so on the status line.
 | `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
 | `pgup` `pgdn` | `page-up`, `page-down` | Move a page at a time |
 | `home` `end`, `g` `G` | `top`, `bottom` | Jump to the first or last item |
-| `←` `→`, `h` `l` | `left`, `right` | Go back a column, or open the selection - the same as `back` and `open` |
+| `←` `→`, `h` `l` | `left`, `right` | Go back a column, or open the selection - the same as `back` and `open`. On the wall of covers, the previous or the next cover |
 | `⏎` | `open` | Open the selection, play the episode under the cursor, drop a row of the queue |
 | `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns: series, seasons, episodes, downloads |
@@ -227,13 +230,38 @@ instead and says so on the status line.
 | `v` | `quality` | Cycle the video quality |
 | `i` | `images` | Show or hide the poster and the episode still |
 | `r` | `reload` | Reload the current column |
-| `?` | `help` | Show the keys, as they are bound |
+| `?` | `help` | Show every key, as it is bound, grouped by what it is for |
 | `q` | `quit` | Quit |
 
 The Action column is the name the key is written under in the config file; see
 [Keys](#keys) for moving any of them. `ctrl-c` quits whatever the config says.
 
 Every one of these can be moved somewhere else; see [Keys](#keys) below.
+
+Nobody has to learn the table first. The line along the bottom offers the keys for
+wherever the cursor is, from the bindings in force, so a remapped key is offered as the key
+it was remapped to: in the Series column it is how to open, search, narrow and reorder the
+catalogue and how to get to the covers; in the Episodes column it is how to play, mark,
+queue and mark watched; on the wall and in the download queue, what those can be asked for.
+`?` and `q` end the line whatever has the keyboard, and they are the last two hints a narrow
+terminal gives up - the others go first, from the end. Until the first key is pressed the
+status line adds where the rest are, `t shows covers, ? shows every key`, and gives way to
+anything it has actual news about.
+
+`?` opens every key, grouped under Navigation, Browse & find, Playback, Downloads, Account
+and Display, in two columns side by side where the terminal is wide enough for that - a
+hundred and twenty columns is - and one where it is not. On a terminal too short for the
+whole list, the keys that move a cursor, and the wheel, scroll it instead, and its bottom
+edge says so; any other key closes it, as any key does when it fits.
+
+The interface is drawn as a set of rounded panels, each titled with a glyph and a name, and
+the panel that has the keyboard is outlined in the accent colour so the eye finds it
+before reading a word. Rows carry their facts in colour rather than in brackets - a film or
+a simulcast in the accent, a count in dim - and the panel under the lists is a card about
+whatever the cursor is on: the series, the season, the episode with its still, or a row of
+the queue. The status line puts a check in front of news, a spinner in front of something
+on its way, and a cross in front of a failure, and it counts along its right end what is
+marked and what is downloading, so a queue scrolled out of sight is still accounted for.
 
 `o` walks one ring: the three browse orders, then the watchlist of whatever account the
 `etp_rt` cookie belongs to, then Continue watching, which is that account's own history
@@ -437,7 +465,7 @@ included.
 | Drag | Move the cursor down the column the drag started in |
 | Wheel | Scroll the column under the pointer, leaving the keyboard where it is |
 | Right click | Go back out of the column it was pressed on |
-| Click a word along an edge | What its key does: `open/play`, `back`, `search`, `download`, `language`, `quality`, `keys`, `quit`, and `audio`, `subs` and `video` at the top right |
+| Click a word along an edge | What its key does: every hint on the bottom line - `open`, `search`, `play`, `download`, `covers`, `keys`, `quit` and the rest, whichever the cursor's column offers - and `audio`, `subs` and `video` at the top right |
 | Click a queue row, then again | Move the cursor there, then take that download out of the queue |
 | Click the listing label | Move on to the next list, or leave a search |
 | Click a filter in the header | Open the list it came from, where it is cleared as well as set |
@@ -460,29 +488,34 @@ reaches the interface until tmux itself is told `set -g mouse on`.
 
 ### Cover art
 
-The series poster gets a column of its own beside the lists, and the still from the
-selected episode sits in the Details panel. They are drawn as pixels, with whichever
+Covers are the point of a video catalogue, so they are on by default and there are two
+ways to look at them. In the columns, the series poster gets a column of its own beside
+the lists, and the still from the selected episode sits in the details card. On the
+[wall of covers](#the-wall-of-covers), every series in the list is a poster. They are
+drawn as pixels, with whichever
 graphics protocol the terminal answers to - kitty, sixel or iTerm2 - which is asked for
 once at startup rather than guessed from environment variables.
 
 A terminal that speaks none of those still gets the pictures, drawn as half-blocks: a
 mosaic of coloured cells rather than a photograph, but every terminal can manage one, and
-a wall of covers with nothing on it is a worse way to browse than a rough picture. If the
-colours bother you, turn the artwork off:
+a wall of covers with nothing on it is a worse way to browse than a rough picture. That
+is what `images = "auto"`, the default, means: the best protocol the terminal has, and
+half-blocks where it has none. `on` is the same, and `off` draws no pictures at all. If
+the colours bother you, turn the artwork off:
 
 ```shell
 cargo run --release -- --tui --images off
 ```
 
 `i` toggles it while the interface is running - which also names the protocol in use, if
-you are wondering why a picture is not where you expected it. The same setting lives in the [config file](#configuration), as
-`images = "auto"`.
+you are wondering why a picture is not where you expected it. The same setting lives in
+the [config file](#configuration), as `images = "auto"`.
 
 Posters and stills come off Crunchyroll's own image CDN, at the smallest size that covers
 the panel, on threads of their own so nothing waits on them. Nothing is written to disk.
 
-Pair it with [`--in-terminal`](#video-in-the-terminal) and the whole thing - catalogue, artwork and video - stays
-inside the terminal:
+Pair it with [`--in-terminal`](#video-in-the-terminal) and the whole thing - catalogue,
+artwork and video - stays inside the terminal:
 
 ```shell
 cargo run --release -- --tui --in-terminal
@@ -490,9 +523,12 @@ cargo run --release -- --tui --in-terminal
 
 ### The wall of covers
 
-`t` (the footer offers it as `t covers`) swaps the three columns for the catalogue drawn as a grid of posters, each with its
-title and a word about what it is - `film`, `3 seasons`, `simulcast`, `dub` - underneath,
-and as many across as the terminal has room for. It is the same list as the Series column:
+`t` - the footer offers it as `t covers`, and as `t columns` once the wall is up - swaps
+the three columns for the catalogue drawn as a grid of posters, each with its title and a
+word about what it is - `film`, `3 seasons`, `simulcast`, `dub` - underneath, and as many
+across as the terminal has room for. The cover under the cursor is framed in the accent
+colour, and the words under it are coloured the way the Series column colours them: what
+kind of thing it is in the accent, counts in dim. It is the same list as the Series column:
 the same cursor, the same filters and narrowing, and the next page is asked for when the
 cursor reaches the last row, so `t` again puts you back in the column on the series you
 were looking at.
