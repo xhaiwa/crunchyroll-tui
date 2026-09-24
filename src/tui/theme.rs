@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui::widgets::Block;
+use ratatui::widgets::{Block, BorderType};
 use serde::Deserialize;
 
 /// The seven colours the interface draws with.
@@ -78,12 +78,20 @@ impl Theme {
         )
     }
 
+    /// A secondary heading: the title of a column that does not have the keyboard, or
+    /// a fact worth a little more weight than the dim text around it.
+    pub fn heading(&self, text: impl Into<String>) -> Span<'static> {
+        Span::styled(text.into(), Style::new().fg(self.heading))
+    }
+
+    /// Every box in the interface. Rounded corners, because a square box inside a
+    /// square terminal is a grid of rules and a rounded one reads as a card; and the
+    /// border itself in the accent only where the keyboard is, so the eye finds the
+    /// focused column before it has read a word of any title.
     pub fn bordered(&self, accented: bool) -> Block<'static> {
-        Block::bordered().border_style(Style::new().fg(if accented {
-            self.accent
-        } else {
-            self.border
-        }))
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(if accented { self.accent } else { self.border }))
     }
 
     /// The row under the cursor.
@@ -490,6 +498,24 @@ palette:
         assert!(warnings[0].contains("dracula") && warnings[0].contains("nord"));
         assert!(warnings[1].contains("/nowhere/at/all.yaml"));
         assert!(warnings[2].contains("theme.accent"));
+    }
+
+    /// Every box has rounded corners, whether or not it has the keyboard.
+    #[test]
+    fn draws_boxes_with_rounded_corners() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        for accented in [true, false] {
+            let area = Rect::new(0, 0, 4, 3);
+            let mut buffer = Buffer::empty(area);
+            Theme::default()
+                .bordered(accented)
+                .render(area, &mut buffer);
+            assert_eq!(buffer[(0, 0)].symbol(), "\u{256d}");
+            assert_eq!(buffer[(3, 2)].symbol(), "\u{256f}");
+        }
     }
 
     /// The bug this replaced: literal black on the accent, which a light scheme cannot

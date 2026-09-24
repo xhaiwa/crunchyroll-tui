@@ -1,6 +1,5 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect, Size};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
@@ -66,9 +65,31 @@ fn column_name(app: &App, focus: Focus) -> &'static str {
 /// half the season. The count is both numbers rather than the one, because how much is
 /// missing is the part that cannot be seen.
 fn pane_title<T>(name: &str, pane: &Pane<T>) -> String {
+    let glyph = glyph(name);
     match pane.query() {
-        Some(query) => format!("{name} \"{query}\" {}/{}", pane.rows(), pane.items.len()),
-        None => name.to_owned(),
+        Some(query) => format!(
+            "{glyph} {name} \"{query}\" {}/{}",
+            pane.rows(),
+            pane.items.len()
+        ),
+        None => format!("{glyph} {name}"),
+    }
+}
+
+/// The small mark in front of a column's title, so that the four boxes can be told
+/// apart at a glance before any of their words have been read.
+///
+/// Keyed on the name [`column_name`] gives rather than on the focus, because that name
+/// is what every title is built from; whatever the middle column is called - `Seasons`,
+/// `Film`, `Music` - it is the middle column. The glyphs are all ones a monospace font
+/// draws a single cell wide and none of them has an emoji form, which is what would
+/// otherwise knock every title after it a column out of line.
+fn glyph(name: &str) -> &'static str {
+    match name {
+        "Series" => "\u{25a4}",
+        "Episodes" | "Episode" => "\u{25b8}",
+        "Downloads" | "Download" => "\u{21e3}",
+        _ => "\u{25eb}",
     }
 }
 
@@ -84,11 +105,14 @@ fn nothing_shown<T>(pane: &Pane<T>, idle: &str) -> String {
     }
 }
 
+/// A column's box: the border and the title in the accent while it has the keyboard,
+/// and both stepped back while it does not, so the focused column is the one thing on
+/// the screen framed in colour.
 fn pane_block(theme: &Theme, title: &str, focused: bool) -> Block<'static> {
     let heading = if focused {
         theme.title(format!(" {title} "))
     } else {
-        Span::styled(format!(" {title} "), Style::new().fg(theme.heading))
+        theme.heading(format!(" {title} "))
     };
     theme.bordered(focused).title(heading)
 }
@@ -1448,6 +1472,34 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
+    }
+
+    /// Each column wears its own mark in front of its name, and only the column with the
+    /// keyboard is framed in the accent - which is what finds it on a screen of four
+    /// boxes before a word of any title has been read.
+    #[test]
+    fn the_focused_column_is_the_one_framed_in_colour() {
+        let mut app = app();
+        let buffer = buffer(120, 30, &mut app);
+        let screen: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for expected in ["\u{25a4} Series", "\u{25eb} Seasons", "\u{25b8} Episodes"] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
+
+        let corner = |area: Rect| &buffer[(area.x, area.y)];
+        let series = corner(app.regions.series);
+        let episodes = corner(app.regions.episodes);
+        assert_eq!(series.symbol(), "\u{256d}", "the box is not rounded");
+        assert_eq!(
+            series.fg,
+            Color::Yellow,
+            "the focused column is not accented"
+        );
+        assert_eq!(episodes.fg, Color::DarkGray, "an idle column is accented");
     }
 
     /// A film keeps the three columns and changes the words in them. Four places would
