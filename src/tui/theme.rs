@@ -84,6 +84,14 @@ impl Theme {
         Span::styled(text.into(), Style::new().fg(self.heading))
     }
 
+    /// A word set off as a label of its own - the name in the corner of the header. It
+    /// wears the cursor row's colours, which already solve the one hard problem here:
+    /// filling a cell with the accent without naming a page colour the terminal never
+    /// gave us. See [`Theme::highlight`].
+    pub fn badge(&self, text: impl Into<String>) -> Span<'static> {
+        Span::styled(text.into(), self.highlight(true))
+    }
+
     /// Every box in the interface. Rounded corners, because a square box inside a
     /// square terminal is a grid of rules and a rounded one reads as a card; and the
     /// border itself in the accent only where the keyboard is, so the eye finds the

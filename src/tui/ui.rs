@@ -343,10 +343,15 @@ fn line(run: &Run) -> Line<'static> {
 fn tally(app: &App) -> String {
     let loaded = app.series.items.len();
     match app.paging.total {
-        Some(total) => format!("   {loaded} of {total} series"),
-        None => format!("   {loaded} series"),
+        Some(total) => format!("{loaded} of {total} series"),
+        None => format!("{loaded} series"),
     }
 }
+
+/// What the words along the header are held apart by: a dot with room either side, the
+/// same separator the details panel puts between its facts, so a line of the interface
+/// reads as a list of things wherever it is one.
+const DOT: &str = " \u{b7} ";
 
 /// The left of the header: what is being listed, how much of it, and what it is narrowed
 /// by.
@@ -364,7 +369,9 @@ fn tally(app: &App) -> String {
 /// vanish.
 ///
 /// While the box is being typed into, none of it is a button: a click there closes the
-/// box, as escape does.
+/// box, as escape does. It carries its own two keys at the end instead, because those
+/// are the only two that mean anything while it is open and neither is on the line
+/// along the bottom.
 fn listing(app: &App) -> Run {
     let theme = &app.theme;
     match &app.editing {
@@ -372,21 +379,33 @@ fn listing(app: &App) -> Run {
         // the two things a box of typing could be doing and only one of them is about
         // to go to Crunchyroll: `Search:` replaces this column with an answer, and
         // `Filter Episodes:` leaves a column alone but for the rows it is hiding.
-        Some(editing) => vec![(
-            None,
-            vec![
-                theme.accent(match editing {
-                    Editing::Search(_) => "Search: ".to_owned(),
-                    Editing::Narrow { focus, .. } => {
-                        format!("Filter {}: ", column_name(app, *focus))
-                    }
-                }),
-                theme.text(editing.query().to_owned()),
-                theme.accent("▏"),
-            ],
-        )],
+        Some(editing) => {
+            let (prompt, enter, escape) = match editing {
+                Editing::Search(_) => ("Search: ".to_owned(), "search", "cancel"),
+                Editing::Narrow { focus, .. } => (
+                    format!("Filter {}: ", column_name(app, *focus)),
+                    "keep",
+                    "clear",
+                ),
+            };
+            vec![(
+                None,
+                vec![
+                    theme.text(" "),
+                    theme.title(prompt),
+                    theme.strong(editing.query().to_owned()),
+                    theme.accent("\u{258f}"),
+                    theme.dim("   "),
+                    theme.title("\u{23ce}"),
+                    theme.dim(format!(" {enter}{DOT}")),
+                    theme.title("esc"),
+                    theme.dim(format!(" {escape}")),
+                ],
+            )]
+        }
         None => {
             let mut run = vec![
+                (None, vec![theme.text(" ")]),
                 (
                     Some(match app.listing {
                         Listing::Browse(_) | Listing::Watchlist | Listing::History => {
@@ -394,9 +413,9 @@ fn listing(app: &App) -> Run {
                         }
                         Listing::Search(_) => Command::Back,
                     }),
-                    vec![theme.strong(app.listing.label())],
+                    vec![theme.title(app.listing.label())],
                 ),
-                (None, vec![theme.dim(tally(app))]),
+                (None, vec![theme.dim(format!("{DOT}{}", tally(app)))]),
             ];
             if matches!(app.listing, Listing::Browse(_)) {
                 let filters = [
@@ -409,7 +428,7 @@ fn listing(app: &App) -> Run {
                 ];
                 for (command, word) in filters {
                     if let Some(word) = word {
-                        run.push((None, vec![theme.dim("   ")]));
+                        run.push((None, vec![theme.dim(DOT)]));
                         run.push((Some(command), vec![theme.accent(word)]));
                     }
                 }
@@ -419,43 +438,50 @@ fn listing(app: &App) -> Run {
     }
 }
 
-/// The three labels along the top right, in the order they are drawn, each with the
-/// command a click on it runs.
+/// The three settings along the top right, in the order they are drawn, each with the
+/// command a click on it runs: a dim word saying which setting it is and the value in
+/// the accent, so the eye reads the values and the words are there for whoever needs
+/// telling what `日本語` is the setting of.
 fn settings(app: &App) -> Run {
     let theme = &app.theme;
+    let chip = |command, what: &str, value: String| {
+        (
+            Some(command),
+            vec![theme.dim(format!("{what} ")), theme.title(value)],
+        )
+    };
     vec![
-        (
-            Some(Command::AudioLanguage),
-            vec![
-                theme.dim("audio "),
-                theme.accent(language_name(&app.audio()).to_owned()),
-            ],
+        (None, vec![theme.text(" ")]),
+        chip(
+            Command::AudioLanguage,
+            "audio",
+            language_name(&app.audio()).to_owned(),
         ),
-        (None, vec![theme.dim("  ")]),
-        (
-            Some(Command::SubtitleLanguage),
-            vec![
-                theme.dim("subs "),
-                theme.accent(language_name(&app.subs()).to_owned()),
-            ],
+        (None, vec![theme.dim(DOT)]),
+        chip(
+            Command::SubtitleLanguage,
+            "subs",
+            language_name(&app.subs()).to_owned(),
         ),
-        (None, vec![theme.dim("  ")]),
-        (
-            Some(Command::Quality),
-            vec![
-                theme.dim("video "),
-                theme.accent(app.options.video_quality.clone()),
-            ],
-        ),
+        (None, vec![theme.dim(DOT)]),
+        chip(Command::Quality, "video", app.options.video_quality.clone()),
         (None, vec![theme.text(" ")]),
     ]
 }
+
+/// The name of the program, set in the top left corner of the header as a label of its
+/// own so the frame has a title the way a window does.
+const NAME: &str = " crunchyroll-tui ";
 
 fn header(app: &App) -> Paragraph<'static> {
     let theme = &app.theme;
     let block = theme
         .bordered(false)
-        .title(theme.title(" Crunchyroll "))
+        .title(Line::from(vec![
+            theme.text(" "),
+            theme.badge(NAME),
+            theme.text(" "),
+        ]))
         .title_top(line(&settings(app)).right_aligned());
     Paragraph::new(line(&listing(app))).block(block)
 }
@@ -1460,7 +1486,7 @@ mod tests {
         let mut app = app();
         let screen = rendered(120, 30, &mut app);
         for expected in [
-            "Crunchyroll",
+            "crunchyroll-tui",
             "Series",
             "Seasons",
             "Episodes",
@@ -1472,6 +1498,32 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
+    }
+
+    /// The header is a title bar: the program's name in the corner, what is listed and
+    /// how much of it underneath, and the three settings along the right as one line of
+    /// labelled values held apart the way the facts in the details panel are.
+    #[test]
+    fn the_header_reads_as_a_title_bar() {
+        let mut app = app();
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains(" crunchyroll-tui "),
+            "no name in the corner"
+        );
+        assert!(screen.contains("Continue watching \u{b7} 1 series"));
+        assert!(screen.contains("subs English \u{b7} video 1080p"));
+
+        // While the box is open it says which two keys mean something in it, since
+        // neither of them is on the line along the bottom.
+        press(&mut app, KeyCode::Char('/'));
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Search: "));
+        assert!(screen.contains("\u{23ce} search \u{b7} esc cancel"));
+        press(&mut app, KeyCode::Esc);
+        app.focus = Focus::Episodes;
+        press(&mut app, KeyCode::Char('f'));
+        assert!(rendered(120, 30, &mut app).contains("\u{23ce} keep \u{b7} esc clear"));
     }
 
     /// Each column wears its own mark in front of its name, and only the column with the
