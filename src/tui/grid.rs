@@ -259,34 +259,74 @@ pub fn truncate(text: &str, width: usize) -> String {
     kept
 }
 
-/// The word under a title: what it is when it is not a series, how many seasons when
+/// The words under a title: what it is when it is not a series, how many seasons when
 /// there are several, whether it is simulcasting and whether it is dubbed. The same
 /// facts the Series column puts beside a title, for the same reason - a wall that
 /// mixes films in with series has to say which is which.
-pub fn tag(item: &CatalogItem) -> String {
+///
+/// Each word comes with whether it stands out, the way the Series column marks them:
+/// what kind of thing a tile is where it is not a series, and that it is simulcasting,
+/// are drawn in the accent, and the counts in dim.
+pub fn tags(item: &CatalogItem) -> Vec<(bool, String)> {
     let metadata = &item.series_metadata;
     let mut tags = Vec::new();
     if let Some(word) = single_name(&item.kind) {
-        tags.push(word.to_lowercase());
+        tags.push((true, word.to_lowercase()));
     } else if metadata.season_count > 1 {
-        tags.push(format!("{} seasons", metadata.season_count));
+        tags.push((false, format!("{} seasons", metadata.season_count)));
     } else if metadata.episode_count > 0 {
-        tags.push(format!("{} ep", metadata.episode_count));
+        tags.push((false, format!("{} ep", metadata.episode_count)));
     }
     if metadata.is_simulcast {
-        tags.push("simulcast".to_owned());
+        tags.push((true, "simulcast".to_owned()));
     }
     if metadata.is_dubbed || item.movie_listing_metadata.is_dubbed {
-        tags.push("dub".to_owned());
+        tags.push((false, "dub".to_owned()));
     }
-    tags.join(" · ")
+    tags
+}
+
+/// What the words under a title are held apart by: the dot the rest of the interface
+/// puts between facts.
+const DOT: &str = " \u{b7} ";
+
+/// The words under a title as spans, cut to `width` columns. A word that does not fit
+/// whole is cut with an ellipsis and ends the line, so a narrow tile still says what
+/// the tile is before it runs out of room.
+fn tag_line(theme: &Theme, tags: &[(bool, String)], width: usize) -> Vec<Span<'static>> {
+    let mut spans = vec![theme.dim(" ")];
+    let mut used = 0;
+    for (index, (loud, word)) in tags.iter().enumerate() {
+        if index > 0 {
+            if used + cells(DOT) >= width {
+                break;
+            }
+            spans.push(theme.dim(DOT));
+            used += cells(DOT);
+        }
+        let word = truncate(word, width.saturating_sub(used));
+        if word.is_empty() {
+            break;
+        }
+        used += cells(&word);
+        let cut = word.ends_with('\u{2026}');
+        spans.push(if *loud {
+            theme.accent(word)
+        } else {
+            theme.dim(word)
+        });
+        if cut {
+            break;
+        }
+    }
+    spans
 }
 
 /// What one tile needs, copied out of the catalogue so that the gallery can be borrowed
 /// to draw it.
 struct Tile {
     title: String,
-    tag: String,
+    tags: Vec<(bool, String)>,
     poster: Option<String>,
 }
 
@@ -348,7 +388,7 @@ pub fn draw(
         .iter()
         .map(|item| Tile {
             title: item.title.clone(),
-            tag: tag(item),
+            tags: tags(item),
             poster: item.images.poster(pixels).map(str::to_owned),
         })
         .collect();
@@ -382,14 +422,12 @@ fn draw_tile(
     selected: bool,
     focused: bool,
 ) {
-    let (border, colour) = match (selected, focused) {
-        (true, true) => (BorderType::Thick, theme.accent),
-        (true, false) => (BorderType::Rounded, theme.accent),
-        (false, _) => (BorderType::Rounded, theme.border),
-    };
-    let block = Block::bordered()
-        .border_type(border)
-        .border_style(Style::new().fg(colour));
+    // The same rounded card as every other box, in the accent where the cursor is; the
+    // one tile the keyboard is on gets the heavier line on top of that.
+    let mut block = theme.bordered(selected);
+    if selected && focused {
+        block = block.border_type(BorderType::Thick);
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -419,7 +457,7 @@ fn draw_tile(
     };
     let lines = vec![
         Line::from(Span::styled(format!(" {title}{padding}"), style)),
-        Line::from(theme.dim(format!(" {}", truncate(&tile.tag, width)))),
+        Line::from(tag_line(theme, &tile.tags, width)),
     ];
     frame.render_widget(Paragraph::new(lines), caption);
 }
@@ -472,7 +510,8 @@ mod tests {
     use crate::model::{CatalogItem, MovieListingMetadata, SeriesMetadata};
 
     use super::{
-        Shape, TILE_MAX, TILE_MIN, Wall, fit, initials, scroll, stack, tag, tile_height, truncate,
+        Shape, TILE_MAX, TILE_MIN, Wall, fit, initials, scroll, stack, tag_line, tags, tile_height,
+        truncate,
     };
 
     #[test]
@@ -604,6 +643,15 @@ mod tests {
         assert_eq!(truncate("Frieren", 0), "");
     }
 
+    /// The words under a title as they read, held apart by a dot.
+    fn tag(item: &CatalogItem) -> String {
+        tags(item)
+            .into_iter()
+            .map(|(_, word)| word)
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
+    }
+
     #[test]
     fn the_tag_says_what_a_tile_is() {
         let series = |seasons, episodes, simulcast, dubbed| CatalogItem {
@@ -629,6 +677,28 @@ mod tests {
             ..CatalogItem::default()
         };
         assert_eq!(tag(&film), "film · dub");
+    }
+
+    /// The words under a title are cut where the tile ends, and a word that is cut ends
+    /// the line rather than being followed by a dot and half of the next one.
+    #[test]
+    fn the_tag_line_is_cut_to_the_tile() {
+        let theme = crate::tui::theme::Theme::default();
+        let words = vec![
+            (false, "12 ep".to_owned()),
+            (true, "simulcast".to_owned()),
+            (false, "dub".to_owned()),
+        ];
+        let read = |width| {
+            tag_line(&theme, &words, width)
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(read(40), " 12 ep · simulcast · dub");
+        assert_eq!(read(12), " 12 ep · sim…");
+        assert_eq!(read(8), " 12 ep");
+        assert_eq!(read(0), " ");
     }
 }
 
@@ -937,6 +1007,75 @@ mod drawn {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.series.state.selected(), Some(app.grid.columns));
+    }
+
+    /// The wall wears the look of the rest of the interface: rounded cards in the
+    /// border colour, the chosen one in the accent and, while the keyboard is on the
+    /// wall, in a heavier line as well.
+    #[test]
+    fn the_chosen_cover_is_framed_in_the_accent() {
+        let mut app = wall(8, Gallery::detached(false));
+        let buffer = buffer(120, 40, &mut app);
+        let corner = |row| {
+            let area = tile(&app, row);
+            buffer[(area.x, area.y)].clone()
+        };
+        let chosen = corner(0);
+        assert_eq!(
+            chosen.symbol(),
+            "\u{250f}",
+            "the chosen cover is not in a heavy line"
+        );
+        assert_eq!(chosen.fg, app.theme.accent);
+        let other = corner(1);
+        assert_eq!(
+            other.symbol(),
+            "\u{256d}",
+            "the other covers are not rounded"
+        );
+        assert_eq!(other.fg, app.theme.border);
+    }
+
+    /// A film on the wall says so in the accent, as it does in the Series column, and
+    /// a count stays dim.
+    #[test]
+    fn a_cover_names_a_film_in_the_accent() {
+        let mut app = app(Gallery::detached(false));
+        let mut film = item(0);
+        film.kind = "movie_listing".to_owned();
+        app.series.set(vec![film, item(1)]);
+        app.sent();
+        press(&mut app, KeyCode::Char('t'));
+        let buffer = buffer(120, 40, &mut app);
+        let find = |word: &str| {
+            let first = word.chars().next().map(String::from).unwrap_or_default();
+            (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .find(|(x, y)| {
+                    buffer[(*x, *y)].symbol() == first
+                        && (0..word.chars().count()).all(|at| {
+                            let x = *x + u16::try_from(at).unwrap_or(0);
+                            x < buffer.area.width
+                                && Some(buffer[(x, *y)].symbol())
+                                    == word.chars().nth(at).map(String::from).as_deref()
+                        })
+                })
+                .unwrap_or_else(|| panic!("{word:?} is not on the wall"))
+        };
+        assert_eq!(buffer[find("film")].fg, app.theme.accent);
+        assert_eq!(buffer[find("2 seasons")].fg, app.theme.dim);
+    }
+
+    /// The footer offers the other view by name, so the wall can be found without the
+    /// help popup, and says how to get back once it is up.
+    #[test]
+    fn the_footer_offers_the_other_view() {
+        let mut app = app(Gallery::detached(false));
+        app.series.set((0..3).map(item).collect());
+        assert!(screen(&buffer(120, 40, &mut app)).contains("t covers"));
+        press(&mut app, KeyCode::Char('t'));
+        let drawn = screen(&buffer(120, 40, &mut app));
+        assert!(drawn.contains("t columns") && !drawn.contains("t covers"));
     }
 
     #[test]

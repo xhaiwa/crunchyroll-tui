@@ -490,7 +490,7 @@ cargo run --release -- --tui --in-terminal
 
 ### The wall of covers
 
-`t` swaps the three columns for the catalogue drawn as a grid of posters, each with its
+`t` (the footer offers it as `t covers`) swaps the three columns for the catalogue drawn as a grid of posters, each with its
 title and a word about what it is - `film`, `3 seasons`, `simulcast`, `dub` - underneath,
 and as many across as the terminal has room for. It is the same list as the Series column:
 the same cursor, the same filters and narrowing, and the next page is asked for when the

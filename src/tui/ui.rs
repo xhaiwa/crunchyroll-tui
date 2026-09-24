@@ -1013,11 +1013,16 @@ const HELP: [(&[Command], &str); 25] = [
 /// The command a click runs is written down rather than taken to be the first of the
 /// keys shown, because the two are not always the same thing: `move` names two keys, and
 /// a pointer that wants to move has a wheel already.
-const FOOTER: [(&[Command], &str, Option<Command>); 9] = [
+///
+/// The view switch is written down as `covers` and read out as whichever view it would
+/// switch to - see [`footer`] - because a key that says `view` does not say that the
+/// catalogue can be a wall of posters, which is the thing worth finding out.
+const FOOTER: [(&[Command], &str, Option<Command>); 10] = [
     (&[Command::Up, Command::Down], "move", None),
     (&[Command::Open], "open/play", Some(Command::Open)),
     (&[Command::Back], "back", Some(Command::Back)),
     (&[Command::Search], "search", Some(Command::Search)),
+    (&[Command::View], "covers", Some(Command::View)),
     (&[Command::Download], "download", Some(Command::Download)),
     (
         &[Command::AudioLanguage, Command::SubtitleLanguage],
@@ -1048,6 +1053,10 @@ fn footer(app: &App) -> Run {
         if run.len() > 1 {
             run.push((None, vec![theme.dim(FOOTER_GAP)]));
         }
+        let what = match commands {
+            [Command::View] if app.view == View::Covers => "columns",
+            _ => what,
+        };
         run.push((click, vec![theme.title(key), theme.dim(format!(" {what}"))]));
     }
     run
@@ -2725,7 +2734,7 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(screen.contains("\u{23ce} apply \u{b7} tab other list \u{b7} \u{2190} cancel"));
+        assert!(screen.contains("\u{23ce} apply \u{b7} tab other list \u{b7} esc cancel"));
         let popup = app.regions.picker;
         let dot = (popup.top()..popup.bottom())
             .flat_map(|y| (popup.left()..popup.right()).map(move |x| (x, y)))
