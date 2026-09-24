@@ -970,6 +970,119 @@ const FOOTER: [(&[Command], &str, Option<Command>); 9] = [
 /// What the hints along the bottom edge are held apart by.
 const FOOTER_GAP: &str = "   ";
 
+/// The reminder along the bottom edge as a run of words: each hint a key in the accent
+/// and what it does in dim, which is what lets the eye pick the keys out of the line
+/// without a separator between every pair. One walk over the table makes both the line
+/// and the boxes, so a hint unbound by the config leaves neither a gap in the line nor
+/// a box over nothing.
+fn footer(app: &App) -> Run {
+    let theme = &app.theme;
+    let mut run: Run = vec![(None, vec![theme.text(" ")])];
+    for (commands, what, click) in FOOTER {
+        let key = one_key(&app.keys, commands, "/");
+        if key.is_empty() {
+            continue;
+        }
+        if run.len() > 1 {
+            run.push((None, vec![theme.dim(FOOTER_GAP)]));
+        }
+        run.push((click, vec![theme.title(key), theme.dim(format!(" {what}"))]));
+    }
+    run
+}
+
+/// What the interface is waiting on, if anything, in the words the status line uses
+/// while there is no sentence of its own to show. The columns say `Loading…` where they
+/// are empty, but a column that is being filled again keeps its old rows until the new
+/// ones land, and a page appended to the catalogue happens below the fold - so this is
+/// the one place that is always on screen to say something is on its way.
+fn waiting_on(app: &App) -> Option<&'static str> {
+    if app
+        .picker
+        .as_ref()
+        .is_some_and(|picker| picker.pane.loading)
+    {
+        Some("Loading the list\u{2026}")
+    } else if app.episodes.loading {
+        Some("Loading episodes\u{2026}")
+    } else if app.seasons.loading {
+        Some("Loading seasons\u{2026}")
+    } else if app.paging.asked.is_some_and(|start| start > 0) {
+        Some("Loading more of the catalogue\u{2026}")
+    } else if app.series.loading || app.paging.asked.is_some() {
+        Some("Loading the catalogue\u{2026}")
+    } else {
+        None
+    }
+}
+
+/// The status line: the last thing the interface had to say, with a mark in front
+/// saying what kind of thing it was - a cross for a failure, a spinner while something
+/// is on its way, a check otherwise.
+fn status_line(app: &App) -> Line<'static> {
+    let theme = &app.theme;
+    let waiting = waiting_on(app);
+    let icon = if waiting.is_some() {
+        theme.accent(SPINNER[app.tick % SPINNER.len()])
+    } else {
+        theme.accent("\u{2713}")
+    };
+    let spans = match (&app.notice, waiting) {
+        (Some(notice), _) if notice.error => {
+            vec![theme.error(" \u{2717} "), theme.error(notice.text.clone())]
+        }
+        (Some(notice), _) => vec![
+            theme.text(" "),
+            icon,
+            theme.text(format!(" {}", notice.text)),
+        ],
+        (None, Some(what)) => vec![theme.text(" "), icon, theme.dim(format!(" {what}"))],
+        (None, None) => vec![theme.dim(" \u{2713} Ready.")],
+    };
+    Line::from(spans)
+}
+
+/// The right end of the status line: what the user has put in motion, so that a mark
+/// or a queue scrolled out of sight is still counted somewhere. Empty while there is
+/// nothing to count, which is most of the time.
+fn activity(app: &App) -> Line<'static> {
+    let theme = &app.theme;
+    let mut words = Vec::new();
+    if !app.marked.is_empty() {
+        words.push(theme.accent(format!("{MARK} {} marked", app.marked.len())));
+    }
+    let count = |wanted: fn(&State) -> bool| {
+        app.downloads
+            .items
+            .iter()
+            .filter(|download| wanted(&download.state))
+            .count()
+    };
+    let running = count(|state| matches!(state, State::Running));
+    let queued = count(|state| matches!(state, State::Queued));
+    let failed = count(|state| matches!(state, State::Failed(_)));
+    if running > 0 {
+        words.push(theme.accent(format!("\u{21e3} {running} downloading")));
+    }
+    if queued > 0 {
+        words.push(theme.dim(format!("{queued} queued")));
+    }
+    if failed > 0 {
+        words.push(theme.error(format!("{failed} failed")));
+    }
+    let mut spans = Vec::new();
+    for (index, word) in words.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(theme.dim(DOT));
+        }
+        spans.push(word);
+    }
+    if !spans.is_empty() {
+        spans.push(theme.text(" "));
+    }
+    Line::from(spans)
+}
+
 /// Every key the commands answer to: `↑ k / ↓ j`. A command that has been unbound
 /// contributes nothing rather than a gap.
 fn every_key(keys: &Bindings, commands: &[Command], separator: &str) -> String {
@@ -1323,44 +1436,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
     }
 
-    let line = match &app.notice {
-        Some(notice) if notice.error => Line::from(theme.error(format!(" {}", notice.text))),
-        Some(notice) => Line::from(theme.text(format!(" {}", notice.text))),
-        None => Line::from(theme.dim(" Ready.")),
-    };
-    frame.render_widget(Paragraph::new(line), status);
+    // The counts along the right take what they need and the sentence gets the rest,
+    // so a long notice runs into the edge of its own half rather than over the counts.
+    let counts = activity(app);
+    let [said, counted] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(u16::try_from(counts.width()).unwrap_or(u16::MAX)),
+    ])
+    .areas(status);
+    frame.render_widget(Paragraph::new(status_line(app)), said);
+    frame.render_widget(Paragraph::new(counts), counted);
 
-    // One walk over the table: the words that are drawn and the boxes that are clicked
-    // come out of the same list, so a hint unbound by the config leaves neither a gap in
-    // the line nor a box over nothing.
-    let hints: Vec<(Option<Command>, String)> = FOOTER
-        .iter()
-        .map(|(commands, what, click)| {
-            (
-                *click,
-                format!("{} {what}", one_key(&app.keys, commands, "/")),
-            )
-        })
-        .filter(|(_, hint)| !hint.starts_with(' '))
-        .collect();
-    let reminder = hints
-        .iter()
-        .map(|(_, hint)| hint.as_str())
-        .collect::<Vec<_>>()
-        .join(FOOTER_GAP);
-    frame.render_widget(
-        Paragraph::new(Line::from(theme.dim(format!(" {reminder}")))),
-        keys,
-    );
-    let mut words: Vec<(Option<Command>, u16)> = Vec::new();
-    for (command, hint) in &hints {
-        if !words.is_empty() {
-            words.push((None, cells(&[Span::raw(FOOTER_GAP)])));
-        }
-        words.push((*command, cells(&[Span::raw(hint.clone())])));
-    }
-    // The line is drawn one column in, which is where the run of words starts.
-    buttons.extend(mouse::lay_out(keys, keys.x.saturating_add(1), &words));
+    let reminder = footer(app);
+    frame.render_widget(Paragraph::new(line(&reminder)), keys);
+    buttons.extend(mouse::lay_out(keys, keys.x, &widths(&reminder)));
 
     if app.show_help {
         help_overlay(frame, area, &theme, &app.keys);
@@ -2514,6 +2603,58 @@ mod tests {
         app.series.items[0].series_metadata.is_dubbed = true;
         let screen = rendered(120, 30, &mut app);
         assert!(screen.contains("Frieren  dub \u{b7} simulcast"));
+    }
+
+    /// The status line says what kind of thing it is saying before it says it: a cross
+    /// for a failure, a spinner while something is on its way, a check otherwise - and it
+    /// counts along its right end what the user has set in motion.
+    #[test]
+    fn the_status_line_marks_what_kind_of_news_it_is() {
+        let mut app = app();
+        // The opening list is still out, since nothing here answers it.
+        assert!(
+            rendered(120, 30, &mut app)
+                .contains(&format!(" {} Loading the catalogue\u{2026}", SPINNER[0]))
+        );
+        app.paging.asked = None;
+        assert!(rendered(120, 30, &mut app).contains(" \u{2713} Ready."));
+
+        app.series.items.clear();
+        press(&mut app, KeyCode::Char('w'));
+        assert!(rendered(120, 30, &mut app).contains(" \u{2717} Pick a series first."));
+
+        app.notice = None;
+        app.episodes.loading = true;
+        assert!(
+            rendered(120, 30, &mut app)
+                .contains(&format!(" {} Loading episodes\u{2026}", SPINNER[0]))
+        );
+        app.episodes.loading = false;
+
+        let mut app = self::app();
+        app.marked.insert("E1".to_owned());
+        with_downloads(&mut app, 3);
+        app.downloads.items[0].state = State::Running;
+        app.downloads.items[2].state = State::Failed("no".to_owned());
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains(&format!(
+                "{MARK} 1 marked \u{b7} \u{21e3} 1 downloading \u{b7} 1 queued \u{b7} 1 failed"
+            )),
+            "the status line kept count of nothing"
+        );
+    }
+
+    /// Each hint along the bottom is a key in the accent and what it does in dim, which is
+    /// what picks the keys out of the line.
+    #[test]
+    fn the_footer_sets_the_keys_apart_from_their_words() {
+        let mut app = app();
+        let drawn = buffer(120, 30, &mut app);
+        let quit = button(&app, Command::Quit);
+        assert_eq!(drawn[(quit.x, quit.y)].symbol(), "q");
+        assert_eq!(drawn[(quit.x, quit.y)].fg, Color::Yellow);
+        assert_eq!(drawn[(quit.x + 2, quit.y)].fg, Color::DarkGray);
     }
 
     /// The panel is a card named after what it describes, and for an episode it says in
