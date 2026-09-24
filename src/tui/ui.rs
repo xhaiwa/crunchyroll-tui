@@ -122,26 +122,38 @@ fn pane_block(theme: &Theme, title: &str, focused: bool) -> Block<'static> {
 /// waiting for an answer.
 ///
 /// The waiting and the idle sentence sit in the middle of the column, where they read as
-/// something the column is saying rather than as a row of it; a failure keeps to the
-/// left, because it is often longer than the column is wide and a centred line cut off
-/// at both ends would lose the start of it, which is where the reason usually is.
+/// something the column is saying rather than as a row of it - but only where they fit.
+/// A centred line wider than its column is cut off at both ends, and loses its start,
+/// which is the part that says what the sentence is about; so one that does not fit
+/// keeps to the left, and a failure always does, being usually the longest of the three.
+///
+/// `area` is the column's whole box: the border and the gutter the cursor is drawn in
+/// come off it here, since the list reserves that gutter on every row, this one too.
 fn placeholder(
     theme: &Theme,
     loading: bool,
     error: Option<&String>,
     idle: &str,
     tick: usize,
+    area: Rect,
 ) -> Vec<ListItem<'static>> {
+    let room = usize::from(area.width.saturating_sub(4));
+    let centred = |line: Line<'static>| {
+        if line.width() <= room {
+            line.centered()
+        } else {
+            line
+        }
+    };
     let line = if loading {
-        Line::from(vec![
+        centred(Line::from(vec![
             theme.accent(SPINNER[tick % SPINNER.len()]),
             theme.dim(" Loading\u{2026}"),
-        ])
-        .centered()
+        ]))
     } else if let Some(error) = error {
         Line::from(vec![theme.error("\u{2717} "), theme.error(error.clone())])
     } else {
-        Line::from(theme.dim(idle.to_owned())).centered()
+        centred(Line::from(theme.dim(idle.to_owned())))
     };
     vec![ListItem::new(line)]
 }
@@ -1434,12 +1446,31 @@ fn help_overlay(frame: &mut Frame, area: Rect, theme: &Theme, keys: &Bindings, s
         wanted.saturating_add(3),
     );
     let most = wanted.saturating_sub(popup.height.saturating_sub(3));
-    let hint = if most > 0 {
-        let arrows = one_key(keys, &[Command::Up, Command::Down], "/");
-        format!(" {arrows} scroll \u{b7} any other key closes this ")
-    } else {
-        " any key closes this ".to_owned()
+    // Cut down to what the bottom edge has room for, rather than cut off by it: the
+    // edge would keep the end of the line, and the end is the half that matters least -
+    // the scroll keys at the start are the only way to the lines below the edge.
+    let fits = |hint: &String| {
+        Span::raw(hint.as_str()).width() <= usize::from(popup.width.saturating_sub(2))
     };
+    let hints = if most > 0 {
+        let arrows = one_key(keys, &[Command::Up, Command::Down], "/");
+        vec![
+            format!(" {arrows} scroll \u{b7} any other key closes this "),
+            format!(" {arrows} scroll \u{b7} other keys close "),
+            format!(" {arrows} scroll "),
+        ]
+    } else {
+        vec![
+            " any key closes this ".to_owned(),
+            " any key closes ".to_owned(),
+        ]
+    };
+    let hint = hints
+        .iter()
+        .find(|hint| fits(hint))
+        .or(hints.last())
+        .cloned()
+        .unwrap_or_default();
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).scroll((scroll.min(most), 0)).block(
@@ -1468,9 +1499,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         16..=21 => 5,
         22..=27 => 7,
         // Two more rows once there is a still to put in the panel: seven rows of picture
-        // is about as small as a sixteen-by-nine frame gets and stays a picture.
-        _ if art => 9,
+        // is about as small as a sixteen-by-nine frame gets and stays a picture. Only in
+        // the columns, though - the still belongs to the episodes, which the wall never
+        // shows, and two blank rows in the card there would cost it a row of covers.
+        _ if art && app.view == View::Columns => 9,
         _ => 7,
+    };
+    // Nor is the card worth the wall's only row of covers. On a short terminal the five
+    // rows it takes are the difference between tiles with a picture in them and boxes
+    // holding nothing but their captions, and the tile already says what the card would.
+    let details_height = if app.view == View::Covers
+        && area.height.saturating_sub(5 + details_height) < grid::TILE_SHORTEST + 2
+    {
+        0
+    } else {
+        details_height
     };
     let [top, body, bottom, status, keys] = Layout::vertical([
         Constraint::Length(3),
@@ -1577,6 +1620,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.series.error.as_ref(),
             &nothing_shown(&app.series, "Nothing here."),
             tick,
+            left,
         )
     } else {
         shown
@@ -1604,6 +1648,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.seasons.error.as_ref(),
             &nothing_shown(&app.seasons, "Pick a series on the left."),
             tick,
+            middle,
         )
     } else {
         let series_title = app
@@ -1635,6 +1680,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.episodes.error.as_ref(),
             &nothing_shown(&app.episodes, "Pick a season to list its episodes."),
             tick,
+            right,
         )
     } else {
         let marked: Vec<bool> = shown
@@ -1704,6 +1750,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 None,
                 &nothing_shown(&app.downloads, "Nothing queued."),
                 tick,
+                queue_area,
             )
         } else {
             shown
@@ -4209,5 +4256,148 @@ mod tests {
             Focus::Series,
             "the click that cancelled the list went through to a column as well"
         );
+    }
+
+    /// The wall of covers with one episode on the queue under it, queued from the
+    /// columns before the wall went up.
+    fn wall_over_a_queue() -> App {
+        let mut app = app();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.downloads.items.len(), 1);
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!((app.view, app.focus), (View::Covers, Focus::Series));
+        app
+    }
+
+    /// Above the queue on the wall is the wall. The episodes are still held from the
+    /// columns, but not drawn, and a keyboard left in them would play what nobody can
+    /// see - whichever way out of the queue was taken.
+    #[test]
+    fn backing_out_of_the_queue_under_the_wall_goes_back_to_the_wall() {
+        let mut app = wall_over_a_queue();
+        for leave in [KeyCode::Esc, KeyCode::Left, KeyCode::Char('h')] {
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.focus, Focus::Downloads);
+            press(&mut app, leave);
+            assert_eq!(app.focus, Focus::Series, "{leave:?} left the wall behind");
+            assert_eq!(app.view, View::Covers);
+        }
+
+        // The right button on the queue is the same `back`.
+        press(&mut app, KeyCode::Tab);
+        let _ = buffer(100, 30, &mut app);
+        let (x, y) = middle(app.regions.downloads);
+        app.on_mouse(pointer(MouseEventKind::Down(MouseButton::Right), x, y));
+        assert_eq!(app.focus, Focus::Series);
+        let screen = rendered(100, 30, &mut app);
+        assert!(
+            !screen.contains(" play "),
+            "the footer offers to play: {screen}"
+        );
+    }
+
+    /// With nothing queued there is no panel under the wall, so `tab` has nowhere to go.
+    #[test]
+    fn tab_stays_on_the_wall_while_nothing_is_queued() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Series);
+
+        // And dropping the last row of a queue takes the keyboard back up to the covers.
+        let mut app = wall_over_a_queue();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.downloads.items.is_empty());
+        assert_eq!(app.focus, Focus::Series);
+    }
+
+    /// The keys about an episode wait for one to be opened. The episodes held behind the
+    /// wall are from the last series opened, which need not be the cover the cursor is
+    /// on, and nothing of them is on screen.
+    #[test]
+    fn the_episode_keys_do_nothing_on_the_wall() {
+        let mut app = wall_over_a_queue();
+        for key in ['p', 'P', 'd', 'D', 'm', 'M', ' '] {
+            assert!(
+                matches!(app.on_key(KeyEvent::from(KeyCode::Char(key))), Action::None),
+                "{key} acted on a hidden episode"
+            );
+            assert!(
+                app.notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.text.contains("Open a cover")),
+                "{key} said nothing"
+            );
+        }
+        assert_eq!(app.downloads.items.len(), 1, "something else was queued");
+        assert!(
+            app.sent()
+                .iter()
+                .all(|request| !matches!(request, Request::Playhead { .. }))
+        );
+        // The queue under the wall is no way round it either.
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            app.on_key(KeyEvent::from(KeyCode::Char('p'))),
+            Action::None
+        ));
+    }
+
+    /// An empty column's sentence is centred only where it fits. At eighty columns the
+    /// Seasons and Episodes columns are narrower than theirs, and a centred line cut at
+    /// both ends would lose the words that say what it is about.
+    #[test]
+    fn an_empty_column_keeps_the_start_of_what_it_says() {
+        let mut app = app();
+        app.seasons.clear();
+        app.episodes.clear();
+        let screen = rendered(80, 24, &mut app);
+        assert!(screen.contains("Pick a series"), "{screen}");
+        assert!(screen.contains("Pick a season"), "{screen}");
+        // Where there is room it still sits in the middle.
+        let screen = rendered(200, 30, &mut app);
+        assert!(screen.contains("  Pick a season to list its episodes.  "));
+    }
+
+    /// The details card only grows for the episode still, which the wall never draws;
+    /// with the artwork on, the wall gets the same room for covers as with it off.
+    #[test]
+    fn the_wall_gets_no_room_taken_for_a_still() {
+        let mut plain = app();
+        let mut art = illustrated();
+        for app in [&mut plain, &mut art] {
+            press(app, KeyCode::Char('t'));
+            let _ = buffer(100, 38, app);
+        }
+        assert_eq!(art.grid.rows, plain.grid.rows);
+        assert_eq!(
+            art.regions.tiles[0].1.height,
+            plain.regions.tiles[0].1.height
+        );
+    }
+
+    /// On a short terminal the wall keeps its pictures rather than the details card:
+    /// sixteen rows is enough for a tile with a poster in it, or for the card, not both.
+    #[test]
+    fn a_short_wall_keeps_its_pictures() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('t'));
+        let _ = buffer(60, 16, &mut app);
+        let tile = app.regions.tiles[0].1;
+        assert!(tile.height >= crate::tui::grid::TILE_SHORTEST, "{tile:?}");
+    }
+
+    /// A help popup too narrow for its whole hint keeps the part that matters, the keys
+    /// that scroll it, rather than letting the edge cut them off.
+    #[test]
+    fn a_narrow_help_popup_keeps_its_scroll_keys() {
+        let mut app = app();
+        app.show_help = true;
+        let screen = rendered(40, 12, &mut app);
+        assert!(app.help_room > 0);
+        assert!(screen.contains("\u{2191}/\u{2193} scroll"), "{screen}");
     }
 }

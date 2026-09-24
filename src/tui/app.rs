@@ -646,7 +646,9 @@ pub struct App {
     pub grid: Shape,
     /// Whether the columns were reached by opening a cover, so that backing out of the
     /// seasons goes back to the wall rather than to a Series column the user never
-    /// chose to look at.
+    /// chose to look at. Only while that is still what happened: the moment the user
+    /// goes to the Series column of their own accord - tab, a click, another series
+    /// opened, a new list asked for - the columns are theirs, and `back` keeps to them.
     back_to_covers: bool,
     pub series: Pane<CatalogItem>,
     pub seasons: Pane<Season>,
@@ -941,6 +943,7 @@ impl App {
         self.clear_episodes();
         self.paging = Paging::first();
         self.focus = Focus::Series;
+        self.back_to_covers = false;
         self.request_catalog_page(0);
     }
 
@@ -1605,10 +1608,12 @@ impl App {
                 // columns take over, since the seasons and the episodes are lists and
                 // the wall has nowhere to put them. Only if it opened: a row nothing
                 // knows how to open leaves the focus where it was and says so, and the
-                // wall should still be there to say it over.
-                if self.view == View::Covers && self.focus != Focus::Series {
+                // wall should still be there to say it over. A series opened from the
+                // Series column, on the other hand, was chosen in the columns, and
+                // backing out of it has no wall to go back to.
+                self.back_to_covers = self.view == View::Covers && self.focus != Focus::Series;
+                if self.back_to_covers {
                     self.view = View::Columns;
-                    self.back_to_covers = true;
                 }
                 Action::None
             }
@@ -1630,6 +1635,11 @@ impl App {
 
     fn ascend(&mut self) {
         match self.focus {
+            // Above the queue is whatever is drawn above it: the episodes in the
+            // columns, and on the wall the wall itself. The episodes are still held
+            // while the wall is up, but nowhere on screen, and a cursor put into them
+            // would have `p` playing an episode nobody can see.
+            Focus::Downloads if self.view == View::Covers => self.focus = Focus::Series,
             Focus::Downloads => self.focus = Focus::Episodes,
             Focus::Episodes => self.focus = Focus::Seasons,
             Focus::Seasons => {
@@ -1924,6 +1934,12 @@ impl App {
         self.downloads
             .state
             .select((left > 0).then(|| row.min(left - 1)));
+        // Under the wall an empty queue is not drawn at all, so the last row going takes
+        // the keyboard back up to the covers rather than leaving it in a panel that has
+        // just left the screen.
+        if self.downloads.items.is_empty() && self.view == View::Covers {
+            self.focus = Focus::Series;
+        }
     }
 
     /// The locales worth offering for the current selection, most specific first: what
@@ -2448,9 +2464,12 @@ impl App {
             Command::Back | Command::Left => self.ascend(),
             // The wall has no seasons or episodes beside it to cycle through, so the key
             // goes between it and the queue - the other thing on screen with a cursor.
+            // An empty queue is not drawn under the wall, so there the key has nowhere
+            // to go and stays where it is rather than hiding the keyboard in a panel
+            // that is not on screen.
             Command::NextColumn if self.view == View::Covers => {
                 self.focus = match self.focus {
-                    Focus::Series => Focus::Downloads,
+                    Focus::Series if !self.downloads.items.is_empty() => Focus::Downloads,
                     _ => Focus::Series,
                 }
             }
@@ -2459,10 +2478,28 @@ impl App {
                     Focus::Series => Focus::Seasons,
                     Focus::Seasons => Focus::Episodes,
                     Focus::Episodes => Focus::Downloads,
-                    Focus::Downloads => Focus::Series,
+                    Focus::Downloads => {
+                        self.back_to_covers = false;
+                        Focus::Series
+                    }
                 }
             }
             Command::View => self.switch_view(),
+            // The episodes are the columns' and are not drawn beside the wall. They are
+            // still held, from whichever series was opened last - which is not
+            // necessarily the cover the cursor is on - so a key that played or queued
+            // one of them from here would be acting on something off the screen.
+            Command::Play
+            | Command::PlayRest
+            | Command::Mark
+            | Command::Download
+            | Command::DownloadSeason
+            | Command::MarkWatched
+            | Command::MarkUnwatched
+                if self.view == View::Covers =>
+            {
+                self.complain("Open a cover to pick an episode first.");
+            }
             Command::Play => return self.play(false),
             Command::PlayRest => return self.play(true),
             Command::Mark => self.toggle_mark(),
@@ -2567,6 +2604,9 @@ impl App {
             Target::Column(focus) => {
                 let working_there = self.focus == focus;
                 self.focus = focus;
+                if focus == Focus::Series {
+                    self.back_to_covers = false;
+                }
                 let Some(index) = self.row_at(focus, at.y) else {
                     return Action::None;
                 };

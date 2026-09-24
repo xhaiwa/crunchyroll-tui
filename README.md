@@ -776,6 +776,13 @@ and `↓` no longer move down, and `down = ["e", "down"]` keeps the arrow - and 
 taken off whatever else was holding it, so a whole layout can be moved across without
 unbinding the old one first. An empty list, `images = []`, turns a command off.
 
+The arrows and `h` `l` used to be written under `open` and `back`, and older copies of the
+example config still say `open = ["enter", "right", "l"]`. They belong to `left` and `right`
+now, which do the same thing in the columns and move between covers on the wall. A file that
+gives one of those keys to `open` or `back` without naming `left` or `right` has it moved
+across, and the status line says so; write it under `left` or `right` to
+silence it.
+
 The commands, and the keys they answer to out of the box:
 
 | Command | Default | What it does |

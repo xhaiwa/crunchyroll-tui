@@ -127,8 +127,10 @@ pub fn tile_height(width: u16, cell: Size) -> u16 {
 }
 
 /// The shortest a tile is squeezed to so that another row fits: the border, the caption
-/// and three rows of picture, below which the picture is not worth drawing.
-const TILE_SHORTEST: u16 = CAPTION + 2 + 3;
+/// and three rows of picture, below which the picture is not worth drawing. The frame
+/// reads it as well, to leave out the details card where keeping it would leave the
+/// wall shorter than this.
+pub const TILE_SHORTEST: u16 = CAPTION + 2 + 3;
 
 /// How many rows of tiles `room` lines hold, and how tall each one is, for tiles that
 /// would be `natural` lines tall given the space.
@@ -139,7 +141,10 @@ const TILE_SHORTEST: u16 = CAPTION + 2 + 3;
 /// tiles a little instead costs each poster a column either side, since a picture keeps
 /// its own shape and sits in the middle of its tile. A tile is never stretched past its
 /// natural height, though - a screen with room for a row and a quarter shows one row -
-/// and never squeezed below [`TILE_SHORTEST`].
+/// and never squeezed below [`TILE_SHORTEST`] to make room for another row. Room for
+/// less than one such tile still gets one, as tall as the room is, which may leave no
+/// picture in it at all: better a caption than an empty wall. The frame sees to it that
+/// this only happens on a terminal too short for anything else.
 pub fn stack(room: u16, natural: u16) -> (usize, u16) {
     if room == 0 || natural == 0 {
         return (0, 0);
@@ -960,6 +965,46 @@ mod drawn {
 
         // Arrived at by `t` rather than by a cover, the columns keep their own back.
         press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Columns);
+    }
+
+    /// A cover opened and then left for the Series column is the columns being used on
+    /// their own terms: `back` out of what is opened next stays in them, rather than
+    /// jumping to a wall the user left some time ago.
+    #[test]
+    fn back_only_returns_to_the_wall_from_the_cover_that_was_opened() {
+        // Opened another series from the Series column.
+        let mut app = wall(8, Gallery::detached(false));
+        let _ = buffer(120, 40, &mut app);
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(app.focus, Focus::Series);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.view, app.focus), (View::Columns, Focus::Series));
+
+        // Tabbed round to the Series column and back to the seasons of the same one.
+        let mut app = wall(8, Gallery::detached(false));
+        let _ = buffer(120, 40, &mut app);
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(app.focus, Focus::Seasons);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Columns);
+
+        // A new list asked for in the columns.
+        let mut app = wall(8, Gallery::detached(false));
+        let _ = buffer(120, 40, &mut app);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('o'));
+        app.series.set((0..8).map(item).collect());
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, View::Columns);

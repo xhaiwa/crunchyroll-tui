@@ -11,8 +11,8 @@
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -45,6 +45,12 @@ const DECODED_CACHE: usize = 96;
 /// wall of covers is one of these, so this has to hold a screenful of them as well, or
 /// each frame would re-encode the tiles the last frame pushed out.
 const ENCODED_CACHE: usize = 96;
+
+/// How many pictures may wait for a fetcher. Scrolling a long wall asks for every
+/// screenful it passes, and without a limit the screen it stops on would wait behind all
+/// of them. The oldest are let go past this - they were on a screen that has gone by -
+/// and asked for again should they come back into view.
+const WAITING: usize = 64;
 
 /// Whether the artwork is drawn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
@@ -110,6 +116,60 @@ impl<K: Clone + Eq + Hash, V> Ring<K, V> {
     }
 }
 
+/// The pictures waiting for a fetcher, oldest first, and who is there to fetch them.
+///
+/// A stack rather than a queue: the newest request is for whatever is on screen now, and
+/// that is the one worth having first. A channel would serve them in the order they were
+/// asked for, which after a fast scroll is the order of screens nobody is looking at any
+/// more.
+#[derive(Default)]
+struct Waiting {
+    urls: VecDeque<String>,
+    /// How many fetchers are still running. None at all - a test's gallery, or every
+    /// thread having failed to start - means nothing asked for will ever arrive.
+    fetchers: usize,
+    /// Set as the gallery goes, so the fetchers stop waiting for work.
+    closed: bool,
+}
+
+impl Waiting {
+    /// Adds `url` on top, and hands back whatever fell off the bottom to make room.
+    fn push(&mut self, url: String) -> Vec<String> {
+        self.urls.push_back(url);
+        let over = self.urls.len().saturating_sub(WAITING);
+        self.urls.drain(..over).collect()
+    }
+
+    /// The newest request.
+    fn pop(&mut self) -> Option<String> {
+        self.urls.pop_back()
+    }
+}
+
+/// The waiting pictures, and the bell a fetcher sleeps on until there are some.
+#[derive(Default)]
+struct Wants {
+    waiting: Mutex<Waiting>,
+    ready: Condvar,
+}
+
+impl Wants {
+    /// The next picture to fetch, waiting for one if there is none; `None` once the
+    /// gallery has gone.
+    fn next(&self) -> Option<String> {
+        let mut waiting = self.waiting.lock().expect("artwork queue poisoned");
+        loop {
+            if waiting.closed {
+                return None;
+            }
+            if let Some(url) = waiting.pop() {
+                return Some(url);
+            }
+            waiting = self.ready.wait(waiting).expect("artwork queue poisoned");
+        }
+    }
+}
+
 /// A decoded image, or the knowledge that this URL will never produce one. A failure is
 /// worth remembering: without it the same broken poster is fetched again on every frame
 /// the cursor rests on it.
@@ -119,7 +179,7 @@ type Decoded = Option<DynamicImage>;
 pub struct Gallery {
     picker: Picker,
     enabled: bool,
-    wanted: Sender<String>,
+    wants: Arc<Wants>,
     arrived: Receiver<(String, Decoded)>,
     decoded: Ring<String, Decoded>,
     encoded: Ring<(String, u16, u16), Option<Protocol>>,
@@ -143,33 +203,32 @@ impl Gallery {
             Setting::Off => false,
         };
 
-        let (wanted, inbox) = channel::<String>();
+        let wants = Arc::new(Wants::default());
         let (outbox, arrived) = channel::<(String, Decoded)>();
-        let inbox = Arc::new(Mutex::new(inbox));
-        // Threads end when the gallery drops its end of the channel, and a fetch still in
-        // flight then finishes into a closed channel rather than holding up the quit.
+        wants
+            .waiting
+            .lock()
+            .expect("artwork queue poisoned")
+            .fetchers = FETCHERS;
+        // Threads end when the gallery closes the queue on its way out, and a fetch still
+        // in flight then finishes into a closed channel rather than holding up the quit.
         for _ in 0..FETCHERS {
-            let inbox = Arc::clone(&inbox);
+            let wants = Arc::clone(&wants);
             let outbox = outbox.clone();
             thread::spawn(move || {
-                let Ok(client) = reqwest::blocking::Client::builder()
+                if let Ok(client) = reqwest::blocking::Client::builder()
                     .timeout(FETCH_TIMEOUT)
                     .build()
-                else {
-                    return;
-                };
-                loop {
-                    let url = {
-                        let inbox = inbox.lock().expect("artwork inbox poisoned");
-                        match inbox.recv() {
-                            Ok(url) => url,
-                            Err(_) => break,
+                {
+                    while let Some(url) = wants.next() {
+                        let picture = fetch(&client, &url);
+                        if outbox.send((url, picture)).is_err() {
+                            break;
                         }
-                    };
-                    let picture = fetch(&client, &url);
-                    if outbox.send((url, picture)).is_err() {
-                        break;
                     }
+                }
+                if let Ok(mut waiting) = wants.waiting.lock() {
+                    waiting.fetchers = waiting.fetchers.saturating_sub(1);
                 }
             });
         }
@@ -177,7 +236,7 @@ impl Gallery {
         Self {
             picker,
             enabled,
-            wanted,
+            wants,
             arrived,
             decoded: Ring::new(DECODED_CACHE),
             encoded: Ring::new(ENCODED_CACHE),
@@ -190,12 +249,11 @@ impl Gallery {
     /// whatever is running the suite and then wait for an answer nobody is going to give.
     #[cfg(test)]
     pub fn detached(enabled: bool) -> Self {
-        let (wanted, _) = channel::<String>();
         let (_, arrived) = channel::<(String, Decoded)>();
         Self {
             picker: Picker::halfblocks(),
             enabled,
-            wanted,
+            wants: Arc::new(Wants::default()),
             arrived,
             decoded: Ring::new(DECODED_CACHE),
             encoded: Ring::new(ENCODED_CACHE),
@@ -304,12 +362,31 @@ impl Gallery {
         if self.asked.contains(url) {
             return;
         }
-        self.asked.insert(url.to_owned());
-        if self.wanted.send(url.to_owned()).is_err() {
+        let mut waiting = self.wants.waiting.lock().expect("artwork queue poisoned");
+        if waiting.fetchers == 0 {
             // Every fetcher is gone, so nothing will ever arrive. Mark the URL as
             // hopeless rather than queueing for a thread that is not there.
+            drop(waiting);
             self.decoded.insert(url.to_owned(), None);
+            return;
         }
+        self.asked.insert(url.to_owned());
+        // Whatever was pushed out is no longer being fetched, so it has to be free to be
+        // asked for again the next time it is drawn.
+        for stale in waiting.push(url.to_owned()) {
+            self.asked.remove(&stale);
+        }
+        drop(waiting);
+        self.wants.ready.notify_one();
+    }
+}
+
+impl Drop for Gallery {
+    fn drop(&mut self) {
+        if let Ok(mut waiting) = self.wants.waiting.lock() {
+            waiting.closed = true;
+        }
+        self.wants.ready.notify_all();
     }
 }
 
@@ -343,7 +420,7 @@ fn fetch(client: &reqwest::blocking::Client, url: &str) -> Decoded {
 mod tests {
     use ratatui::layout::{Rect, Size};
 
-    use super::{Ring, centre};
+    use super::{Ring, WAITING, Waiting, centre};
 
     #[test]
     fn a_ring_forgets_its_oldest_entry() {
@@ -359,6 +436,27 @@ mod tests {
         ring.insert(2, "B");
         assert_eq!(ring.get(&2), Some(&"B"));
         assert_eq!(ring.get(&3), Some(&"c"));
+    }
+
+    /// The picture asked for last is fetched first, and a long scroll lets go of the
+    /// screens it passed rather than making the one it stopped on wait behind them.
+    #[test]
+    fn the_newest_picture_is_fetched_first_and_the_oldest_let_go() {
+        let mut waiting = Waiting::default();
+        let mut let_go = Vec::new();
+        for index in 0..WAITING + 3 {
+            let_go.extend(waiting.push(format!("poster {index}")));
+        }
+        assert_eq!(let_go, ["poster 0", "poster 1", "poster 2"]);
+        assert_eq!(waiting.urls.len(), WAITING);
+        assert_eq!(
+            waiting.pop().as_deref(),
+            Some(format!("poster {}", WAITING + 2).as_str())
+        );
+        assert_eq!(
+            waiting.pop().as_deref(),
+            Some(format!("poster {}", WAITING + 1).as_str())
+        );
     }
 
     #[test]
