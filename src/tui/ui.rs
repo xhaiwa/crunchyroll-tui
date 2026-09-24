@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect, Size};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Wrap};
 
 use crate::download::OnDisk;
 use crate::model::{CatalogItem, Playhead, Season, SeasonEpisode, single_name};
@@ -527,29 +527,50 @@ fn header(app: &App) -> Paragraph<'static> {
     Paragraph::new(line(&listing(app))).block(block)
 }
 
+/// A line of facts held apart by dots: the plain ones in the heading colour, and after
+/// them the ones worth finding first - that a series is simulcasting, where an episode
+/// was left off - in the accent.
+fn facts(theme: &Theme, plain: Vec<String>, loud: Vec<String>) -> Line<'static> {
+    let mut spans = Vec::new();
+    let words = plain
+        .into_iter()
+        .map(|fact| theme.heading(fact))
+        .chain(loud.into_iter().map(|fact| theme.accent(fact)));
+    for (index, word) in words.enumerate() {
+        if index > 0 {
+            spans.push(theme.dim(DOT));
+        }
+        spans.push(word);
+    }
+    Line::from(spans)
+}
+
 /// The panel under the columns: everything about the item the cursor is on that does
-/// not fit on its one line.
-fn details(app: &App) -> Vec<Line<'static>> {
+/// not fit on its one line, as a card - the title in the accent, a line of facts, and
+/// then the description - and what to call the card, which is what it is describing
+/// rather than a word like `Details` that would be true of any of them.
+fn details(app: &App) -> (&'static str, Vec<Line<'static>>) {
     let theme = &app.theme;
     let mut lines = Vec::new();
-    match app.focus {
+    let name = match app.focus {
         Focus::Series | Focus::Seasons => {
             let Some(series) = app.series.selected() else {
-                return lines;
+                return ("Series", lines);
             };
             let metadata = &series.series_metadata;
             // A film keeps the same facts under a name of its own and leaves
             // `series_metadata` empty, so both are read and whichever has something to
             // say fills the line. Nothing has both.
             let film = &series.movie_listing_metadata;
-            lines.push(Line::from(theme.strong(series.title.clone())));
-            let mut facts = Vec::new();
+            lines.push(Line::from(theme.title(series.title.clone())));
+            let mut plain = Vec::new();
+            let mut loud = Vec::new();
             // What it is comes first where it is not a series, because everything after
             // it reads differently for a film - a running time rather than a count of
             // episodes - and this is the one place with room to say which is being
             // described.
             if let Some(word) = single_name(&series.kind) {
-                facts.push(word.to_owned());
+                plain.push(word.to_owned());
             }
             let year = if metadata.series_launch_year > 0 {
                 metadata.series_launch_year
@@ -557,16 +578,19 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 film.movie_release_year
             };
             if year > 0 {
-                facts.push(year.to_string());
+                plain.push(year.to_string());
+            }
+            if metadata.season_count > 1 {
+                plain.push(format!("{} seasons", metadata.season_count));
             }
             if metadata.episode_count > 0 {
-                facts.push(format!("{} episodes", metadata.episode_count));
+                plain.push(format!("{} episodes", metadata.episode_count));
             }
             if film.duration_ms > 0 {
-                facts.push(duration(film.duration_ms));
+                plain.push(duration(film.duration_ms));
             }
             if !metadata.audio_locales.is_empty() {
-                facts.push(format!("{} audio tracks", metadata.audio_locales.len()));
+                plain.push(format!("{} audio tracks", metadata.audio_locales.len()));
             }
             let subtitles = if metadata.subtitle_locales.is_empty() {
                 &film.subtitle_locales
@@ -574,9 +598,9 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 &metadata.subtitle_locales
             };
             if !subtitles.is_empty() {
-                facts.push(format!("{} subtitles", subtitles.len()));
+                plain.push(format!("{} subtitles", subtitles.len()));
             }
-            facts.extend(
+            plain.extend(
                 metadata
                     .maturity_ratings
                     .iter()
@@ -584,17 +608,18 @@ fn details(app: &App) -> Vec<Line<'static>> {
                     .cloned(),
             );
             if metadata.is_simulcast {
-                facts.push("simulcast".to_owned());
+                loud.push("simulcast".to_owned());
             }
-            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            lines.push(facts(theme, plain, loud));
             lines.push(Line::from(theme.text(series.description.clone())));
+            single_name(&series.kind).unwrap_or("Series")
         }
         Focus::Episodes => {
             let Some(episode) = app.episodes.selected() else {
-                return lines;
+                return ("Episode", lines);
             };
-            lines.push(Line::from(theme.strong(episode.title.clone())));
-            let mut facts = vec![single_name(&episode.kind).map_or_else(
+            lines.push(Line::from(theme.title(episode.title.clone())));
+            let mut plain = vec![single_name(&episode.kind).map_or_else(
                 || {
                     format!(
                         "S{}E{}",
@@ -609,34 +634,51 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 str::to_owned,
             )];
             if episode.duration_ms > 0 {
-                facts.push(duration(episode.duration_ms));
+                plain.push(duration(episode.duration_ms));
             }
             if !episode.audio_locale.is_empty() {
-                facts.push(language_name(&episode.audio_locale).to_owned());
+                plain.push(language_name(&episode.audio_locale).to_owned());
             }
             if episode.versions.len() > 1 {
-                facts.push(format!("{} dubs", episode.versions.len()));
+                plain.push(format!("{} dubs", episode.versions.len()));
             }
             if let Some(date) = episode.availability_starts.split('T').next()
                 && !date.is_empty()
             {
-                facts.push(date.to_owned());
+                plain.push(date.to_owned());
             }
-            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            // What the row says in a glyph and a number, said here in words: the row
+            // has four cells for it and the panel has the width of the screen.
+            let mut loud = Vec::new();
+            let playhead = app.playheads.get(&episode.id);
+            if let Some(seconds) = playhead
+                .and_then(|seen| resume_at(seen.playhead, episode.duration_ms, seen.fully_watched))
+            {
+                loud.push(format!("resume at {}", duration(u64::from(seconds) * 1000)));
+            } else if playhead.is_some_and(|seen| seen.fully_watched) {
+                loud.push("watched".to_owned());
+            }
+            match app.downloaded.get(&episode.id) {
+                Some(OnDisk::Complete) => loud.push("on disk".to_owned()),
+                Some(OnDisk::Partial) => loud.push("partly on disk".to_owned()),
+                Some(OnDisk::Missing) | None => {}
+            }
+            lines.push(facts(theme, plain, loud));
             lines.push(Line::from(theme.text(episode.description.clone())));
+            single_name(&episode.kind).unwrap_or("Episode")
         }
         // The panel is one line per episode and a failure is a sentence out of
         // anyhow's chain, so this is the only place with room to say what went wrong.
         Focus::Downloads => {
             let Some(download) = app.downloads.selected() else {
-                return lines;
+                return ("Download", lines);
             };
-            lines.push(Line::from(theme.strong(download.title.clone())));
-            let mut facts = vec![download.number.clone()];
+            lines.push(Line::from(theme.title(download.title.clone())));
+            let mut plain = vec![download.number.clone()];
             if !download.series.is_empty() {
-                facts.push(download.series.clone());
+                plain.push(download.series.clone());
             }
-            lines.push(Line::from(theme.dim(facts.join(" · "))));
+            lines.push(facts(theme, plain, Vec::new()));
             lines.push(Line::from(match &download.state {
                 State::Queued => theme.dim("Waiting for the episode in front of it."),
                 State::Running => match download.stage() {
@@ -646,9 +688,10 @@ fn details(app: &App) -> Vec<Line<'static>> {
                 State::Done => theme.dim("Downloaded."),
                 State::Failed(error) => theme.error(error.clone()),
             }));
+            "Download"
         }
-    }
-    lines
+    };
+    (name, lines)
 }
 
 /// A run of cells turned into the pixels behind it, which is what the CDN is asked for:
@@ -1241,7 +1284,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if details_height > 0 {
-        let block = theme.bordered(false).title(theme.dim(" Details "));
+        let (name, mut lines) = details(app);
+        // A card with nothing under the cursor to describe says so, rather than standing
+        // empty and looking like something failed to arrive.
+        if lines.is_empty() {
+            lines.push(Line::from(theme.dim("Nothing selected yet.")));
+        }
+        // A cell of room either side, so the words sit inside the card rather than
+        // against its edges.
+        let block = theme
+            .bordered(false)
+            .padding(Padding::horizontal(1))
+            .title(theme.heading(format!(" {} {name} ", glyph(name))));
         let inner = block.inner(bottom);
         frame.render_widget(block, bottom);
 
@@ -1261,7 +1315,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .areas(inner);
 
-        let lines = details(app);
         if let Some(url) = still
             && !app.art.draw(frame, still_area, &url)
         {
@@ -2461,6 +2514,43 @@ mod tests {
         app.series.items[0].series_metadata.is_dubbed = true;
         let screen = rendered(120, 30, &mut app);
         assert!(screen.contains("Frieren  dub \u{b7} simulcast"));
+    }
+
+    /// The panel is a card named after what it describes, and for an episode it says in
+    /// words what the row can only say in a glyph and four cells: where it was left off
+    /// and whether it is on the disk.
+    #[test]
+    fn the_details_card_is_named_after_what_it_describes() {
+        let mut app = app();
+        app.focus = Focus::Episodes;
+        app.playheads = [("E1".to_owned(), playhead("E1", 842, false))]
+            .into_iter()
+            .collect();
+        app.downloaded = [("E1".to_owned(), OnDisk::Complete)].into_iter().collect();
+        let screen = rendered(120, 30, &mut app);
+        assert!(
+            screen.contains("\u{25b8} Episode "),
+            "the card is not named"
+        );
+        assert!(
+            screen.contains("S1E1 \u{b7} 24:21 \u{b7} resume at 14:02 \u{b7} on disk"),
+            "the card kept the row's glyphs to itself"
+        );
+
+        app.playheads = [("E1".to_owned(), playhead("E1", 1_461, true))]
+            .into_iter()
+            .collect();
+        app.downloaded.clear();
+        assert!(rendered(120, 30, &mut app).contains("S1E1 \u{b7} 24:21 \u{b7} watched"));
+
+        with_downloads(&mut app, 1);
+        app.focus = Focus::Downloads;
+        assert!(rendered(120, 30, &mut app).contains("\u{21e3} Download "));
+
+        // And a card with nothing to describe says so rather than standing empty.
+        app.series.clear();
+        app.focus = Focus::Series;
+        assert!(rendered(120, 30, &mut app).contains("Nothing selected yet."));
     }
 
     /// A mark is a decision the user made about a row, so it has to be visible on that
