@@ -119,6 +119,11 @@ fn pane_block(theme: &Theme, title: &str, focused: bool) -> Block<'static> {
 
 /// What a column shows when it holds nothing: why it is empty, or that it is still
 /// waiting for an answer.
+///
+/// The waiting and the idle sentence sit in the middle of the column, where they read as
+/// something the column is saying rather than as a row of it; a failure keeps to the
+/// left, because it is often longer than the column is wide and a centred line cut off
+/// at both ends would lose the start of it, which is where the reason usually is.
 fn placeholder(
     theme: &Theme,
     loading: bool,
@@ -129,36 +134,56 @@ fn placeholder(
     let line = if loading {
         Line::from(vec![
             theme.accent(SPINNER[tick % SPINNER.len()]),
-            theme.text(" Loading..."),
+            theme.dim(" Loading\u{2026}"),
         ])
+        .centered()
     } else if let Some(error) = error {
-        Line::from(theme.error(error.clone()))
+        Line::from(vec![theme.error("\u{2717} "), theme.error(error.clone())])
     } else {
-        Line::from(theme.dim(idle.to_owned()))
+        Line::from(theme.dim(idle.to_owned())).centered()
     };
     vec![ListItem::new(line)]
+}
+
+/// The little words after a title, held apart by a dot. `(true, ..)` is a word that
+/// stands out - what kind of thing a row is where it is not a series, or that it is
+/// simulcasting - and is drawn in the accent; the rest are dim.
+fn tags(theme: &Theme, tags: Vec<(bool, String)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, (loud, word)) in tags.into_iter().enumerate() {
+        spans.push(theme.dim(if index == 0 { "  " } else { DOT }));
+        spans.push(if loud {
+            theme.accent(word)
+        } else {
+            theme.dim(word)
+        });
+    }
+    spans
 }
 
 fn series_row(theme: &Theme, series: &CatalogItem) -> ListItem<'static> {
     let metadata = &series.series_metadata;
     let film = &series.movie_listing_metadata;
-    let mut tags = Vec::new();
+    let mut words = Vec::new();
     // What it is, where it is not a series. `2 seasons` is a thing to say about a series
     // and nothing to say about a film, and the catalogue now mixes the two: a row that
     // said neither would leave the column looking like a list of series with some odd
     // short ones in it.
     if let Some(word) = single_name(&series.kind) {
-        tags.push(word.to_lowercase());
+        words.push((true, word.to_lowercase()));
     } else if metadata.season_count > 1 {
-        tags.push(format!("{} seasons", metadata.season_count));
+        words.push((false, format!("{} seasons", metadata.season_count)));
     }
     if metadata.is_dubbed || film.is_dubbed {
-        tags.push("dub".to_owned());
+        words.push((false, "dub".to_owned()));
     }
-    let mut spans = vec![theme.text(series.title.clone())];
-    if !tags.is_empty() {
-        spans.push(theme.dim(format!("  {}", tags.join(" · "))));
+    // New episodes every week is the one thing about a series that changes what
+    // somebody does next, so it is worth a word in the row rather than only in the panel.
+    if metadata.is_simulcast {
+        words.push((true, "simulcast".to_owned()));
     }
+    let mut spans = vec![theme.strong(series.title.clone())];
+    spans.extend(tags(theme, words));
     ListItem::new(Line::from(spans))
 }
 
@@ -167,7 +192,10 @@ fn season_row(theme: &Theme, season: &Season, series_title: &str) -> ListItem<'s
     // is already showing - see [`season_title`], which the narrowing reads a row with.
     let mut spans = vec![theme.text(season_title(season, series_title))];
     if season.number_of_episodes > 0 {
-        spans.push(theme.dim(format!("  {} ep", season.number_of_episodes)));
+        spans.extend(tags(
+            theme,
+            vec![(false, format!("{} ep", season.number_of_episodes))],
+        ));
     }
     ListItem::new(Line::from(spans))
 }
@@ -220,6 +248,17 @@ fn episode_row(
     } else {
         episode.episode.clone()
     };
+    // An episode the account has finished steps back: its number and its title go dim
+    // and the check stands out instead, so what is left to watch in a season is what the
+    // eye lands on and the finished ones read as done without being hidden.
+    let watched = playhead.is_some_and(|seen| seen.fully_watched);
+    let quiet = |text: String| {
+        if watched {
+            theme.dim(text)
+        } else {
+            theme.accent(text)
+        }
+    };
     let mut spans = Vec::new();
     if let Some(marked) = mark {
         spans.push(theme.accent(if marked { MARK } else { " " }));
@@ -228,8 +267,8 @@ fn episode_row(
     // in itself is called what the rest of the interface calls it. The word is spent in
     // the four cells the number slot already takes, so nothing below it moves.
     spans.push(match single_name(&episode.kind) {
-        Some(word) => theme.accent(format!("{word:<4}")),
-        None => theme.accent(format!("E{number:<3}")),
+        Some(word) => quiet(format!("{word:<4}")),
+        None => quiet(format!("E{number:<3}")),
     });
     spans.push(match held {
         OnDisk::Complete => theme.accent("● "),
@@ -239,32 +278,32 @@ fn episode_row(
     let resume =
         playhead.and_then(|seen| resume_at(seen.playhead, episode.duration_ms, seen.fully_watched));
     if let Some(seconds) = resume {
-        spans.push(theme.accent(format!("{:>6}  ", duration(u64::from(seconds) * 1000))));
-    } else if playhead.is_some_and(|seen| seen.fully_watched) {
-        spans.push(theme.dim(format!("{:>6}  ", "✓")));
+        spans.push(theme.title(format!("{:>6}", duration(u64::from(seconds) * 1000))));
+        spans.push(theme.dim("  "));
+    } else if watched {
+        spans.push(theme.accent(format!("{:>6}", "✓")));
+        spans.push(theme.dim("  "));
     } else if episode.duration_ms > 0 {
         spans.push(theme.dim(format!("{:>6}  ", duration(episode.duration_ms))));
     }
-    spans.push(theme.text(episode.title.clone()));
+    spans.push(if watched {
+        theme.dim(episode.title.clone())
+    } else {
+        theme.text(episode.title.clone())
+    });
     ListItem::new(Line::from(spans))
 }
 
-/// A bar drawn out of the characters the command line's own progress bars use, so a
-/// download looks like a download wherever this program shows one. A fraction with no
-/// number behind it yet - a subtitle fetch, a mux, a track whose server would not say
-/// how long the file is - is an empty track rather than a full one, which is the honest
-/// reading of not knowing.
-fn meter(fraction: Option<f64>, width: u16) -> String {
+/// A bar as two runs of line: the part that is done, heavy, and the track still to go,
+/// thin - given back apart so the done part can be drawn in the accent and the track
+/// left dim, which is what makes a bar read at a glance rather than by counting. A
+/// fraction with no number behind it yet - a subtitle fetch, a mux, a track whose server
+/// would not say how long the file is - is an empty track rather than a full one, which
+/// is the honest reading of not knowing.
+fn meter(fraction: Option<f64>, width: u16) -> (String, String) {
     let width = usize::from(width);
     let filled = fraction.map_or(0.0, |fraction| fraction.clamp(0.0, 1.0) * width as f64) as usize;
-    let mut bar = "=".repeat(filled);
-    if filled < width {
-        // The arrow is the head of the bar rather than part of what is done, so it only
-        // appears once something has been.
-        bar.push(if filled > 0 { '>' } else { ' ' });
-        bar.push_str(&" ".repeat(width - filled - 1));
-    }
-    format!("[{bar}]")
+    ("\u{2501}".repeat(filled), "\u{2500}".repeat(width - filled))
 }
 
 /// How wide the bar in the queue is. Wide enough to read a tenth off, narrow enough to
@@ -283,18 +322,20 @@ fn download_row(theme: &Theme, download: &Download, column: usize) -> ListItem<'
     spans.push(theme.text(download.title.clone()));
     spans.push(theme.text(" ".repeat(column.saturating_sub(title) + 2)));
     match &download.state {
-        State::Queued => spans.push(theme.dim("queued")),
+        State::Queued => spans.push(theme.dim("\u{25e6} queued")),
         State::Running => {
             let (stage, fraction) = download.stage().unwrap_or(("starting", None));
-            spans.push(theme.accent(meter(fraction, METER_WIDTH)));
-            spans.push(theme.accent(match fraction {
+            let (done, left) = meter(fraction, METER_WIDTH);
+            spans.push(theme.accent(done));
+            spans.push(theme.dim(left));
+            spans.push(theme.title(match fraction {
                 Some(fraction) => format!(" {:>3}%", (fraction * 100.0) as u16),
                 None => "     ".to_owned(),
             }));
             spans.push(theme.dim(format!("  {stage}")));
         }
-        State::Done => spans.push(theme.dim("done")),
-        State::Failed(error) => spans.push(theme.error(format!("failed: {error}"))),
+        State::Done => spans.push(theme.accent("\u{2713} done")),
+        State::Failed(error) => spans.push(theme.error(format!("\u{2717} failed: {error}"))),
     }
     ListItem::new(Line::from(spans))
 }
@@ -1084,7 +1125,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &theme,
             app.seasons.loading,
             app.seasons.error.as_ref(),
-            &nothing_shown(&app.seasons, "Pick a series."),
+            &nothing_shown(&app.seasons, "Pick a series on the left."),
             tick,
         )
     } else {
@@ -1115,7 +1156,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             &theme,
             app.episodes.loading,
             app.episodes.error.as_ref(),
-            &nothing_shown(&app.episodes, "Pick a season."),
+            &nothing_shown(&app.episodes, "Pick a season to list its episodes."),
             tick,
         )
     } else {
@@ -2375,6 +2416,53 @@ mod tests {
         assert!(screen.contains("24:21"), "so the running time is back");
     }
 
+    /// A finished episode steps back rather than disappearing: its title goes dim, so
+    /// what is left of a season is what the eye lands on, and the check stands out in
+    /// its place so the row still says why.
+    #[test]
+    fn a_watched_episode_steps_back() {
+        let mut app = app();
+        app.playheads = [("E2".to_owned(), playhead("E2", 1_410, true))]
+            .into_iter()
+            .collect();
+        let drawn = buffer(120, 30, &mut app);
+        let first_cell_of = |text: &str| {
+            let area = drawn.area;
+            (area.top()..area.bottom())
+                .find_map(|y| {
+                    let line: String = (area.left()..area.right())
+                        .map(|x| drawn[(x, y)].symbol())
+                        .collect();
+                    // Every cell up to the word is one column: nothing wide is drawn
+                    // in the episodes column in front of a title.
+                    line.find(text).map(|at| {
+                        let x = line[..at].chars().count() as u16;
+                        drawn[(x, y)].clone()
+                    })
+                })
+                .unwrap_or_else(|| panic!("{text:?} was not drawn"))
+        };
+        assert_eq!(first_cell_of("The Priest's Lie").fg, Color::DarkGray);
+        assert_eq!(first_cell_of("\u{2713}").fg, Color::Yellow);
+        assert_ne!(
+            first_cell_of("The Journey Ends").fg,
+            Color::DarkGray,
+            "an episode nobody has watched went dim"
+        );
+    }
+
+    /// A series that is simulcasting says so in its row, and a film says what it is,
+    /// both in the accent among the dim words, since either changes what someone does
+    /// next.
+    #[test]
+    fn a_catalogue_row_names_what_stands_out() {
+        let mut app = app();
+        app.series.items[0].series_metadata.is_simulcast = true;
+        app.series.items[0].series_metadata.is_dubbed = true;
+        let screen = rendered(120, 30, &mut app);
+        assert!(screen.contains("Frieren  dub \u{b7} simulcast"));
+    }
+
     /// A mark is a decision the user made about a row, so it has to be visible on that
     /// row - and the column it needs has to be there only while a mark is on one of them,
     /// since the width of this column is what the titles are living on.
@@ -2979,7 +3067,7 @@ mod tests {
         assert!(screen.contains("Nothing matches \"zzz\"."));
         assert!(screen.contains("Episodes \"zzz\" 0/2"));
         assert!(
-            !screen.contains("Pick a season."),
+            !screen.contains("Pick a season to list its episodes."),
             "a season is open, so that is not the problem"
         );
         assert!(
@@ -3085,7 +3173,10 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "missing {expected:?}");
         }
-        assert!(screen.contains("[====="), "no bar was drawn");
+        assert!(
+            screen.contains("\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2500}"),
+            "no bar was drawn"
+        );
 
         // And what became of it, in the words the panel has room for.
         app.downloads.items[0].state = State::Failed("Crunchyroll said no".to_owned());
@@ -3195,18 +3286,22 @@ mod tests {
         assert_eq!(downloads_height(Rect::new(0, 3, 120, 3), 4, true), 0);
     }
 
-    /// The bar is the one the command line draws, in the characters indicatif uses for
-    /// it. A part whose size nothing knows yet is an empty track rather than a full one,
-    /// which is the honest reading of not knowing.
+    /// The bar is a heavy line for what is done on a thin one for what is left, always
+    /// the same width between them. A part whose size nothing knows yet is an empty
+    /// track rather than a full one, which is the honest reading of not knowing.
     #[test]
     fn the_bar_reads_as_a_progress_bar() {
-        assert_eq!(meter(Some(0.5), 10), "[=====>    ]");
-        assert_eq!(meter(Some(1.0), 10), "[==========]");
-        assert_eq!(meter(Some(0.0), 10), "[          ]");
-        assert_eq!(meter(None, 10), "[          ]");
+        let bar = |fraction, width| {
+            let (done, left) = meter(fraction, width);
+            format!("{done}{left}")
+        };
+        assert_eq!(bar(Some(0.5), 10), "━━━━━─────");
+        assert_eq!(bar(Some(1.0), 10), "━━━━━━━━━━");
+        assert_eq!(bar(Some(0.0), 10), "──────────");
+        assert_eq!(bar(None, 10), "──────────");
         // Nothing a downloader says can draw outside the bar.
-        assert_eq!(meter(Some(4.0), 4), "[====]");
-        assert_eq!(meter(Some(-1.0), 4), "[    ]");
+        assert_eq!(bar(Some(4.0), 4), "━━━━");
+        assert_eq!(bar(Some(-1.0), 4), "────");
     }
 
     /// A panel that is only drawn sometimes is a panel that has to survive being drawn
