@@ -14,6 +14,7 @@ use crate::util::{LANGUAGES, language_name};
 
 use super::QUALITIES;
 use super::art::Gallery;
+use super::grid::{Shape, View};
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions, Target};
 use super::theme::Theme;
@@ -638,6 +639,17 @@ pub struct App {
     /// The posters and episode stills, and the terminal's ability to draw them.
     pub art: Gallery,
     pub focus: Focus,
+    /// Whether the catalogue is drawn as columns or as a wall of covers.
+    pub view: View,
+    /// What the wall of covers looked like when it was last drawn: how many tiles make a
+    /// row, which is what `up` and `down` move by, and which row was at the top.
+    pub grid: Shape,
+    /// Whether the columns were reached by opening a cover, so that backing out of the
+    /// seasons goes back to the wall rather than to a Series column the user never
+    /// chose to look at. Only while that is still what happened: the moment the user
+    /// goes to the Series column of their own accord - tab, a click, another series
+    /// opened, a new list asked for - the columns are theirs, and `back` keeps to them.
+    back_to_covers: bool,
     pub series: Pane<CatalogItem>,
     pub seasons: Pane<Season>,
     pub episodes: Pane<SeasonEpisode>,
@@ -700,6 +712,19 @@ pub struct App {
     /// Where the last frame put everything, so a click can be aimed at it.
     pub regions: Regions,
     pub show_help: bool,
+    /// How many lines the help popup is scrolled down, on a terminal too short to hold
+    /// all of it.
+    pub help_scroll: u16,
+    /// How far the help popup could be scrolled when it was last drawn: nothing when it
+    /// fits, which is what lets an arrow close it like any other key does then. Written
+    /// by the drawing, the way [`App::grid`] is, since only the drawing knows how tall
+    /// the terminal is.
+    pub help_room: u16,
+    /// Whether the user has yet to press a key or click anything. Until then the status
+    /// line uses its idle moments to say where the covers and the rest of the keys are,
+    /// and it stops the moment it has been heard, since a hint that stays for good
+    /// becomes part of the furniture and is read by nobody.
+    pub untouched: bool,
     pub quit: bool,
     pub tick: usize,
     /// Which browse order to come back to. The ring carries it along as it passes each
@@ -735,6 +760,9 @@ impl App {
             keys,
             art,
             focus: Focus::Series,
+            view: View::default(),
+            grid: Shape::default(),
+            back_to_covers: false,
             series: Pane::default(),
             seasons: Pane::default(),
             episodes: Pane::default(),
@@ -757,6 +785,9 @@ impl App {
             notices,
             regions: Regions::default(),
             show_help: false,
+            help_scroll: 0,
+            help_room: 0,
+            untouched: true,
             quit: false,
             tick: 0,
             sort: 0,
@@ -912,6 +943,7 @@ impl App {
         self.clear_episodes();
         self.paging = Paging::first();
         self.focus = Focus::Series;
+        self.back_to_covers = false;
         self.request_catalog_page(0);
     }
 
@@ -968,7 +1000,19 @@ impl App {
         // asking for - a query that kept four rows out of a hundred has hidden ninety-six
         // series the user is not looking for and says nothing about the hundred behind
         // them.
-        if cursor + 1 >= self.series.rows() {
+        //
+        // On the wall of covers the end is the last row of tiles rather than the last
+        // tile: `down` from anywhere on that row goes nowhere, so a wall that waited for
+        // the very last cover would leave someone pressing it against the bottom edge
+        // with nothing happening. Counted in whole rows, which for the one-wide column
+        // is the same test as before.
+        let across = if self.view == View::Covers {
+            self.grid.columns()
+        } else {
+            1
+        };
+        let rows = self.series.rows();
+        if rows > 0 && cursor / across >= (rows - 1) / across {
             self.request_next_catalog_page();
         }
     }
@@ -1452,6 +1496,12 @@ impl App {
     /// a title, or the sentence an empty column draws. A row rather than an item, since
     /// the column may be narrowed and the cursor counts in rows - see [`Pane`].
     fn row_at(&self, focus: Focus, row: u16) -> Option<usize> {
+        // The wall of covers is not a list, and the arithmetic below would turn a line of
+        // it into whichever row of the hidden column happened to be there. Its tiles are
+        // hit one by one instead - see [`Target::Tile`].
+        if focus == Focus::Series && self.covers() {
+            return None;
+        }
         let (offset, len) = self.pane_window(focus);
         mouse::row_at(self.regions.column(focus), offset, len, row)
     }
@@ -1466,10 +1516,105 @@ impl App {
         self.catalog_page_if_at_the_end(self.focus);
     }
 
+    /// Whether the keys are driving the wall of covers: it is up, and it has the
+    /// keyboard rather than the queue under it.
+    fn covers(&self) -> bool {
+        self.view == View::Covers && self.focus == Focus::Series
+    }
+
+    /// How many rows of tiles a screenful of the wall is.
+    fn page_of_rows(&self) -> isize {
+        isize::try_from(self.grid.rows.max(1)).unwrap_or(1)
+    }
+
+    /// Moves the cursor `rows` rows of tiles up or down the wall, staying in its column.
+    ///
+    /// Past the top it stops on the first row rather than on the first tile, and past
+    /// the bottom it lands on the last row - in the same column where the last row
+    /// reaches that far, and on its last tile where it is short. Down from the last row
+    /// goes nowhere, which is also where the next page is asked for: see
+    /// [`App::catalog_page_if_at_the_end`], which [`App::put_cursor`] ends in.
+    fn grid_rows(&mut self, rows: isize) {
+        let count = self.series.rows();
+        let Some(cursor) = self.series.state.selected().filter(|_| count > 0) else {
+            return;
+        };
+        let across = self.grid.columns();
+        let column = cursor % across;
+        let wanted = isize::try_from(cursor)
+            .unwrap_or(isize::MAX)
+            .saturating_add(rows.saturating_mul(isize::try_from(across).unwrap_or(1)));
+        let target = if wanted < 0 {
+            column
+        } else {
+            let last_row = (count - 1) / across;
+            usize::try_from(wanted)
+                .unwrap_or(usize::MAX)
+                .min(last_row * across + column)
+                .min(count - 1)
+        };
+        self.put_cursor(Focus::Series, target);
+    }
+
+    /// `view`: the columns, or the wall of covers.
+    ///
+    /// The wall only ever shows the catalogue, so going to it from the seasons or the
+    /// episodes takes the keyboard back to the catalogue - on the series that was open,
+    /// since the cursor is the one both views share. The queue keeps the keyboard if it
+    /// had it, because it is drawn under either view.
+    fn switch_view(&mut self) {
+        self.back_to_covers = false;
+        self.view = match self.view {
+            View::Columns => {
+                if self.focus != Focus::Downloads {
+                    self.focus = Focus::Series;
+                }
+                View::Covers
+            }
+            View::Covers => View::Columns,
+        };
+    }
+
+    /// Moves the help popup by what `command` would move a cursor by, if the popup is
+    /// taller than the terminal and `command` is one that moves. Says whether it was.
+    fn scroll_help(&mut self, command: Command) -> bool {
+        if self.help_room == 0 {
+            return false;
+        }
+        let page = self.help_room.max(1);
+        self.help_scroll = match command {
+            Command::Up => self.help_scroll.saturating_sub(1),
+            Command::Down => self.help_scroll.saturating_add(1),
+            Command::PageUp => self.help_scroll.saturating_sub(page),
+            Command::PageDown => self.help_scroll.saturating_add(page),
+            Command::Top => 0,
+            Command::Bottom => self.help_room,
+            _ => return false,
+        }
+        .min(self.help_room);
+        true
+    }
+
+    fn close_help(&mut self) {
+        self.show_help = false;
+        self.help_scroll = 0;
+    }
+
     fn descend(&mut self) -> Action {
         match self.focus {
             Focus::Series => {
                 self.request_seasons();
+                // A cover opens the way a row of the Series column does, and then the
+                // columns take over, since the seasons and the episodes are lists and
+                // the wall has nowhere to put them. Only if it opened: a row nothing
+                // knows how to open leaves the focus where it was and says so, and the
+                // wall should still be there to say it over. A series opened from the
+                // Series column, on the other hand, was chosen in the columns, and
+                // backing out of it has no wall to go back to.
+                self.back_to_covers = self.view == View::Covers && self.focus != Focus::Series;
+                if self.back_to_covers {
+                    self.view = View::Columns;
+                }
                 Action::None
             }
             Focus::Seasons => {
@@ -1490,9 +1635,19 @@ impl App {
 
     fn ascend(&mut self) {
         match self.focus {
+            // Above the queue is whatever is drawn above it: the episodes in the
+            // columns, and on the wall the wall itself. The episodes are still held
+            // while the wall is up, but nowhere on screen, and a cursor put into them
+            // would have `p` playing an episode nobody can see.
+            Focus::Downloads if self.view == View::Covers => self.focus = Focus::Series,
             Focus::Downloads => self.focus = Focus::Episodes,
             Focus::Episodes => self.focus = Focus::Seasons,
-            Focus::Seasons => self.focus = Focus::Series,
+            Focus::Seasons => {
+                self.focus = Focus::Series;
+                if std::mem::take(&mut self.back_to_covers) {
+                    self.view = View::Covers;
+                }
+            }
             // Leaving the leftmost column means leaving the search behind.
             Focus::Series => {
                 if matches!(self.listing, Listing::Search(_)) {
@@ -1779,6 +1934,12 @@ impl App {
         self.downloads
             .state
             .select((left > 0).then(|| row.min(left - 1)));
+        // Under the wall an empty queue is not drawn at all, so the last row going takes
+        // the keyboard back up to the covers rather than leaving it in a panel that has
+        // just left the screen.
+        if self.downloads.items.is_empty() && self.view == View::Covers {
+            self.focus = Focus::Series;
+        }
     }
 
     /// The locales worth offering for the current selection, most specific first: what
@@ -2180,7 +2341,7 @@ impl App {
             return;
         };
         match command {
-            Command::Back | Command::Quit => self.picker = None,
+            Command::Back | Command::Left | Command::Quit => self.picker = None,
             Command::Up => picker.pane.move_by(-1),
             Command::Down => picker.pane.move_by(1),
             Command::PageUp => picker.pane.move_by(-10),
@@ -2195,7 +2356,7 @@ impl App {
             Command::SubtitleLanguage => self.open_picker(Picking::Subtitles),
             Command::Genre => self.open_picker(Picking::Filter(FilterKind::Genre)),
             Command::AnimeSeason => self.open_picker(Picking::Filter(FilterKind::Season)),
-            Command::Open => {
+            Command::Open | Command::Right => {
                 let kind = picker.kind;
                 let chosen = picker.pane.selected().cloned();
                 self.picker = None;
@@ -2217,6 +2378,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        self.untouched = false;
         // The box along the top is typing rather than commands: every letter belongs in
         // it, whatever it would otherwise do.
         match self.editing {
@@ -2239,9 +2401,13 @@ impl App {
             return Action::None;
         }
         // The help popup is read and dismissed, so any key at all closes it - including
-        // one that is bound to nothing.
+        // one that is bound to nothing. The one exception is a popup too tall for the
+        // terminal, where the keys that move a cursor move the popup instead: the lines
+        // below the edge are otherwise out of reach.
         if self.show_help {
-            self.show_help = false;
+            if !command.is_some_and(|command| self.scroll_help(command)) {
+                self.close_help();
+            }
             return Action::None;
         }
         self.notice = None;
@@ -2273,24 +2439,66 @@ impl App {
                 }
                 return Action::Quit;
             }
-            Command::Help => self.show_help = true,
+            Command::Help => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             Command::Search => self.editing = Some(Editing::Search(String::new())),
             Command::Filter => self.open_narrow(),
+            // The wall of covers is walked in two directions: `up` and `down` a row of
+            // tiles at a time, `left` and `right` one tile, and a page is a screenful.
+            // Everything else about it is the Series column's.
+            Command::Up if self.covers() => self.grid_rows(-1),
+            Command::Down if self.covers() => self.grid_rows(1),
+            Command::PageUp if self.covers() => self.grid_rows(-self.page_of_rows()),
+            Command::PageDown if self.covers() => self.grid_rows(self.page_of_rows()),
+            Command::Left if self.covers() => self.pane_move(Focus::Series, -1),
+            Command::Right if self.covers() => self.pane_move(Focus::Series, 1),
             Command::Up => self.focused_pane_move(-1),
             Command::Down => self.focused_pane_move(1),
             Command::PageUp => self.focused_pane_move(-10),
             Command::PageDown => self.focused_pane_move(10),
             Command::Top => self.focused_pane_edge(false),
             Command::Bottom => self.focused_pane_edge(true),
-            Command::Open => return self.descend(),
-            Command::Back => self.ascend(),
+            Command::Open | Command::Right => return self.descend(),
+            Command::Back | Command::Left => self.ascend(),
+            // The wall has no seasons or episodes beside it to cycle through, so the key
+            // goes between it and the queue - the other thing on screen with a cursor.
+            // An empty queue is not drawn under the wall, so there the key has nowhere
+            // to go and stays where it is rather than hiding the keyboard in a panel
+            // that is not on screen.
+            Command::NextColumn if self.view == View::Covers => {
+                self.focus = match self.focus {
+                    Focus::Series if !self.downloads.items.is_empty() => Focus::Downloads,
+                    _ => Focus::Series,
+                }
+            }
             Command::NextColumn => {
                 self.focus = match self.focus {
                     Focus::Series => Focus::Seasons,
                     Focus::Seasons => Focus::Episodes,
                     Focus::Episodes => Focus::Downloads,
-                    Focus::Downloads => Focus::Series,
+                    Focus::Downloads => {
+                        self.back_to_covers = false;
+                        Focus::Series
+                    }
                 }
+            }
+            Command::View => self.switch_view(),
+            // The episodes are the columns' and are not drawn beside the wall. They are
+            // still held, from whichever series was opened last - which is not
+            // necessarily the cover the cursor is on - so a key that played or queued
+            // one of them from here would be acting on something off the screen.
+            Command::Play
+            | Command::PlayRest
+            | Command::Mark
+            | Command::Download
+            | Command::DownloadSeason
+            | Command::MarkWatched
+            | Command::MarkUnwatched
+                if self.view == View::Covers =>
+            {
+                self.complain("Open a cover to pick an episode first.");
             }
             Command::Play => return self.play(false),
             Command::PlayRest => return self.play(true),
@@ -2325,6 +2533,7 @@ impl App {
     /// runs the command it names. Nothing here does anything no key does.
     pub fn on_mouse(&mut self, event: MouseEvent) -> Action {
         let at = Position::new(event.column, event.row);
+        self.untouched = false;
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.click(at),
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -2367,7 +2576,7 @@ impl App {
         // The help popup is read and dismissed, so a click anywhere closes it - even one
         // that landed on a word that would otherwise have answered.
         if self.show_help {
-            self.show_help = false;
+            self.close_help();
             return Action::None;
         }
         let target = self.regions.at(at);
@@ -2381,9 +2590,23 @@ impl App {
         }
         match target {
             Target::Button(command) => self.run(command),
+            // The columns' rule, for a cover: the first click chooses it and a click on
+            // the one already chosen opens it.
+            Target::Tile(row) => {
+                let working_there = self.focus == Focus::Series;
+                self.focus = Focus::Series;
+                if working_there && self.series.state.selected() == Some(row) {
+                    return self.descend();
+                }
+                self.put_cursor(Focus::Series, row);
+                Action::None
+            }
             Target::Column(focus) => {
                 let working_there = self.focus == focus;
                 self.focus = focus;
+                if focus == Focus::Series {
+                    self.back_to_covers = false;
+                }
                 let Some(index) = self.row_at(focus, at.y) else {
                     return Action::None;
                 };
@@ -2414,10 +2637,16 @@ impl App {
             self.select_picker(at);
             return;
         }
-        if self.regions.at(at) == Target::Column(self.focus)
-            && let Some(index) = self.row_at(self.focus, at.y)
-        {
-            self.put_cursor(self.focus, index);
+        match self.regions.at(at) {
+            Target::Tile(row) if self.focus == Focus::Series => {
+                self.put_cursor(Focus::Series, row);
+            }
+            Target::Column(focus) if focus == self.focus => {
+                if let Some(index) = self.row_at(focus, at.y) {
+                    self.put_cursor(focus, index);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2425,7 +2654,15 @@ impl App {
     /// keyboard where it was: looking down a list is not the same as going to work in
     /// it, and each column keeps a cursor of its own, so a look costs nothing.
     fn wheel(&mut self, at: Position, delta: isize) {
-        if self.editing.is_some() || self.show_help {
+        if self.show_help {
+            self.scroll_help(if delta < 0 {
+                Command::Up
+            } else {
+                Command::Down
+            });
+            return;
+        }
+        if self.editing.is_some() {
             return;
         }
         if self.picker.is_some() {
@@ -2436,8 +2673,16 @@ impl App {
             }
             return;
         }
-        if let Target::Column(focus) = self.regions.at(at) {
-            self.pane_move(focus, delta);
+        match self.regions.at(at) {
+            // A notch is a row of covers rather than three: a row of tiles is most of the
+            // height of the screen, and three of them at once would throw the one the
+            // cursor was on out of sight before anyone saw where it went.
+            Target::Tile(_) => self.grid_rows(delta.signum()),
+            Target::Column(Focus::Series) if self.view == View::Covers => {
+                self.grid_rows(delta.signum());
+            }
+            Target::Column(focus) => self.pane_move(focus, delta),
+            _ => {}
         }
     }
 
@@ -2450,18 +2695,21 @@ impl App {
             return;
         }
         if self.show_help {
-            self.show_help = false;
+            self.close_help();
             return;
         }
         if self.picker.is_some() {
             self.picker = None;
             return;
         }
-        if let Target::Column(focus) = self.regions.at(at) {
-            self.notice = None;
-            self.focus = focus;
-            self.ascend();
-        }
+        let focus = match self.regions.at(at) {
+            Target::Column(focus) => focus,
+            Target::Tile(_) => Focus::Series,
+            _ => return,
+        };
+        self.notice = None;
+        self.focus = focus;
+        self.ascend();
     }
 
     /// The row under the pointer, while a list is open over the interface.

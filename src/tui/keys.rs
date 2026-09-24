@@ -17,9 +17,16 @@ pub enum Command {
     PageDown,
     Top,
     Bottom,
+    /// Sideways. In the columns these are `back` and `open` under another name, which is
+    /// all the arrows ever were there; on the wall of covers they move a tile - see
+    /// [`DEFAULTS`] for why they are commands of their own.
+    Left,
+    Right,
     Open,
     Back,
     NextColumn,
+    /// Between the columns and the wall of covers.
+    View,
     Search,
     Filter,
     Order,
@@ -57,9 +64,12 @@ impl Command {
             Self::PageDown => "page-down",
             Self::Top => "top",
             Self::Bottom => "bottom",
+            Self::Left => "left",
+            Self::Right => "right",
             Self::Open => "open",
             Self::Back => "back",
             Self::NextColumn => "next-column",
+            Self::View => "view",
             Self::Search => "search",
             Self::Filter => "filter",
             Self::Order => "order",
@@ -90,16 +100,25 @@ impl Command {
 /// Every command and the keys it answers to out of the box - vim's, with the arrows
 /// beside them. They are written the way a user would write them in the config and read
 /// by the same parser, so the defaults cannot mean something the config file cannot say.
-pub const DEFAULTS: [(Command, &[&str]); 32] = [
+///
+/// The arrows and `h` `l` used to belong to `open` and `back` directly. They are `left`
+/// and `right` now, because on the wall of covers a sideways key has to move to the next
+/// tile while return still opens one and escape still leaves a search - and a command
+/// only ever hears which command it is, never which key asked for it. In the columns the
+/// two are passed straight on to `back` and `open`, so nothing changes there.
+pub const DEFAULTS: [(Command, &[&str]); 35] = [
     (Command::Up, &["up", "k"]),
     (Command::Down, &["down", "j"]),
     (Command::PageUp, &["pgup"]),
     (Command::PageDown, &["pgdn"]),
     (Command::Top, &["home", "g"]),
     (Command::Bottom, &["end", "G"]),
-    (Command::Open, &["enter", "right", "l"]),
-    (Command::Back, &["left", "h", "esc"]),
+    (Command::Left, &["left", "h"]),
+    (Command::Right, &["right", "l"]),
+    (Command::Open, &["enter"]),
+    (Command::Back, &["esc"]),
     (Command::NextColumn, &["tab"]),
+    (Command::View, &["t"]),
     (Command::Search, &["/"]),
     (Command::Filter, &["f"]),
     (Command::Order, &["o"]),
@@ -344,10 +363,27 @@ impl Settings {
 
         for (command, keys) in &self.0 {
             bindings.table.retain(|(_, bound)| bound != command);
+            // A file written before `left` and `right` existed gave the arrows and `h`
+            // `l` to `open` and `back`, which is what the example config said to do.
+            // Taken at its word, that file would now take the sideways keys away from
+            // the wall of covers, where they move a tile rather than open one. So while
+            // the file says nothing about the sideways command itself, a key it gives
+            // `open` or `back` that is one of that command's own goes there instead -
+            // which in the columns is the same thing under another name - and the
+            // user is told, so the file can be brought up to date.
+            let sideways = legacy_sideways(*command).filter(|side| !self.0.contains_key(side));
+            let mut moved = Vec::new();
             for spec in keys.specs() {
                 let Some(chord) = Chord::parse(spec) else {
                     warnings.push(format!("keys.{}: {spec:?} is not a key", command.name()));
                     continue;
+                };
+                let target = match sideways {
+                    Some(side) if default_chords(side).contains(&chord) => {
+                        moved.push(chord.label());
+                        side
+                    }
+                    _ => *command,
                 };
                 if let Some(index) = bindings.table.iter().position(|(bound, _)| *bound == chord) {
                     // Displacing a default is the point of the exercise; displacing
@@ -363,7 +399,15 @@ impl Settings {
                     bindings.table.remove(index);
                 }
                 claimed.push(chord);
-                bindings.table.push((chord, *command));
+                bindings.table.push((chord, target));
+            }
+            if let (Some(side), false) = (sideways, moved.is_empty()) {
+                warnings.push(format!(
+                    "keys.{}: {} moved to `{}`, which does the same in the columns and moves between covers on the wall",
+                    command.name(),
+                    moved.join(" "),
+                    side.name()
+                ));
             }
         }
 
@@ -380,6 +424,25 @@ impl Settings {
 
         (bindings, warnings)
     }
+}
+
+/// The sideways command that `command` used to hold the keys of, before the wall of
+/// covers gave the arrows something of their own to do: see [`Settings::resolve`].
+fn legacy_sideways(command: Command) -> Option<Command> {
+    match command {
+        Command::Open => Some(Command::Right),
+        Command::Back => Some(Command::Left),
+        _ => None,
+    }
+}
+
+/// The keys `command` answers to out of the box.
+fn default_chords(command: Command) -> Vec<Chord> {
+    DEFAULTS
+        .iter()
+        .filter(|(bound, _)| *bound == command)
+        .flat_map(|(_, specs)| specs.iter().filter_map(|spec| Chord::parse(spec)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -532,6 +595,88 @@ images = \"q\"
         );
     }
 
+    /// The `[keys]` section the example config used to hold, from before `left` and
+    /// `right` were commands. Copied into a config file, it must not take the arrows away
+    /// from the wall of covers: the sideways keys it gave `open` and `back` go to the
+    /// commands that hold them now, and the file is told so rather than left to find out.
+    #[test]
+    fn moves_the_sideways_keys_of_an_old_config_to_left_and_right() {
+        let (bindings, warnings) = settings(
+            "\
+open = [\"enter\", \"right\", \"l\"]
+back = [\"left\", \"h\", \"esc\"]
+",
+        )
+        .resolve();
+        for (key, expected) in [
+            (KeyCode::Right, Command::Right),
+            (KeyCode::Char('l'), Command::Right),
+            (KeyCode::Left, Command::Left),
+            (KeyCode::Char('h'), Command::Left),
+            (KeyCode::Enter, Command::Open),
+            (KeyCode::Esc, Command::Back),
+        ] {
+            assert_eq!(
+                bindings.command(KeyEvent::from(key)),
+                Some(expected),
+                "{key:?}"
+            );
+        }
+        assert_eq!(bindings.label(Command::Right), "→ l");
+        assert_eq!(bindings.label(Command::Left), "← h");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("keys.open") && warnings[0].contains("`right`"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("keys.back") && warnings[1].contains("`left`"),
+            "{}",
+            warnings[1]
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("no key left")),
+            "{warnings:?}"
+        );
+
+        // The Colemak layout the README used to offer: its own letters stay where it put
+        // them, and the arrows go sideways.
+        let (bindings, _) = settings(
+            "\
+back = [\"n\", \"left\", \"esc\"]
+open = [\"o\", \"enter\", \"right\"]
+",
+        )
+        .resolve();
+        assert_eq!(bindings.command(press('n')), Some(Command::Back));
+        assert_eq!(bindings.command(press('o')), Some(Command::Open));
+        assert_eq!(
+            bindings.command(KeyEvent::from(KeyCode::Left)),
+            Some(Command::Left)
+        );
+        assert_eq!(
+            bindings.command(KeyEvent::from(KeyCode::Right)),
+            Some(Command::Right)
+        );
+
+        // A file that names `left` and `right` as well means what it says.
+        let (bindings, _) = settings(
+            "\
+left = \"n\"
+right = \"o\"
+open = [\"enter\", \"right\"]
+",
+        )
+        .resolve();
+        assert_eq!(
+            bindings.command(KeyEvent::from(KeyCode::Right)),
+            Some(Command::Open)
+        );
+    }
+
     /// An empty list is how an action is turned off, and it is not a mistake.
     #[test]
     fn unbinds_an_action_without_complaining() {
@@ -555,10 +700,10 @@ images = \"q\"
     fn the_colemak_example_is_a_working_config() {
         let (bindings, warnings) = toml::from_str::<Settings>(
             "\
-back = [\"n\", \"left\", \"esc\"]
+left = [\"n\", \"left\"]
 down = [\"e\", \"down\"]
 up = [\"i\", \"up\"]
-open = [\"o\", \"enter\", \"right\"]
+right = [\"o\", \"right\"]
 anime-season = \"N\"
 images = \"I\"
 order = \"O\"
@@ -568,10 +713,10 @@ order = \"O\"
         .resolve();
         assert!(warnings.is_empty(), "{warnings:?}");
         for (letter, expected) in [
-            ('n', Command::Back),
+            ('n', Command::Left),
             ('e', Command::Down),
             ('i', Command::Up),
-            ('o', Command::Open),
+            ('o', Command::Right),
             ('N', Command::AnimeSeason),
             ('I', Command::Images),
             ('O', Command::Order),
