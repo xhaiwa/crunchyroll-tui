@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::credentials::Secret;
-use crate::tui::{art, keys, theme};
+use crate::tui::{art, grid, keys, theme};
 use crate::util::parse_langs;
 
 /// `config.toml`. Nothing in it is required, and a file that is not there is not a
@@ -25,6 +25,10 @@ pub struct Config {
     /// Whether the posters and episode stills are drawn. `--images` overrides it.
     #[serde(default)]
     pub images: art::Setting,
+    /// Whether the catalogue opens as columns or as a wall of covers. `--view` overrides
+    /// it, and `t` switches between the two while the interface is running.
+    #[serde(default)]
+    pub view: grid::View,
     /// Whether the terminal interface answers the mouse. `--mouse` overrides it.
     ///
     /// Asking the terminal to report the pointer takes its own click-and-drag text
@@ -144,7 +148,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::style::Color;
 
-    use super::{Config, art, keys, theme};
+    use super::{Config, art, grid, keys, theme};
     use crate::credentials::Secret;
     use crate::tui::keys::Command;
 
@@ -177,6 +181,19 @@ dim = \"bright black\"
             assert_eq!(config.images, expected, "{text:?}");
         }
         assert!(toml::from_str::<Config>("images = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn reads_the_view_the_catalogue_opens_in() {
+        for (text, expected) in [
+            ("", grid::View::Columns),
+            ("view = \"columns\"\n", grid::View::Columns),
+            ("view = \"covers\"\n", grid::View::Covers),
+        ] {
+            let config: Config = toml::from_str(text).expect("valid config");
+            assert_eq!(config.view, expected, "{text:?}");
+        }
+        assert!(toml::from_str::<Config>("view = \"grid\"\n").is_err());
     }
 
     /// Left unsaid, the interface answers the mouse: a feature nobody finds is worth
@@ -275,6 +292,7 @@ download = [\"d\", \"ctrl-d\"]
         let config: Config = toml::from_str(include_str!("../config.example.toml"))
             .expect("config.example.toml is valid config");
         assert_eq!(config.images, art::Setting::Auto);
+        assert_eq!(config.view, grid::View::Columns);
         assert_eq!(
             config.mouse,
             Some(true),

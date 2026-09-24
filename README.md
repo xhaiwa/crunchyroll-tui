@@ -16,7 +16,7 @@ Rust port of `CuteTenshii/crunchyroll-downloader`. It downloads Crunchyroll epis
 - Several episodes of a season marked and queued together, in the order the season lists them
 - Any column narrowed as you type, fzf style, without a request going anywhere: a season, a watchlist or the download queue cut down to the rows that match
 - One XDG config file for the colours, the default languages and quality, mpv's options and every key
-- Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2
+- Series posters and episode stills drawn in the terminal, over kitty, sixel or iTerm2, and the catalogue browsable as a wall of covers
 - Multiple audio, subtitle and closed-caption tracks in one MKV
 - Downloads a later run can pick up: the finished name appears only once the episode is whole, and what a killed run did fetch is kept for the next one
 - Playback with mpv while the stream downloads, instead of writing a file
@@ -207,9 +207,11 @@ instead and says so on the status line.
 | `↑` `↓`, `k` `j` | `up`, `down` | Move the cursor |
 | `pgup` `pgdn` | `page-up`, `page-down` | Move a page at a time |
 | `home` `end`, `g` `G` | `top`, `bottom` | Jump to the first or last item |
-| `⏎`, `→`, `l` | `open` | Open the selection, play the episode under the cursor, drop a row of the queue |
-| `←`, `h`, `esc` | `back` | Go back a column, and leave a search |
+| `←` `→`, `h` `l` | `left`, `right` | Go back a column, or open the selection - the same as `back` and `open` |
+| `⏎` | `open` | Open the selection, play the episode under the cursor, drop a row of the queue |
+| `esc` | `back` | Go back a column, and leave a search |
 | `tab` | `next-column` | Cycle the columns: series, seasons, episodes, downloads |
+| `t` | `view` | Switch between the columns and the [wall of covers](#the-wall-of-covers) |
 | `/` | `search` | Search the catalogue: asks Crunchyroll, and replaces the Series column with the answer. An empty search goes back to browsing |
 | `f` | `filter` | Narrow the column the cursor is in to the rows that match what you type. Asks nobody anything, and hides nothing anywhere else |
 | `o` | `order` | Change the list: popular, recently added, A to Z, the account's watchlist, then Continue watching |
@@ -463,18 +465,17 @@ selected episode sits in the Details panel. They are drawn as pixels, with which
 graphics protocol the terminal answers to - kitty, sixel or iTerm2 - which is asked for
 once at startup rather than guessed from environment variables.
 
-By default they appear only where one of those protocols is available. Every terminal can
-manage half-blocks, but half-blocks are a mosaic of coloured cells rather than a picture,
-and they drag a hundred colours of their own across the colourscheme the rest of the
-interface is careful to wear - so they are opt-in:
+A terminal that speaks none of those still gets the pictures, drawn as half-blocks: a
+mosaic of coloured cells rather than a photograph, but every terminal can manage one, and
+a wall of covers with nothing on it is a worse way to browse than a rough picture. If the
+colours bother you, turn the artwork off:
 
 ```shell
-cargo run --release -- --tui --images on
+cargo run --release -- --tui --images off
 ```
 
-`--images off` turns the artwork off altogether, and `i` toggles it while the interface is
-running - which also names the protocol in use, if you are wondering why a picture is not
-where you expected it. The same setting lives in the [config file](#configuration), as
+`i` toggles it while the interface is running - which also names the protocol in use, if
+you are wondering why a picture is not where you expected it. The same setting lives in the [config file](#configuration), as
 `images = "auto"`.
 
 Posters and stills come off Crunchyroll's own image CDN, at the smallest size that covers
@@ -485,6 +486,30 @@ inside the terminal:
 
 ```shell
 cargo run --release -- --tui --in-terminal
+```
+
+### The wall of covers
+
+`t` swaps the three columns for the catalogue drawn as a grid of posters, each with its
+title and a word about what it is - `film`, `3 seasons`, `simulcast`, `dub` - underneath,
+and as many across as the terminal has room for. It is the same list as the Series column:
+the same cursor, the same filters and narrowing, and the next page is asked for when the
+cursor reaches the last row, so `t` again puts you back in the column on the series you
+were looking at.
+
+`↑` `↓` move a row of covers, `←` `→` one cover, `pgup` `pgdn` a screenful, and `⏎` opens
+the one under the cursor into the columns, with its seasons listed. `esc` out of those
+seasons comes back to the wall. With the mouse, a click picks a cover, a second click on
+it opens it, and the wheel scrolls a row at a time.
+
+A cover that has not arrived yet, or any cover while the artwork is off, is drawn as a
+shaded panel with the title's initials on it rather than left as a hole.
+
+To open on the wall rather than the columns, say so on the command line or put
+`view = "covers"` in the [config file](#configuration):
+
+```shell
+cargo run --release -- --tui --view covers
 ```
 
 ### The download queue
@@ -654,6 +679,9 @@ etp_rt_command = "pass show crunchyroll"
 # before the first section - that is TOML, not us.
 images = "auto"
 
+# Whether the catalogue opens as "columns" or as a wall of "covers". Top level too.
+view = "columns"
+
 # Whether the interface answers the mouse. Turning it off gives the terminal back
 # its own click-and-drag text selection. Top level too.
 mouse = true
@@ -696,10 +724,10 @@ where `hjkl` is scattered across the keyboard rather than sitting under a hand.
 ```toml
 [keys]
 # Colemak's navigation row - neio - with the arrows kept beside it
-back = ["n", "left", "esc"]
+left = ["n", "left"]
 down = ["e", "down"]
 up = ["i", "up"]
-open = ["o", "enter", "right"]
+right = ["o", "right"]
 # and somewhere to put the three that `n`, `i` and `o` were holding
 anime-season = "N"
 images = "I"
@@ -719,9 +747,11 @@ The commands, and the keys they answer to out of the box:
 | `up` `down` | `↑` `k`, `↓` `j` | Move the cursor |
 | `page-up` `page-down` | `pgup`, `pgdn` | Move it ten rows |
 | `top` `bottom` | `home` `g`, `end` `G` | Jump to the first or last item |
-| `open` | `enter` `right` `l` | Open the selection, play an episode, drop a download |
-| `back` | `left` `h` `esc` | Go back a column, and leave a search |
+| `left` `right` | `left` `h`, `right` `l` | Go back a column, or open the selection; the previous or next cover on the wall |
+| `open` | `enter` | Open the selection, play an episode, drop a download |
+| `back` | `esc` | Go back a column, and leave a search |
 | `next-column` | `tab` | Cycle the columns |
+| `view` | `t` | Switch between the columns and the wall of covers |
 | `search` | `/` | Search the catalogue |
 | `order` | `o` | Change the list the catalogue shows |
 | `genre` `anime-season` | `c`, `n` | Narrow the catalogue by category or anime season |

@@ -10,6 +10,7 @@ use crate::play::resume_at;
 use crate::util::language_name;
 
 use super::app::{App, Download, Editing, Focus, Pane, Picker, State, season_title};
+use super::grid::{self, View};
 use super::keys::{Bindings, Command};
 use super::mouse::{self, Regions};
 use super::theme::Theme;
@@ -743,7 +744,7 @@ fn picker_overlay(
 /// What the help popup lists, and in what order. Commands that read as one line share a
 /// row; the keys printed are whatever they are bound to, so a config that moves them
 /// documents itself instead of leaving the popup lying.
-const HELP: [(&[Command], &str); 23] = [
+const HELP: [(&[Command], &str); 25] = [
     (&[Command::Up, Command::Down], "move the cursor"),
     (
         &[Command::PageUp, Command::PageDown],
@@ -754,11 +755,19 @@ const HELP: [(&[Command], &str); 23] = [
         "jump to the first or last item",
     ),
     (
+        &[Command::Left, Command::Right],
+        "go back a column / open; the previous / next cover",
+    ),
+    (
         &[Command::Open],
         "open the selection, play an episode, drop a download",
     ),
     (&[Command::Back], "go back a column, and leave a search"),
     (&[Command::NextColumn], "cycle the columns"),
+    (
+        &[Command::View],
+        "switch between the columns and the wall of covers",
+    ),
     (&[Command::Search], "search the catalogue"),
     (
         &[Command::Filter],
@@ -968,7 +977,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // The poster takes a column off the left of the body and the three lists share what
     // is left, in the proportions they had the whole width in.
-    let panel = poster_width(body, cell, art);
+    // The wall of covers is all posters, so it needs no column of its own for one.
+    let panel = poster_width(body, cell, art && app.view == View::Columns);
     let poster = app
         .series
         .selected()
@@ -1000,6 +1010,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Percentage(44),
     ])
     .areas(body);
+    // The wall of covers takes the whole body in place of the three columns, which are
+    // then drawn into nothing. A catalogue with nothing in it yet - loading, failed, or
+    // narrowed to nothing - has no covers to show, so the Series column says why across
+    // the same space instead.
+    let wall = (app.view == View::Covers && app.series.rows() > 0).then_some(body);
+    let [left, middle, right] = match wall {
+        Some(_) => [Rect::default(); 3],
+        None if app.view == View::Covers => [body, Rect::default(), Rect::default()],
+        None => [left, middle, right],
+    };
 
     let shown = app.series.shown();
     let items: Vec<ListItem> = if shown.is_empty() {
@@ -1108,6 +1128,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         right,
         &mut app.episodes.state,
     );
+
+    let mut tiles = Vec::new();
+    if let Some(wall) = wall {
+        let title = pane_title(column_name(app, Focus::Series), &app.series);
+        let block = pane_block(&theme, &title, focus == Focus::Series);
+        tiles = grid::draw(frame, app, wall, block);
+    }
 
     // Nothing at all while the queue is empty, which is what keeps the three columns
     // the size they were before any of this existed.
@@ -1235,11 +1262,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // and only then polls.
     app.regions = Regions {
         area,
-        series: left,
+        series: wall.unwrap_or(left),
         seasons: middle,
         episodes: right,
         downloads: queue_area,
         picker: picked,
+        tiles,
         buttons,
     };
 }

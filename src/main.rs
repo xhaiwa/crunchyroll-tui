@@ -108,10 +108,16 @@ struct Cli {
     theme: Option<String>,
 
     /// Whether the terminal interface draws posters and episode stills, overriding the
-    /// config file. `auto` draws them only where the terminal speaks kitty, sixel or
-    /// iTerm2; `on` falls back to half-blocks.
+    /// config file. `auto` and `on` draw them with kitty, sixel or iTerm2 where the
+    /// terminal speaks one, and as half-blocks where it does not; `off` never draws them.
     #[arg(long, value_name = "WHEN", requires = "tui")]
     images: Option<tui::art::Setting>,
+
+    /// Whether the terminal interface opens on the three columns or on the catalogue as
+    /// a wall of covers, overriding the config file. `t` switches between them either
+    /// way.
+    #[arg(long, value_name = "VIEW", requires = "tui")]
+    view: Option<tui::grid::View>,
 
     /// Whether the terminal interface answers the mouse, overriding the config file.
     /// `--mouse=false` browses with the keyboard alone and leaves the terminal its own
@@ -297,6 +303,9 @@ fn run() -> Result<()> {
         }
         if let Some(images) = cli.images {
             config.images = images;
+        }
+        if let Some(view) = cli.view {
+            config.view = view;
         }
         if cli.mouse.is_some() {
             config.mouse = cli.mouse;
