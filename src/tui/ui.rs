@@ -483,47 +483,76 @@ fn listing(app: &App) -> Run {
 /// command a click on it runs: a dim word saying which setting it is and the value in
 /// the accent, so the eye reads the values and the words are there for whoever needs
 /// telling what `日本語` is the setting of.
-fn settings(app: &App) -> Run {
+///
+/// `room` is the width of the header. Where the name in the corner and the words would
+/// not both fit, the words go and the values stay: the values are what a click changes
+/// and what someone glances up for, and a right-aligned title that ran over the left
+/// one would print half a name.
+fn settings(app: &App, room: u16) -> Run {
     let theme = &app.theme;
-    let chip = |command, what: &str, value: String| {
-        (
-            Some(command),
-            vec![theme.dim(format!("{what} ")), theme.title(value)],
-        )
+    let chips = |labelled: bool| {
+        let chip = |command, what: &str, value: String| {
+            let mut spans = Vec::new();
+            if labelled {
+                spans.push(theme.dim(format!("{what} ")));
+            }
+            spans.push(theme.title(value));
+            (Some(command), spans)
+        };
+        vec![
+            (None, vec![theme.text(" ")]),
+            chip(
+                Command::AudioLanguage,
+                "audio",
+                language_name(&app.audio()).to_owned(),
+            ),
+            (None, vec![theme.dim(DOT)]),
+            chip(
+                Command::SubtitleLanguage,
+                "subs",
+                language_name(&app.subs()).to_owned(),
+            ),
+            (None, vec![theme.dim(DOT)]),
+            chip(Command::Quality, "video", app.options.video_quality.clone()),
+            (None, vec![theme.text(" ")]),
+        ]
     };
-    vec![
-        (None, vec![theme.text(" ")]),
-        chip(
-            Command::AudioLanguage,
-            "audio",
-            language_name(&app.audio()).to_owned(),
-        ),
-        (None, vec![theme.dim(DOT)]),
-        chip(
-            Command::SubtitleLanguage,
-            "subs",
-            language_name(&app.subs()).to_owned(),
-        ),
-        (None, vec![theme.dim(DOT)]),
-        chip(Command::Quality, "video", app.options.video_quality.clone()),
-        (None, vec![theme.text(" ")]),
-    ]
+    let full = chips(true);
+    if fits_beside_the_name(&full, room) {
+        full
+    } else {
+        chips(false)
+    }
 }
 
 /// The name of the program, set in the top left corner of the header as a label of its
 /// own so the frame has a title the way a window does.
 const NAME: &str = " crunchyroll-tui ";
 
-fn header(app: &App) -> Paragraph<'static> {
+/// Whether a run of words fits along the top border beside the name: the two corners,
+/// the name with a cell either side of it, and the run.
+fn fits_beside_the_name(run: &Run, room: u16) -> bool {
+    let wide: u16 = widths(run).iter().map(|(_, width)| width).sum();
+    let name = cells(&[Span::raw(NAME)]).saturating_add(2);
+    wide.saturating_add(name).saturating_add(2) <= room
+}
+
+/// The header, `room` columns wide. The name is left out altogether on a terminal too
+/// narrow for it and the settings both, since the settings are the part that does
+/// something.
+fn header(app: &App, room: u16) -> Paragraph<'static> {
     let theme = &app.theme;
-    let block = theme
+    let settings = settings(app, room);
+    let mut block = theme
         .bordered(false)
-        .title(Line::from(vec![
+        .title_top(line(&settings).right_aligned());
+    if fits_beside_the_name(&settings, room) {
+        block = block.title(Line::from(vec![
             theme.text(" "),
             theme.badge(NAME),
             theme.text(" "),
-        ]))
-        .title_top(line(&settings(app)).right_aligned());
+        ]));
+    }
     Paragraph::new(line(&listing(app))).block(block)
 }
 
@@ -1207,7 +1236,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // worked out again afterwards.
     let mut buttons: Vec<(Command, Rect)> = Vec::new();
 
-    frame.render_widget(header(app), top);
+    frame.render_widget(header(app, top.width), top);
     // The settings are a right-aligned title, so they sit on the border row itself,
     // inside it and hard against the right edge; the listing label is the paragraph's
     // own line, one row below. Both are reproduced here rather than guessed at, so that
@@ -1218,7 +1247,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         width: top.width.saturating_sub(2),
         height: top.height.min(1),
     };
-    let labels = widths(&settings(app));
+    let labels = widths(&settings(app, top.width));
     let wide: u16 = labels.iter().map(|(_, width)| width).sum();
     let start = bar.right().saturating_sub(wide).max(bar.left());
     buttons.extend(mouse::lay_out(bar, start, &labels));
@@ -1728,6 +1757,19 @@ mod tests {
         );
         assert!(screen.contains("Continue watching \u{b7} 1 series"));
         assert!(screen.contains("subs English \u{b7} video 1080p"));
+
+        // Too narrow for the name and the words both, the words go and the values
+        // stay - and are still where a click finds them.
+        let drawn = buffer(60, 16, &mut app);
+        let top: String = (0..60).map(|x| drawn[(x, 0)].symbol()).collect();
+        assert!(top.contains(" crunchyroll-tui "), "{top}");
+        assert!(top.contains("English \u{b7} 1080p"), "{top}");
+        assert!(!top.contains("video"), "{top}");
+        let quality = button(&app, Command::Quality);
+        let word: String = (quality.left()..quality.right())
+            .map(|x| drawn[(x, quality.y)].symbol())
+            .collect();
+        assert_eq!(word, "1080p");
 
         // While the box is open it says which two keys mean something in it, since
         // neither of them is on the line along the bottom.
