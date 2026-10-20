@@ -625,6 +625,7 @@ Notes:
 
 - The stream is a pipe, so it cannot be seeked past what mpv has already buffered. mpv keeps a 256 MiB forward and 128 MiB backward window in memory, which covers a few minutes of seeking either way.
 - Nothing is kept: no MKV is written, and the already-downloaded episode check is skipped.
+- On macOS, FFmpeg feeds mpv through standard input to avoid a named-pipe playback stall. Use the mpv window for playback keys; terminal stdin carries the video.
 - `--play` needs mpv in `PATH`, and named pipes, so it is Unix-only. Downloading is unaffected.
 
 ### Video in the terminal

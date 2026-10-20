@@ -23,6 +23,7 @@ use crate::output::{MediaTrack, build_mux_command};
 /// every slot is filled before it starts ffmpeg and mpv.
 pub struct LivePipes {
     directory: TempDir,
+    #[cfg(not(target_os = "macos"))]
     stream: PathBuf,
     state: Mutex<PipeState>,
     ready: Condvar,
@@ -105,10 +106,15 @@ impl LivePipes {
             .prefix("crdl-live-")
             .tempdir()
             .context("create named pipe directory")?;
-        let stream = directory.path().join("stream.mkv");
-        make_fifo(&stream)?;
+        #[cfg(not(target_os = "macos"))]
+        let stream = {
+            let stream = directory.path().join("stream.mkv");
+            make_fifo(&stream)?;
+            stream
+        };
         Ok(Self {
             directory,
+            #[cfg(not(target_os = "macos"))]
             stream,
             state: Mutex::new(PipeState {
                 tracks: vec![None; tracks],
@@ -375,8 +381,8 @@ pub struct Playback<'a> {
 
 /// Muxes the live tracks into Matroska and lets mpv play the result as it is produced.
 ///
-/// ffmpeg writes into a pipe rather than mpv's stdin so that mpv keeps the terminal and
-/// its keyboard bindings still work.
+/// On macOS, use an anonymous pipe: mpv's polling of a named FIFO can stall while
+/// ffmpeg blocks writing to it. Other systems retain terminal input through a FIFO.
 pub fn play(
     pipes: &LivePipes,
     video: &MediaTrack,
@@ -392,9 +398,12 @@ pub fn play(
     let log = tempfile::NamedTempFile::new().context("create ffmpeg log")?;
     ffmpeg
         .args(["-f", "matroska"])
-        .arg(&pipes.stream)
         .stdin(Stdio::null())
         .stderr(Stdio::from(log.reopen().context("open ffmpeg log")?));
+    #[cfg(target_os = "macos")]
+    ffmpeg.arg("pipe:1").stdout(Stdio::piped());
+    #[cfg(not(target_os = "macos"))]
+    ffmpeg.arg(&pipes.stream);
     let ffmpeg = Mutex::new(
         ffmpeg
             .spawn()
@@ -430,7 +439,19 @@ pub fn play(
     }
     // Last, so that anything asked for by hand beats what is set here: mpv keeps the last
     // value of an option it is given twice.
-    mpv.args(playback.mpv_args).arg(&pipes.stream);
+    mpv.args(playback.mpv_args);
+    #[cfg(target_os = "macos")]
+    {
+        let stream = ffmpeg
+            .lock()
+            .expect("ffmpeg poisoned")
+            .stdout
+            .take()
+            .context("open ffmpeg output pipe")?;
+        mpv.stdin(Stdio::from(stream)).arg("-");
+    }
+    #[cfg(not(target_os = "macos"))]
+    mpv.arg(&pipes.stream);
 
     let playing = AtomicBool::new(true);
     let result = thread::scope(|scope| {
@@ -482,6 +503,76 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    /// Exercises the real ffmpeg -> mpv handoff without an account or DRM device.
+    /// Run with: cargo test --release plays_a_generated_video -- --ignored
+    #[test]
+    #[ignore = "requires ffmpeg and mpv in PATH"]
+    fn plays_a_generated_video() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("video.mkv");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25",
+                "-t",
+                "2",
+                "-c:v",
+                "ffv1",
+            ])
+            .arg(&video)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success());
+
+        // A timer also fires if opening the media stalls, so a broken handoff
+        // fails instead of hanging the test. Require a decoded frame, not merely
+        // a successful mpv exit. No window or sound is needed.
+        let script = directory.path().join("check.lua");
+        std::fs::write(
+            &script,
+            r#"
+local passed = false
+mp.observe_property("time-pos", "number", function(_, position)
+    if position and position > 0 then
+        passed = true
+        mp.commandv("quit", "0")
+    end
+end)
+mp.add_timeout(5, function()
+    if not passed then mp.commandv("quit", "1") end
+end)
+"#,
+        )
+        .unwrap();
+        let args = vec![
+            "--no-config".into(),
+            "--vo=null".into(),
+            "--ao=null".into(),
+            format!("--script={}", script.display()),
+        ];
+        let pipes = LivePipes::new(0).unwrap();
+        play(
+            &pipes,
+            &track(video),
+            &[],
+            &[],
+            &EpisodeInfo::default(),
+            &Playback {
+                mpv_args: &args,
+                start_at: None,
+                playhead: None,
+            },
+        )
+        .expect("mpv must decode the generated video before the timeout");
+    }
 
     fn track(file: PathBuf) -> MediaTrack {
         MediaTrack::media(file, String::new(), None)
